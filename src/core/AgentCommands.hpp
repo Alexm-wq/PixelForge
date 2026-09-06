@@ -23,13 +23,18 @@ enum class AgentErrorCode {
 
 enum class AgentPixelOpKind {
     SetPixel,
-    FillRect
+    FillRect,
+    HorizontalRun,
+    VerticalRun,
+    Line
 };
 
 struct AgentPixelOp {
     AgentPixelOpKind kind = AgentPixelOpKind::SetPixel;
     int x = 0;
     int y = 0;
+    int x2 = 0;
+    int y2 = 0;
     int width = 1;
     int height = 1;
     std::uint32_t argb = 0;
