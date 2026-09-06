@@ -1,4 +1,5 @@
 #include "AgentMcpServer.hpp"
+#include "ReferenceResponseLimiter.hpp"
 
 #include <windows.h>
 
@@ -37,8 +38,13 @@ BOOL WINAPI pixelforge_mcp_write_file(HANDLE file,
     }
     if (has_delimiter) compact.push_back('\n');
 
+    // Content/style references are capped by total delivered pixel area at
+    // 512x512 (262,144 pixels). The full-resolution reference remains loaded
+    // in PixelForge; canvas render observations are never modified here.
+    std::string delivered = pixelforge::win32::limit_reference_response(compact);
+
     DWORD actual = 0;
-    const BOOL ok = ::WriteFile(file, compact.data(), static_cast<DWORD>(compact.size()), &actual, overlapped);
+    const BOOL ok = ::WriteFile(file, delivered.data(), static_cast<DWORD>(delivered.size()), &actual, overlapped);
     if (bytes_written) *bytes_written = ok ? bytes_to_write : 0;
     return ok;
 }
