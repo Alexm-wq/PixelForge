@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(PixelForge VERSION 0.1.0 LANGUAGES CXX)
+project(PixelForge VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,13 +9,15 @@ add_library(pixelforge_core
     src/core/PixelDocument.cpp
     src/core/AgentTask.cpp
     src/core/AgentCommands.cpp
+    src/core/MiniJson.cpp
 )
 target_include_directories(pixelforge_core PUBLIC src/core)
 
 if(WIN32)
     add_executable(PixelForge WIN32
-        src/win32/main.cpp
+        src/win32/main_mcp.cpp
         src/win32/ImageIO.cpp
+        src/win32/AgentMcpServer.cpp
     )
     target_include_directories(PixelForge PRIVATE src/core src/win32)
     target_link_libraries(PixelForge PRIVATE
