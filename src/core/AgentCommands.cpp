@@ -7,6 +7,12 @@ namespace pixelforge {
 
 namespace {
 
+bool rect_fits(const PixelDocument& document, int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0 || x < 0 || y < 0) return false;
+    if (width > document.width() || height > document.height()) return false;
+    return x <= document.width() - width && y <= document.height() - height;
+}
+
 bool draw_line(PixelDocument::Transaction& tx, int x0, int y0, int x1, int y1, std::uint32_t argb) {
     const int dx = std::abs(x1 - x0);
     const int sx = x0 < x1 ? 1 : -1;
@@ -145,10 +151,11 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
                 accepted = tx.set_pixel(op.x, op.y, op.argb);
                 break;
             case AgentPixelOpKind::FillRect:
-                accepted = tx.fill_rect(op.x, op.y, op.width, op.height, op.argb);
+                accepted = rect_fits(*document_, op.x, op.y, op.width, op.height) &&
+                           tx.fill_rect(op.x, op.y, op.width, op.height, op.argb);
                 break;
             case AgentPixelOpKind::HorizontalRun:
-                if (op.width <= 0) break;
+                if (!rect_fits(*document_, op.x, op.y, op.width, 1)) break;
                 accepted = true;
                 for (int dx = 0; dx < op.width; ++dx) {
                     if (!tx.set_pixel(op.x + dx, op.y, op.argb)) {
@@ -158,7 +165,7 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
                 }
                 break;
             case AgentPixelOpKind::VerticalRun:
-                if (op.height <= 0) break;
+                if (!rect_fits(*document_, op.x, op.y, 1, op.height)) break;
                 accepted = true;
                 for (int dy = 0; dy < op.height; ++dy) {
                     if (!tx.set_pixel(op.x, op.y + dy, op.argb)) {
@@ -230,8 +237,7 @@ AgentRegionObservation AgentCommandRouter::inspect_region(std::uint64_t task_id,
         out.message = edit_check.message;
         return out;
     }
-    if (width <= 0 || height <= 0 || x < 0 || y < 0 ||
-        x + width > document_->width() || y + height > document_->height()) {
+    if (!rect_fits(*document_, x, y, width, height)) {
         out.error = AgentErrorCode::InvalidArgument;
         out.message = "Requested inspection region is outside the canvas.";
         return out;
