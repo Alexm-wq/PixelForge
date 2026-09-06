@@ -18,6 +18,7 @@ if(WIN32)
         src/win32/main_auto.cpp
         src/win32/ImageIO.cpp
         src/win32/AgentMcpServerFramed.cpp
+        src/win32/ReferenceResponseLimiter.cpp
         src/win32/PipeBridge.cpp
         src/win32/CodexAppClientTraced.cpp
         src/win32/CodexSessionTrace.cpp
