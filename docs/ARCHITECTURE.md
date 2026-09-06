@@ -1,33 +1,39 @@
 # PixelForge architecture
 
-## Current prototype
+PixelForge is a portable C++20 document core with a native Win32/GDI/WIC host.
+`main_mcp.cpp` owns the GUI and document. `AgentMcpServerFramed.cpp` builds the
+MCP adapter with JSONL response framing. MCP runs on a worker; the GUI and adapter
+lock the same mutex while reading or mutating the document.
 
-- `pixelforge_core`: portable C++20 document and task-state library.
-- `PixelForge` (Windows): dependency-free Win32/GDI/WIC UI.
-- Two cached reference slots: content reference and style reference.
-- Native PNG import for references and PNG export for the canvas via Windows Imaging Component.
-- Revisioned pixel document with batch transactions and delta-based undo/redo.
-- Task state machine with explicit agent accept/reject/finish actions.
+The six tools route lifecycle, patches, observations, palettes, history and export.
+Semantic scope decisions belong to the agent. The application validates dimensions,
+coordinates, task state and revision numbers. No external runtime is needed to run
+the application; PowerShell is used only for build/test automation.
 
-## Target architecture
+Transactions retain the first old value and final new value per changed pixel.
+Tiny transactions scan at most 64 entries; larger transactions switch to a dense
+pixel-to-change index for constant-time writes. Net no-ops leave revision/history
+unchanged. Transactions reject commits after another mutation or resize. Undo/redo
+use deltas and monotonically increasing revisions. History is held in memory.
 
-```text
-Codex
-  | MCP / stdio
-  v
-pixelforge-agent-bridge
-  | compact commands + revisions
-  v
-PixelForge document core <--> native GUI
-```
+The GUI composites straight alpha over a checkerboard into one bitmap and uses
+nearest-neighbor drawing. Large canvases fit the viewport. Export preserves exact
+ARGB without the GUI checkerboard or grid. References are decoded through WIC,
+limited to 64 megapixels, and observations use the loaded snapshot.
 
-The GUI and agent bridge must operate the same in-memory/project document. GUI automation is not part of the agent path.
+Render cache keys include a pixel-content hash, source width, task, revision, crop
+and scale, preventing stale images when process-local counters restart. PNG cache
+files live in the Windows temporary PixelForge/observations directory. They are
+not a project save format and are not automatically pruned. Observation IDs avoid
+retransmitting unchanged images. Patch input is buffered in 16 KiB chunks with an
+8 MiB line limit. Inspection uses row-major run-length encoding.
 
-## Performance rules
+Tests exercise portable state/transaction behavior (including a maximum-size
+fill), plus the actual Windows executable over redirected MCP pipes, WIC PNG
+export, reference images and process restart caching. Checks remain active in
+Release builds. CTest runs both suites and Windows CI uploads the tested executable
+with its agent prompt.
 
-1. One revision per batch transaction, not per pixel.
-2. Responses return changed bounds/revision counts, not full pixel arrays unless explicitly requested.
-3. Reference images are decoded once and retained in memory.
-4. Future render observations are keyed by document revision + crop + scale + visible layers.
-5. Future pixel patch transport uses palette indices and runs/rectangles rather than verbose per-pixel JSON.
-6. Semantic prompt refusal remains an agent decision, never a local keyword classifier.
+Current boundaries: one in-memory canvas, no project persistence/import, layers,
+animation, transforms or flood fill. Agent patches are the primary drawing path;
+the GUI provides preview, reference loading, simple pixel touchups and PNG saving.

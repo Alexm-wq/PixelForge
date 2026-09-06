@@ -175,7 +175,9 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
                 }
                 break;
             case AgentPixelOpKind::Line:
-                accepted = draw_line(tx, op.x, op.y, op.x2, op.y2, op.argb);
+                accepted = rect_fits(*document_, op.x, op.y, 1, 1) &&
+                           rect_fits(*document_, op.x2, op.y2, 1, 1) &&
+                           draw_line(tx, op.x, op.y, op.x2, op.y2, op.argb);
                 break;
         }
         if (!accepted) {
@@ -231,7 +233,11 @@ AgentRegionObservation AgentCommandRouter::inspect_region(std::uint64_t task_id,
     out.task_id = task_id;
     out.revision = document_->revision();
 
-    auto edit_check = validate_editable(task_id, expected_revision);
+    auto edit_check = validate_task(task_id);
+    if (edit_check.ok && task_->state() != TaskState::Accepted && task_->state() != TaskState::Finished)
+        edit_check = result(false, AgentErrorCode::InvalidState, "No accepted or finished canvas to inspect.");
+    if (edit_check.ok && expected_revision != document_->revision())
+        edit_check = result(false, AgentErrorCode::StaleRevision, "Document revision changed; refresh before inspecting.");
     if (!edit_check.ok) {
         out.error = edit_check.error;
         out.message = edit_check.message;

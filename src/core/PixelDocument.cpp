@@ -51,11 +51,14 @@ std::uint32_t PixelDocument::pixel(int x, int y) const {
     return pixels_[index_of(x, y)];
 }
 
-PixelDocument::Transaction::Transaction(PixelDocument& document) : document_(&document) {}
+PixelDocument::Transaction::Transaction(PixelDocument& document)
+    : document_(&document), base_revision_(document.revision()) {}
 
 PixelDocument::Transaction::Transaction(Transaction&& other) noexcept
     : document_(std::exchange(other.document_, nullptr)),
       pending_(std::move(other.pending_)),
+      pending_index_(std::move(other.pending_index_)),
+      base_revision_(other.base_revision_),
       completed_(std::exchange(other.completed_, true)) {}
 
 PixelDocument::Transaction& PixelDocument::Transaction::operator=(Transaction&& other) noexcept {
@@ -63,6 +66,8 @@ PixelDocument::Transaction& PixelDocument::Transaction::operator=(Transaction&& 
     cancel();
     document_ = std::exchange(other.document_, nullptr);
     pending_ = std::move(other.pending_);
+    pending_index_ = std::move(other.pending_index_);
+    base_revision_ = other.base_revision_;
     completed_ = std::exchange(other.completed_, true);
     return *this;
 }
@@ -72,15 +77,29 @@ PixelDocument::Transaction::~Transaction() {
 }
 
 bool PixelDocument::Transaction::set_pixel(int x, int y, std::uint32_t argb) {
-    if (!document_ || !document_->in_bounds(x, y) || completed_) return false;
-    for (auto it = pending_.rbegin(); it != pending_.rend(); ++it) {
-        if (it->x == x && it->y == y) {
-            it->after = argb;
+    if (!document_ || completed_ || document_->revision() != base_revision_ || !document_->in_bounds(x, y)) return false;
+    // Small mouse edits need no canvas-sized allocation. Large patches switch
+    // to direct indexing, making repeated/overlapping writes constant time.
+    if (pending_index_.empty() && pending_.size() >= 64) {
+        pending_index_.assign(document_->pixels().size(), -1);
+        for (std::size_t i = 0; i < pending_.size(); ++i)
+            pending_index_[document_->index_of(pending_[i].x, pending_[i].y)] = static_cast<int>(i);
+    }
+    const auto index = document_->index_of(x, y);
+    if (!pending_index_.empty()) {
+        const int slot = pending_index_[index];
+        if (slot >= 0) {
+            pending_[slot].after = argb;
             return true;
+        }
+    } else {
+        for (auto& change : pending_) {
+            if (change.x == x && change.y == y) { change.after = argb; return true; }
         }
     }
     const auto before = document_->pixel(x, y);
     if (before == argb) return true;
+    if (!pending_index_.empty()) pending_index_[index] = static_cast<int>(pending_.size());
     pending_.push_back({x, y, before, argb});
     return true;
 }
@@ -89,19 +108,24 @@ bool PixelDocument::Transaction::fill_rect(int x, int y, int width, int height, 
     if (!document_ || completed_ || width <= 0 || height <= 0) return false;
     const int x0 = std::max(0, x);
     const int y0 = std::max(0, y);
-    const int x1 = std::min(document_->width(), x + width);
-    const int y1 = std::min(document_->height(), y + height);
+    const int x1 = static_cast<int>(std::min<std::int64_t>(document_->width(), static_cast<std::int64_t>(x) + width));
+    const int y1 = static_cast<int>(std::min<std::int64_t>(document_->height(), static_cast<std::int64_t>(y) + height));
     if (x0 >= x1 || y0 >= y1) return false;
     for (int py = y0; py < y1; ++py) {
-        for (int px = x0; px < x1; ++px) set_pixel(px, py, argb);
+        for (int px = x0; px < x1; ++px) if (!set_pixel(px, py, argb)) return false;
     }
     return true;
 }
 
 bool PixelDocument::Transaction::commit() {
-    if (!document_ || completed_) return false;
+    if (!document_ || completed_ || document_->revision() != base_revision_) return false;
     completed_ = true;
     return document_->commit_changes(std::move(pending_));
+}
+
+std::size_t PixelDocument::Transaction::pending_changes() const noexcept {
+    return static_cast<std::size_t>(std::count_if(pending_.begin(), pending_.end(),
+        [](const PixelChange& change) { return change.before != change.after; }));
 }
 
 void PixelDocument::Transaction::cancel() noexcept {
@@ -130,9 +154,8 @@ bool PixelDocument::commit_changes(std::vector<PixelChange> changes) {
         delta.min_y = std::min(delta.min_y, change.y);
         delta.max_x = std::max(delta.max_x, change.x);
         delta.max_y = std::max(delta.max_y, change.y);
-        delta.changes.push_back(change);
     }
-    if (delta.changes.empty()) return false;
+    delta.changes = std::move(changes);
 
     ++revision_;
     delta.revision_after = revision_;

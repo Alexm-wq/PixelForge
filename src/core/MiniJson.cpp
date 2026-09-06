@@ -54,6 +54,7 @@ bool parse_string(std::string_view text, std::size_t& p, std::string& out, std::
         const char c = text[p++];
         if (c == '"') return true;
         if (c != '\\') {
+            if (static_cast<unsigned char>(c) < 0x20) { error = "Unescaped JSON control character."; return false; }
             out.push_back(c);
             continue;
         }
@@ -168,7 +169,13 @@ bool parse_flat_json_object(std::string_view text, FlatJsonObject& out, std::str
     }
     ++p;
     skip_ws(text, p);
-    if (p < text.size() && text[p] == '}') return true;
+    if (p < text.size() && text[p] == '}') {
+        ++p;
+        skip_ws(text, p);
+        if (p == text.size()) return true;
+        error = "Unexpected trailing data after JSON object.";
+        return false;
+    }
 
     for (;;) {
         skip_ws(text, p);

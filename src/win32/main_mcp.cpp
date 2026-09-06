@@ -169,39 +169,36 @@ void draw_canvas(HDC dc, RECT area) {
     RECT usable{area.left + 10, area.top + 30, area.right - 10, area.bottom - 36};
     const int uw = static_cast<int>(usable.right - usable.left);
     const int uh = static_cast<int>(usable.bottom - usable.top);
-    int cell = std::max(1, std::min(uw / width, uh / height));
-    cell = std::min(cell, 32);
-    const int draw_w = width * cell;
-    const int draw_h = height * cell;
-    RECT canvas{
-        usable.left + (uw - draw_w) / 2,
-        usable.top + (uh - draw_h) / 2,
-        usable.left + (uw - draw_w) / 2 + draw_w,
-        usable.top + (uh - draw_h) / 2 + draw_h
-    };
+    if (uw <= 0 || uh <= 0) { g_app.canvas_rect = {}; return; }
+    const double fit = std::min(static_cast<double>(uw) / width, static_cast<double>(uh) / height);
+    const int cell = fit >= 1 ? std::min(32, static_cast<int>(fit)) : 0;
+    const int draw_w = cell ? width * cell : std::max(1, static_cast<int>(width * fit));
+    const int draw_h = cell ? height * cell : std::max(1, static_cast<int>(height * fit));
+    RECT canvas{usable.left + (uw - draw_w) / 2, usable.top + (uh - draw_h) / 2,
+                usable.left + (uw - draw_w) / 2 + draw_w, usable.top + (uh - draw_h) / 2 + draw_h};
     g_app.canvas_rect = canvas;
-
+    std::vector<std::uint32_t> preview(g_app.document.pixels().size());
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            RECT r{
-                canvas.left + x * cell,
-                canvas.top + y * cell,
-                canvas.left + (x + 1) * cell,
-                canvas.top + (y + 1) * cell
-            };
-            const std::uint32_t argb = g_app.document.pixel(x, y);
-            const std::uint8_t a = static_cast<std::uint8_t>(argb >> 24);
-            COLORREF color;
-            if (a == 0) {
-                const bool light = ((x + y) & 1) == 0;
-                color = light ? RGB(54, 58, 61) : RGB(42, 46, 49);
-            } else {
-                color = RGB((argb >> 16) & 0xffu, (argb >> 8) & 0xffu, argb & 0xffu);
-            }
-            fill_rect(dc, r, color);
+            const auto argb = g_app.document.pixel(x, y);
+            const unsigned a = argb >> 24;
+            const unsigned bg = ((x + y) & 1) ? 42 : 54;
+            auto blend = [&](unsigned c, unsigned b) { return (c * a + b * (255 - a) + 127) / 255; };
+            preview[static_cast<std::size_t>(y) * width + x] =
+                (blend((argb >> 16) & 255, bg) << 16) |
+                (blend((argb >> 8) & 255, bg + 4) << 8) | blend(argb & 255, bg + 7);
         }
     }
-
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, canvas.left, canvas.top, draw_w, draw_h, 0, 0, width, height,
+                  preview.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
     if (cell >= 8) {
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(62, 68, 72));
         HGDIOBJ old = SelectObject(dc, pen);
@@ -283,11 +280,8 @@ bool map_canvas_point_locked(int mx, int my, int& px, int& py) {
     const int w = g_app.document.width();
     const int h = g_app.document.height();
     if (w <= 0 || h <= 0) return false;
-    const int cell_x = static_cast<int>(r.right - r.left) / w;
-    const int cell_y = static_cast<int>(r.bottom - r.top) / h;
-    if (cell_x <= 0 || cell_y <= 0) return false;
-    px = (mx - static_cast<int>(r.left)) / cell_x;
-    py = (my - static_cast<int>(r.top)) / cell_y;
+    px = (mx - static_cast<int>(r.left)) * w / static_cast<int>(r.right - r.left);
+    py = (my - static_cast<int>(r.top)) * h / static_cast<int>(r.bottom - r.top);
     return px >= 0 && py >= 0 && px < w && py < h;
 }
 

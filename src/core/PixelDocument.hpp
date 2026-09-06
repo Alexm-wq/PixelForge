@@ -57,13 +57,15 @@ public:
 
         bool set_pixel(int x, int y, std::uint32_t argb);
         bool fill_rect(int x, int y, int width, int height, std::uint32_t argb);
-        [[nodiscard]] std::size_t pending_changes() const noexcept { return pending_.size(); }
+        [[nodiscard]] std::size_t pending_changes() const noexcept;
         bool commit();
         void cancel() noexcept;
 
     private:
         PixelDocument* document_ = nullptr;
         std::vector<PixelChange> pending_;
+        std::vector<int> pending_index_;
+        std::uint64_t base_revision_ = 0;
         bool completed_ = false;
     };
 

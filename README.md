@@ -4,7 +4,7 @@ Agent-native pixel-art editor for Codex.
 
 PixelForge is a native C++ pixel editor designed around a compact agent protocol. The GUI is for the user; Codex edits the exact same live document through MCP rather than GUI automation.
 
-## Current prototype
+## Implemented workflow
 
 - Dependency-free Win32 C++20 UI (Win32/GDI/WIC only)
 - Editable nearest-neighbor pixel canvas
@@ -42,11 +42,21 @@ From a Visual Studio Developer PowerShell:
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 The executable will be under `build/Release/PixelForge.exe` for the standard Visual Studio generator layout.
 
-The repository also has the incremental BAT workflow used during development.
+For a repeatable configure/build/test workflow, run `./build.ps1` from PowerShell.
+Use `./build.ps1 -Configuration Debug` for Debug or add `-Run` to open the tested
+GUI. Requires CMake, Visual Studio 2022 C++ Build Tools and a Windows SDK.
+The script works relative to its own folder and does not pull Git changes or
+terminate an existing editor. Close the application before rebuilding its EXE.
+
+CTest includes always-active core checks and a real MCP integration test that
+launches hidden app instances, draws a gem, checks revisions/history/cache behavior
+and verifies PNG pixels and transparency. Its example output is
+`build/test-output/mcp-gem.png`. Windows CI publishes the executable and prompt.
 
 ## Connect Codex
 
@@ -97,6 +107,16 @@ Canvas renders are cached by task, revision, crop, and integer scale. They are e
 Content and style references are also observation-addressed and are sent at their original resolution rather than silently downscaled.
 
 ## Agent contract
+
+The ready-to-use system prompt is **`config/agent_system_prompt.md`**. Have the
+drawing agent read this file before using the six tools, or put its contents in
+the agent's system instructions. The build also copies it beside `PixelForge.exe`.
+It contains exact arguments, patch examples, limits, visual refinement guidance,
+stale-revision recovery and the finish/export workflow.
+
+PixelForge currently edits one in-memory canvas. Export before closing: there is
+no project save/reopen, canvas import, layer or animation support. Reference slots
+load images for observation; they do not import pixels into the canvas.
 
 See:
 

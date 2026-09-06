@@ -66,8 +66,9 @@ bool load_image_wic(const std::wstring& path, ImageData& out, std::wstring& erro
 
     UINT width = 0, height = 0;
     hr = frame->GetSize(&width, &height);
-    if (FAILED(hr) || width == 0 || height == 0) {
-        error = L"Image has invalid dimensions.";
+    if (FAILED(hr) || width == 0 || height == 0 || width > 16384 || height > 16384 ||
+        static_cast<std::uint64_t>(width) * height > 64ull * 1024ull * 1024ull) {
+        error = L"Reference exceeds limits (16384 per dimension, 64 megapixels) or has invalid dimensions.";
         return false;
     }
 

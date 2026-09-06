@@ -71,7 +71,10 @@ H,12,14,8,4;H,11,15,10,4;P,15,13,#FFFFFFFF;L,8,20,17,27,2
 
 One call can carry up to 20,000 operations. If any operation is malformed or invalid/out-of-bounds, the complete transaction is cancelled.
 
-A successful batch increments the document revision once regardless of how many pixels changed.
+A successful batch with effective changes increments the document revision once.
+A net no-op succeeds with `changed_pixels:0` and leaves the revision unchanged.
+`changed_pixels` counts unique pixels whose final value differs from their initial
+value, including when operations overlap. Requests are limited to 8 MiB per JSONL line.
 
 ### `pixelforge_view`
 
@@ -84,7 +87,15 @@ Actions:
 
 `render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, and scale. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
 
-`content_reference` and `style_reference` use the same observation-ID rule and return the original image data rather than silently reducing reference quality.
+`content_reference` and `style_reference` use the same observation-ID rule and
+return the loaded reference snapshot as lossless PNG at original resolution.
+Changing the file on disk does not change the loaded reference. Reference decoding
+is limited to 16384 pixels per dimension and 64 megapixels total.
+
+`render` and `inspect` work for accepted and finished tasks; edits and history
+require an accepted task. Render scales are 1–32, limited to 16,777,216 output pixels.
+Render cache keys include pixel content as well as task/revision/crop/scale, so
+restarting the app cannot reuse a different document's cached image.
 
 `inspect` returns row-major run-length encoded exact pixel values and is capped at 4096 pixels. Use visual renders for larger areas.
 

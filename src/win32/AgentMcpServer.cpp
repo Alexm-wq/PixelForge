@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -44,13 +45,18 @@ std::string wide_to_utf8(std::wstring_view text) {
 }
 
 bool read_line(HANDLE input, std::string& line) {
+    static char buffer[16384];
+    static DWORD available = 0, cursor = 0;
     line.clear();
-    char c = 0;
-    DWORD read = 0;
     for (;;) {
-        if (!ReadFile(input, &c, 1, &read, nullptr) || read == 0) return !line.empty();
+        if (cursor == available) {
+            if (!ReadFile(input, buffer, sizeof(buffer), &available, nullptr) || available == 0) return !line.empty();
+            cursor = 0;
+        }
+        const char c = buffer[cursor++];
         if (c == '\n') return true;
         if (c != '\r') line.push_back(c);
+        if (line.size() > 8u * 1024u * 1024u) return false;
     }
 }
 
@@ -250,6 +256,7 @@ std::string compact_result(const AgentCommandResult& r, bool include_task = fals
         out += ",\"task_id\":" + std::to_string(r.task.id) +
                ",\"state\":" + json_quote(state_name_lower(r.task.state)) +
                ",\"prompt\":" + json_quote(r.task.prompt) +
+               ",\"status_message\":" + json_quote(r.task.status_message) +
                ",\"canvas_width\":" + std::to_string(r.task.canvas_width) +
                ",\"canvas_height\":" + std::to_string(r.task.canvas_height) +
                ",\"content_reference\":" + json_quote(r.task.content_reference.present ? r.task.content_reference.path : "") +
@@ -492,6 +499,12 @@ public:
     explicit Server(AgentMcpBindings bindings) : b_(bindings), palette_(default_palette()) {}
 
     ToolOutput call_tool(std::string_view name, const FlatJsonObject& args) {
+        for (const auto key : {"x", "y", "width", "height", "scale"}) {
+            if (!args.contains(key)) continue;
+            const auto value = args.get_i64(key);
+            if (!value || *value < std::numeric_limits<int>::min() || *value > std::numeric_limits<int>::max())
+                return {true, "{\"ok\":false,\"error\":\"invalid_integer\"}"};
+        }
         if (name == "pixelforge_task") return task(args);
         if (name == "pixelforge_edit") return edit(args);
         if (name == "pixelforge_view") return view(args);
@@ -618,18 +631,35 @@ private:
                 path = style ? *b_.style_path : *b_.content_path;
             }
             if (!image.valid() || path.empty()) return {true, "{\"ok\":false,\"error\":\"reference_missing\"}"};
-            const std::uint64_t hash = fnv1a(image.bgra.data(), image.bgra.size());
+            auto hash = fnv1a(image.bgra.data(), image.bgra.size());
+            hash = fnv1a(&image.width, sizeof(image.width), hash);
+            hash = fnv1a(&image.height, sizeof(image.height), hash);
             const std::string obs = std::string(style_name(action)) + ":" + hex64(hash);
             if (args.get("known_observation") == obs)
                 return {false, "{\"ok\":true,\"unchanged\":true,\"observation\":" + json_quote(obs) + "}"};
+            // Serve the decoded snapshot shown in the GUI, even if the source
+            // file changes or disappears after loading it.
+            std::filesystem::path snapshot = observation_dir();
+            snapshot /= utf8_to_wide("reference-" + hex64(hash) + ".png");
+            if (!std::filesystem::exists(snapshot)) {
+                std::vector<std::uint32_t> pixels(image.bgra.size() / 4);
+                for (std::size_t i = 0; i < pixels.size(); ++i) {
+                    const auto* p = image.bgra.data() + i * 4;
+                    pixels[i] = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+                        (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+                }
+                std::wstring error;
+                if (!save_png_wic(snapshot.wstring(), image.width, image.height, pixels, error))
+                    return {true, "{\"ok\":false,\"error\":\"reference_encode_failed\"}"};
+            }
             std::vector<std::uint8_t> bytes;
-            if (!read_file_bytes(path, bytes)) return {true, "{\"ok\":false,\"error\":\"reference_read_failed\"}"};
+            if (!read_file_bytes(snapshot.wstring(), bytes)) return {true, "{\"ok\":false,\"error\":\"reference_read_failed\"}"};
             ToolOutput out;
             out.text = "{\"ok\":true,\"observation\":" + json_quote(obs) +
                        ",\"width\":" + std::to_string(image.width) + ",\"height\":" + std::to_string(image.height) +
                        ",\"path\":" + json_quote(wide_to_utf8(path)) + "}";
             out.image_base64 = base64_encode(bytes);
-            out.image_mime = mime_for_path(path);
+            out.image_mime = "image/png";
             return out;
         }
 
@@ -670,7 +700,7 @@ private:
                 const auto check = router.task_get();
                 if (!check.ok || check.task.id != static_cast<std::uint64_t>(*task_id))
                     return {true, "{\"ok\":false,\"error\":\"stale_task\"}"};
-                if (check.task.state != TaskState::Accepted)
+                if (check.task.state != TaskState::Accepted && check.task.state != TaskState::Finished)
                     return {true, "{\"ok\":false,\"error\":\"invalid_state\"}"};
                 if (check.revision != static_cast<std::uint64_t>(*rev))
                     return {true, "{\"ok\":false,\"error\":\"stale_revision\",\"revision\":" + std::to_string(check.revision) + "}"};
@@ -678,7 +708,8 @@ private:
                 if (w == 0) w = source_width;
                 if (h == 0) h = b_.document->height();
                 if (scale < 1 || scale > 32 || x < 0 || y < 0 || w <= 0 || h <= 0 ||
-                    x + w > b_.document->width() || y + h > b_.document->height())
+                    w > b_.document->width() || h > b_.document->height() ||
+                    x > b_.document->width() - w || y > b_.document->height() - h)
                     return {true, "{\"ok\":false,\"error\":\"invalid_render_region\"}"};
                 const std::uint64_t out_pixels = static_cast<std::uint64_t>(w) * h * scale * scale;
                 if (out_pixels > kMaxObservationPixels)
@@ -686,7 +717,8 @@ private:
                 pixels = b_.document->pixels();
             }
 
-            const std::string key = std::to_string(*task_id) + ":" + std::to_string(*rev) + ":" +
+            const std::string key = hex64(fnv1a(pixels.data(), pixels.size() * sizeof(std::uint32_t))) + ":" +
+                std::to_string(source_width) + ":" + std::to_string(*task_id) + ":" + std::to_string(*rev) + ":" +
                 std::to_string(x) + ":" + std::to_string(y) + ":" + std::to_string(w) + ":" +
                 std::to_string(h) + ":" + std::to_string(scale);
             const std::uint64_t key_hash = fnv1a(key.data(), key.size());

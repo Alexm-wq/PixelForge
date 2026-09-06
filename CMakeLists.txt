@@ -25,6 +25,10 @@ if(WIN32)
         user32 gdi32 comdlg32 ole32 windowscodecs
     )
     target_compile_definitions(PixelForge PRIVATE UNICODE _UNICODE NOMINMAX)
+    add_custom_command(TARGET PixelForge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/agent_system_prompt.md"
+            "$<TARGET_FILE_DIR:PixelForge>/agent_system_prompt.md")
 endif()
 
 include(CTest)
@@ -32,4 +36,12 @@ if(BUILD_TESTING)
     add_executable(pixelforge_core_tests tests/test_core.cpp)
     target_link_libraries(pixelforge_core_tests PRIVATE pixelforge_core)
     add_test(NAME pixelforge_core_tests COMMAND pixelforge_core_tests)
+    set_tests_properties(pixelforge_core_tests PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
+        add_test(NAME pixelforge_mcp_tests COMMAND "${POWERSHELL_EXECUTABLE}"
+            -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mcp.ps1"
+            -Executable "$<TARGET_FILE:PixelForge>" -OutputDirectory "${CMAKE_CURRENT_BINARY_DIR}/test-output")
+        set_tests_properties(pixelforge_mcp_tests PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+    endif()
 endif()
