@@ -16,6 +16,7 @@ struct CodexGenerateRequest {
     std::wstring repo_root;
     std::wstring executable_path;
     std::wstring pipe_name;
+    std::wstring record_pipe_name;
     std::string prompt;
     std::string agent_contract;
 };
@@ -67,6 +68,7 @@ private:
     std::wstring configured_repo_root_;
     std::wstring configured_executable_;
     std::wstring configured_pipe_name_;
+    std::wstring configured_record_pipe_name_;
 
     std::atomic_bool busy_{false};
     std::atomic_bool shutting_down_{false};
