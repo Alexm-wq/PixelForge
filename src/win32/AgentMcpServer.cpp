@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cctype>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
