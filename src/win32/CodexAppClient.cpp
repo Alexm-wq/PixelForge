@@ -238,9 +238,26 @@ std::wstring search_path(std::wstring_view file) {
     return out;
 }
 
+std::wstring module_directory() {
+    std::vector<wchar_t> buffer(32768, L'\0');
+    const DWORD count = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (!count || count >= buffer.size()) return {};
+    return std::filesystem::path(std::wstring(buffer.data(), count)).parent_path().wstring();
+}
+
 std::wstring find_codex_launcher() {
     if (auto configured = get_env(L"PIXELFORGE_CODEX_EXE"); !configured.empty()) return configured;
+    if (auto configured = get_env(L"CODEX_CLI_PATH"); !configured.empty()) return configured;
     if (auto exe = search_path(L"codex.exe"); !exe.empty()) return exe;
+
+    // The build copies a resolver beside PixelForge.exe. Prefer it before other
+    // shell shims so launching PixelForge from Explorer works without PATH setup.
+    const auto module_dir = module_directory();
+    if (!module_dir.empty()) {
+        const auto bundled = std::filesystem::path(module_dir) / L"codex.cmd";
+        if (std::filesystem::exists(bundled)) return bundled.wstring();
+    }
+
     if (auto cmd = search_path(L"codex.cmd"); !cmd.empty()) return cmd;
     if (auto bat = search_path(L"codex.bat"); !bat.empty()) return bat;
     const auto appdata = get_env(L"APPDATA");
@@ -312,9 +329,9 @@ bool CodexAppClient::generate_async(CodexGenerateRequest request,
         error = L"Codex is already working on a PixelForge task.";
         return false;
     }
-    if (request.repo_root.empty() || request.executable_path.empty() || request.pipe_name.empty()) {
+    if (request.repo_root.empty() || request.executable_path.empty() || request.pipe_name.empty() || request.record_pipe_name.empty()) {
         busy_.store(false, std::memory_order_relaxed);
-        error = L"PixelForge Codex integration is missing its repo, executable, or bridge path.";
+        error = L"PixelForge Codex integration is missing its repo, executable, pixel bridge, or recording bridge path.";
         return false;
     }
 
@@ -322,9 +339,6 @@ bool CodexAppClient::generate_async(CodexGenerateRequest request,
     worker_ = std::thread([this, request = std::move(request), status = std::move(status), completion = std::move(completion)]() mutable {
         std::wstring run_error;
         const bool ok = run_generation(request, status, run_error);
-        // A fresh app-server per art task prevents old image/tool history from
-        // remaining resident and guarantees the named-pipe MCP connection is
-        // released before the next task begins.
         stop_process();
         busy_.store(false, std::memory_order_relaxed);
         if (completion) completion(ok, ok ? L"Codex turn completed." : run_error);
@@ -347,7 +361,8 @@ bool CodexAppClient::ensure_server(const CodexGenerateRequest& request, std::wst
             if (GetExitCodeProcess(process_, &code) && code == STILL_ACTIVE &&
                 configured_repo_root_ == request.repo_root &&
                 configured_executable_ == request.executable_path &&
-                configured_pipe_name_ == request.pipe_name) {
+                configured_pipe_name_ == request.pipe_name &&
+                configured_record_pipe_name_ == request.record_pipe_name) {
                 return true;
             }
         }
@@ -362,13 +377,14 @@ bool CodexAppClient::ensure_server(const CodexGenerateRequest& request, std::wst
     configured_repo_root_ = request.repo_root;
     configured_executable_ = request.executable_path;
     configured_pipe_name_ = request.pipe_name;
+    configured_record_pipe_name_ = request.record_pipe_name;
     return true;
 }
 
 bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wstring& error) {
     const std::wstring launcher = find_codex_launcher();
     if (launcher.empty()) {
-        error = L"Could not find the Codex CLI. Install Codex or set PIXELFORGE_CODEX_EXE to codex.exe/codex.cmd.";
+        error = L"Could not find the Codex CLI. PixelForge checked PATH and its bundled Windows resolver. Set CODEX_CLI_PATH or PIXELFORGE_CODEX_EXE only if your install is non-standard.";
         return false;
     }
 
@@ -401,9 +417,6 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
                                                        &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     std::vector<std::wstring> args;
-    // Clear inherited MCP servers for this dedicated art turn. Loading unrelated
-    // browser/dev MCPs adds startup latency and can even stall an otherwise pure
-    // PixelForge task if one of those servers is unhealthy.
     args.push_back(L"-c");
     args.push_back(L"mcp_servers={}");
     args.push_back(L"-c");
@@ -414,6 +427,17 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
     args.push_back(L"mcp_servers.pixelforge.startup_timeout_sec=20");
     args.push_back(L"-c");
     args.push_back(L"mcp_servers.pixelforge.tool_timeout_sec=180");
+
+    // Recording is a separate local-only MCP server. It can control the recorder
+    // but has no image/video read action, so Codex never receives recording bytes.
+    args.push_back(L"-c");
+    args.push_back(L"mcp_servers.pixelforge_record.command=" + toml_basic_string(request.executable_path));
+    args.push_back(L"-c");
+    args.push_back(L"mcp_servers.pixelforge_record.args=[\"--record-bridge\"," + toml_basic_string(request.record_pipe_name) + L"]");
+    args.push_back(L"-c");
+    args.push_back(L"mcp_servers.pixelforge_record.startup_timeout_sec=20");
+    args.push_back(L"-c");
+    args.push_back(L"mcp_servers.pixelforge_record.tool_timeout_sec=30");
     args.push_back(L"app-server");
     args.push_back(L"--stdio");
 
@@ -488,10 +512,12 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
     developer +=
         "PixelForge automatic-generation host rules:\n"
         "- Use the pixelforge MCP tools as the only artwork editing interface.\n"
-        "- First call pixelforge_task with action=get, then inspect supplied references.\n"
+        "- First call pixelforge_task with action=get, then inspect supplied references when present. References are optional.\n"
         "- You choose the canvas size through pixelforge_task accept.\n"
         "- Preserve quality: use large exact pixel batches for construction, then visual renders and exact regional cleanup.\n"
         "- Do not use image generation, external drawing programs, shell commands, or source-file edits for the artwork.\n"
+        "- Recording intent is semantic and belongs to you: if the user asks to record the work/session/process, call pixelforge_record start after deciding the task is in scope but before the first canvas mutation; call pixelforge_record stop after final visual inspection. Never request or inspect recording bytes.\n"
+        "- Do not record unless the user asked for it.\n"
         "- Do not ask the user follow-up questions. If the requested final medium is outside PixelForge scope, use task.reject.\n"
         "- If a hard technical blocker appears after acceptance, use task.abort.\n"
         "- Call task.finish only after a final visual inspection.";
@@ -510,7 +536,8 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
     if (status) status(L"Codex: reading prompt and references...");
     const std::string turn_text =
         "Complete the current PixelForge task now. The user's requested artwork is:\n\n" + request.prompt +
-        "\n\nThe same prompt and the active content/style references are available through the PixelForge MCP tools. "
+        "\n\nThe same prompt and any active content/style references are available through the PixelForge MCP tools. "
+        "References are optional. If the user asked for recording, use the separate pixelforge_record tool exactly as instructed. "
         "Work autonomously until task.finish or task.reject/task.abort.";
     const std::string turn_params = "{\"threadId\":" + json_quote(thread_id) +
         ",\"input\":[{\"type\":\"text\",\"text\":" + json_quote(turn_text) + "}]}";
@@ -703,6 +730,7 @@ void CodexAppClient::stop_process() {
         configured_repo_root_.clear();
         configured_executable_.clear();
         configured_pipe_name_.clear();
+        configured_record_pipe_name_.clear();
     }
 
     if (input) CloseHandle(input);
