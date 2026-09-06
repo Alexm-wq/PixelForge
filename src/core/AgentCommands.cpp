@@ -1,8 +1,35 @@
 #include "AgentCommands.hpp"
 
+#include <cstdlib>
 #include <utility>
 
 namespace pixelforge {
+
+namespace {
+
+bool draw_line(PixelDocument::Transaction& tx, int x0, int y0, int x1, int y1, std::uint32_t argb) {
+    const int dx = std::abs(x1 - x0);
+    const int sx = x0 < x1 ? 1 : -1;
+    const int dy = -std::abs(y1 - y0);
+    const int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        if (!tx.set_pixel(x0, y0, argb)) return false;
+        if (x0 == x1 && y0 == y1) return true;
+        const int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+} // namespace
 
 AgentCommandRouter::AgentCommandRouter(PixelDocument& document, AgentTaskController& task)
     : document_(&document), task_(&task) {}
@@ -119,6 +146,29 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
                 break;
             case AgentPixelOpKind::FillRect:
                 accepted = tx.fill_rect(op.x, op.y, op.width, op.height, op.argb);
+                break;
+            case AgentPixelOpKind::HorizontalRun:
+                if (op.width <= 0) break;
+                accepted = true;
+                for (int dx = 0; dx < op.width; ++dx) {
+                    if (!tx.set_pixel(op.x + dx, op.y, op.argb)) {
+                        accepted = false;
+                        break;
+                    }
+                }
+                break;
+            case AgentPixelOpKind::VerticalRun:
+                if (op.height <= 0) break;
+                accepted = true;
+                for (int dy = 0; dy < op.height; ++dy) {
+                    if (!tx.set_pixel(op.x, op.y + dy, op.argb)) {
+                        accepted = false;
+                        break;
+                    }
+                }
+                break;
+            case AgentPixelOpKind::Line:
+                accepted = draw_line(tx, op.x, op.y, op.x2, op.y2, op.argb);
                 break;
         }
         if (!accepted) {
