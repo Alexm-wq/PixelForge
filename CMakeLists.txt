@@ -17,7 +17,7 @@ if(WIN32)
     add_executable(PixelForge WIN32
         src/win32/main_mcp.cpp
         src/win32/ImageIO.cpp
-        src/win32/AgentMcpServer.cpp
+        src/win32/AgentMcpServerFramed.cpp
     )
     target_include_directories(PixelForge PRIVATE src/core src/win32)
     target_link_libraries(PixelForge PRIVATE
