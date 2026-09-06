@@ -187,7 +187,8 @@ std::wstring bridge_pipe_argument(const std::vector<std::wstring>& args) {
 }
 
 bool has_arg(const std::vector<std::wstring>& args, std::wstring_view wanted) {
-    return std::find(args.begin(), args.end(), wanted) != args.end();
+    const std::wstring value(wanted);
+    return std::find(args.begin(), args.end(), value) != args.end();
 }
 
 } // namespace
