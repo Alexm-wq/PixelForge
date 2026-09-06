@@ -1,0 +1,9 @@
+# Copy this block into ~/.codex/config.toml on Windows.
+# Codex launches PixelForge itself; do not pre-launch --mcp manually because
+# stdio MCP requires Codex to own the process pipes.
+
+[mcp_servers.pixelforge]
+command = 'C:\dev\PixelForge\build\Release\PixelForge.exe'
+args = ["--mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
