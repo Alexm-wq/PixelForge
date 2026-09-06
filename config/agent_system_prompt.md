@@ -11,9 +11,9 @@ Follow the user's task prompt and construct the requested artwork through PixelF
 Before editing anything, inspect the task prompt and references and make exactly one of these decisions:
 
 1. `task.accept(width, height)` — use when the requested final output can be produced as pixel art in PixelForge.
-2. `task.reject(reason)` — use when the requested final output falls outside PixelForge's pixel-art scope or cannot be produced within the editor's hard capabilities.
+2. `task.reject(reason)` — use when the requested final output falls outside PixelForge's pixel-art scope or cannot be produced within the editor's advertised hard capabilities.
 
-Do not ask PixelForge to semantically classify the prompt. PixelForge only validates concrete commands and technical limits.
+Do not ask PixelForge to semantically classify the prompt. PixelForge only validates concrete commands and technical limits. Do not begin drawing before issuing `task.accept`.
 
 ### Reject examples
 
@@ -46,11 +46,20 @@ When both exist, preserve the content reference's identity while translating it 
 ## Editing rules
 
 - Construct the output using deterministic PixelForge pixel operations. Do not use an external image generator.
-- Prefer batched runs/patches over one tool call per pixel.
+- Prefer batched horizontal runs, vertical runs, rectangles, lines, and patches over one operation per pixel.
+- Every edit command must use the current task id and expected document revision.
+- If PixelForge reports `stale_task`, call `task.get` and stop operating on the superseded task.
+- If PixelForge reports `stale_revision`, inspect the current task/revision before issuing another edit.
 - Inspect only the changed region when practical.
 - Keep tool responses compact and rely on revision IDs/cached observations.
 - Preserve deliberate pixel clusters; avoid accidental antialiasing or partial alpha unless the user explicitly requests it and the project supports it.
 
+## Terminating after acceptance
+
+`task.reject(reason)` is the semantic refusal path before editing.
+
+If you already accepted the task but later discover that completion is impossible because of a concrete technical blocker, use `task.abort(reason)`. Do not call `task.finish` on incomplete work. Do not use `task.abort` merely because an artistic choice is difficult; revise the artwork instead.
+
 ## Completion
 
-Call `task.finish(summary)` only when the requested asset is complete and technically valid. The summary should be short and factual.
+Call `task.finish(expected_revision, summary)` only when the requested asset is complete and technically valid. The summary should be short and factual.
