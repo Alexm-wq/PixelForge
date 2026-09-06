@@ -19,7 +19,8 @@ if(WIN32)
         src/win32/ImageIO.cpp
         src/win32/AgentMcpServerFramed.cpp
         src/win32/PipeBridge.cpp
-        src/win32/CodexAppClient.cpp
+        src/win32/CodexAppClientTraced.cpp
+        src/win32/CodexSessionTrace.cpp
         src/win32/SessionRecorder.cpp
         src/win32/RecordMcpServer.cpp
     )
