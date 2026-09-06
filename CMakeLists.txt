@@ -20,17 +20,23 @@ if(WIN32)
         src/win32/AgentMcpServerFramed.cpp
         src/win32/PipeBridge.cpp
         src/win32/CodexAppClient.cpp
+        src/win32/SessionRecorder.cpp
+        src/win32/RecordMcpServer.cpp
     )
     target_include_directories(PixelForge PRIVATE src/core src/win32)
     target_link_libraries(PixelForge PRIVATE
         pixelforge_core
         user32 gdi32 comdlg32 ole32 windowscodecs shell32
+        mfplat mfreadwrite mfuuid
     )
     target_compile_definitions(PixelForge PRIVATE UNICODE _UNICODE NOMINMAX)
     add_custom_command(TARGET PixelForge POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/config/agent_system_prompt.md"
-            "$<TARGET_FILE_DIR:PixelForge>/agent_system_prompt.md")
+            "$<TARGET_FILE_DIR:PixelForge>/agent_system_prompt.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/codex.cmd"
+            "$<TARGET_FILE_DIR:PixelForge>/codex.cmd")
 endif()
 
 include(CTest)
