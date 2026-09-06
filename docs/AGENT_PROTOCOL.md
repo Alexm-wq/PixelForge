@@ -1,6 +1,6 @@
 # PixelForge agent protocol
 
-PixelForge supports two MCP hosting paths.
+PixelForge supports automatic and manual MCP hosting paths.
 
 ## Automatic Generate path
 
@@ -10,17 +10,18 @@ Normal GUI launch:
 PixelForge.exe
 ```
 
-The user loads references, enters a prompt, and clicks **Generate with Codex**. PixelForge then starts a local Codex App Server turn automatically. The Codex process is given only a temporary PixelForge MCP configuration that launches:
+The user optionally loads references, enters a prompt, and clicks **Generate with Codex**. PixelForge starts a local Codex App Server turn automatically and injects two private MCP connections:
 
 ```text
-PixelForge.exe --bridge <private named pipe>
+PixelForge.exe --bridge <private pixel pipe>
+PixelForge.exe --record-bridge <private recording pipe>
 ```
 
-`--bridge` is headless and stateless. It forwards MCP stdio to the already-running editor over the named pipe. The MCP server on the GUI side operates on the exact same live `PixelDocument` shown to the user.
+Both bridge modes are headless and stateless. The pixel bridge forwards to the live `PixelDocument` in the already-open GUI. The recording bridge forwards only local recorder-control commands. Neither bridge creates a second editor document.
 
 No global PixelForge MCP configuration is required for this automatic path.
 
-Each Generate operation uses a fresh ephemeral Codex thread with the PixelForge agent contract injected as developer instructions. The automatic art turn uses a read-only filesystem sandbox and no approvals; artwork therefore goes through PixelForge tools rather than repository/source writes. The task-scoped App Server is terminated after the turn to release the bridge and old observation/tool context.
+Each Generate operation uses a fresh ephemeral Codex thread with the PixelForge agent contract injected as developer instructions. The automatic art turn uses a read-only filesystem sandbox and no approvals; artwork therefore goes through PixelForge tools rather than repository/source writes. The task-scoped App Server is terminated after the turn to release bridge and observation context.
 
 ## Manual MCP path
 
@@ -30,7 +31,7 @@ For development/debugging, PixelForge can still be launched by any stdio MCP cli
 PixelForge.exe --mcp
 ```
 
-The native GUI remains visible. MCP and mouse editing operate on the same revisioned `PixelDocument` in that process.
+The native GUI remains visible. MCP and mouse editing operate on the same revisioned `PixelDocument` in that process. This manual path exposes the six artwork tools; automatic Generate additionally injects the isolated recording-control server.
 
 ## Design rule
 
@@ -41,33 +42,19 @@ Agent efficiency is optimized without reducing artwork fidelity:
 - palette indices compress the wire format only;
 - any color can always be supplied as exact `#AARRGGBB`;
 - renders are lossless PNG with nearest-neighbor integer scaling;
-- content/style references are returned at original loaded resolution;
-- unchanged observations are addressed by IDs and do not need retransmission.
+- content/style references are optional and returned at original loaded resolution;
+- unchanged observations are addressed by IDs and do not need retransmission;
+- recording video is never part of an agent observation.
 
-## MCP tool surface
+## Artwork MCP tool surface
 
-Only six broad tools are exposed so Codex does not carry a large catalog of micro-tools.
+Six broad artwork tools are exposed so Codex does not carry a large catalog of micro-tools.
 
 ### `pixelforge_task`
 
-Actions:
+Actions: `begin`, `get`, `accept`, `reject`, `abort`, `finish`.
 
-- `begin`
-- `get`
-- `accept`
-- `reject`
-- `abort`
-- `finish`
-
-The **agent owns semantic scope**. PixelForge never guesses whether the user's request is appropriate for pixel art.
-
-`accept` selects the canvas dimensions. PixelForge validates only hard limits.
-
-`reject` is used before editing for a request outside the pixel-art editor's scope.
-
-`abort` is used after acceptance only when a concrete technical blocker is discovered.
-
-`finish` requires the current document revision.
+The **agent owns semantic scope**. PixelForge never guesses whether the user's request is appropriate for pixel art. `accept` selects canvas dimensions. `reject` is used before editing for an incompatible final medium. `abort` is used after acceptance only for a concrete technical blocker. `finish` requires the current document revision.
 
 `get` supports `known_task`, `known_revision`, and `known_state`; when all still match, the response is a compact `unchanged` result instead of repeating the prompt/references.
 
@@ -87,86 +74,52 @@ L,x0,y0,x1,y1,c         integer line
 
 `c` is either a palette index or exact `#AARRGGBB`.
 
-Example:
-
-```text
-H,12,14,8,4;H,11,15,10,4;P,15,13,#FFFFFFFF;L,8,20,17,27,2
-```
-
-One call can carry up to 20,000 operations. If any operation is malformed or invalid/out-of-bounds, the complete transaction is cancelled.
-
-A successful batch with effective changes increments the document revision once. A net no-op succeeds with `changed_pixels:0` and leaves the revision unchanged. `changed_pixels` counts unique pixels whose final value differs from their initial value, including when operations overlap. Requests are limited to 8 MiB per JSONL line.
+One call can carry up to 20,000 operations. If any operation is malformed or invalid/out-of-bounds, the complete transaction is cancelled. A successful batch with effective changes increments the document revision once. A net no-op succeeds with `changed_pixels:0` and leaves revision unchanged. Requests are limited to 8 MiB per JSONL line.
 
 ### `pixelforge_view`
 
-Actions:
+Actions: `render`, `content_reference`, `style_reference`, `inspect`.
 
-- `render`
-- `content_reference`
-- `style_reference`
-- `inspect`
+`render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, scale and pixel content. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
 
-`render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, and scale. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
-
-`content_reference` and `style_reference` use the same observation-ID rule and return the loaded reference snapshot as lossless PNG at original resolution. Changing the file on disk does not change the loaded reference. Reference decoding is limited to 16384 pixels per dimension and 64 megapixels total.
-
-`render` and `inspect` work for accepted and finished tasks; edits and history require an accepted task. Render scales are 1–32, limited to 16,777,216 output pixels. Render cache keys include pixel content as well as task/revision/crop/scale, so restarting the app cannot reuse a different document's cached image.
-
-`inspect` returns row-major run-length encoded exact pixel values and is capped at 4096 pixels. Use visual renders for larger areas.
+Reference actions return the loaded reference snapshot as lossless PNG at original resolution. References are optional. `inspect` returns row-major run-length encoded exact pixels and is capped at 4096 pixels.
 
 ### `pixelforge_palette`
 
-Actions:
-
-- `get`
-- `set`
+Actions: `get`, `set`.
 
 Palette values are comma-separated `AARRGGBB` colors, up to 256 entries. The palette is an agent-side compression dictionary; it never quantizes existing artwork.
 
 ### `pixelforge_history`
 
-Actions:
-
-- `undo`
-- `redo`
-
-Both require task ID + expected revision.
+Actions: `undo`, `redo`. Both require task ID + expected revision.
 
 ### `pixelforge_io`
 
-Currently exposes lossless native-resolution PNG `export` with task/revision validation.
+Exposes lossless native-resolution PNG `export` with task/revision validation.
+
+## Recording-control MCP
+
+Automatic Generate exposes one additional tool, `pixelforge_record`, on a separate MCP server. Recording intent remains semantic: Codex uses it only when the user's prompt asks to record the work/session/process.
+
+Actions:
+
+- `start` — requires `task_id`; optional `fps` 1–60, default 30.
+- `status` — returns recording boolean and frame count.
+- `stop` — finalizes the local MP4.
+
+Recording should start after the agent decides the task is in scope but before the first canvas mutation, and stop after final visual inspection. PixelForge automatically finalizes an active recording when the Codex turn ends as a safety net.
+
+The recorder captures the visible PixelForge client area and writes H.264 MP4 under the local `recordings` directory. The recording MCP intentionally exposes **no** path parameter for agent-chosen output, no video-read operation, no frame/preview operation, and no video bytes. `pixelforge_view` cannot access recordings either.
 
 ## Revision discipline
 
-Every edit/history command carries:
-
-```text
-task_id
-expected_revision
-```
-
-If the user manually changes the sprite while Codex is working, a stale command fails instead of overwriting newer work. Codex should inspect/re-render the relevant area and continue from the returned current revision.
+Every edit/history command carries `task_id` and `expected_revision`. If the user manually changes the sprite while Codex is working, a stale command fails instead of overwriting newer work. Codex should inspect/re-render the relevant area and continue from the returned current revision.
 
 ## Recommended observation cadence
 
-Do not render after every batch.
-
-Prefer:
-
-1. establish silhouette with a large batch;
-2. render whole sprite;
-3. refine anatomy/shading by region with large patches;
-4. render only changed crops;
-5. use compact `inspect` for exact cluster cleanup;
-6. final whole-sprite render;
-7. finish.
-
-This keeps visual quality high while avoiding unnecessary image/tool round-trips.
+Do not render after every batch. Prefer: establish silhouette with a large batch; render whole sprite; refine anatomy/shading by region; render changed crops; use compact inspect for cleanup; final whole-sprite render; stop any requested recording; finish.
 
 ## Transport
 
-The PixelForge MCP transport uses newline-delimited JSON-RPC. PixelForge compacts internal formatting at the wire boundary so every response occupies exactly one transport line.
-
-The server supports the initialize/tools flow used by stdio MCP clients and also recognizes `server/discover`.
-
-Automatic Generate adds a separate Codex App Server JSONL control channel above MCP. PixelForge owns that control channel; the Codex-launched `--bridge` process owns only the MCP stdio channel and contains no artwork state.
+PixelForge MCP uses newline-delimited JSON-RPC. The artwork server compacts internal formatting at the wire boundary so every response occupies one transport line. Automatic Generate adds a separate Codex App Server JSONL control channel above MCP. PixelForge owns that control channel; Codex-launched bridge processes own only their MCP stdio channels and contain no artwork/video state.
