@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <cctype>
+#include <utility>
 
 namespace pixelforge {
 
@@ -9,6 +10,37 @@ namespace {
 
 void skip_ws(std::string_view text, std::size_t& p) {
     while (p < text.size() && std::isspace(static_cast<unsigned char>(text[p]))) ++p;
+}
+
+bool parse_hex4(std::string_view text, std::size_t& p, std::uint32_t& value) {
+    if (p + 4 > text.size()) return false;
+    value = 0;
+    for (int i = 0; i < 4; ++i) {
+        const char c = text[p++];
+        value <<= 4;
+        if (c >= '0' && c <= '9') value |= static_cast<std::uint32_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') value |= static_cast<std::uint32_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') value |= static_cast<std::uint32_t>(c - 'A' + 10);
+        else return false;
+    }
+    return true;
+}
+
+void append_utf8(std::string& out, std::uint32_t cp) {
+    if (cp <= 0x7f) out.push_back(static_cast<char>(cp));
+    else if (cp <= 0x7ff) {
+        out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp <= 0xffff) {
+        out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
 }
 
 bool parse_string(std::string_view text, std::size_t& p, std::string& out, std::string& error) {
@@ -39,8 +71,33 @@ bool parse_string(std::string_view text, std::size_t& p, std::string& out, std::
             case 'n': out.push_back('\n'); break;
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
+            case 'u': {
+                std::uint32_t cp = 0;
+                if (!parse_hex4(text, p, cp)) {
+                    error = "Invalid JSON Unicode escape.";
+                    return false;
+                }
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (p + 6 > text.size() || text[p] != '\\' || text[p + 1] != 'u') {
+                        error = "High surrogate must be followed by a low surrogate.";
+                        return false;
+                    }
+                    p += 2;
+                    std::uint32_t low = 0;
+                    if (!parse_hex4(text, p, low) || low < 0xdc00 || low > 0xdfff) {
+                        error = "Invalid JSON low surrogate.";
+                        return false;
+                    }
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    error = "Unexpected JSON low surrogate.";
+                    return false;
+                }
+                append_utf8(out, cp);
+                break;
+            }
             default:
-                error = "Unsupported JSON escape. Use UTF-8 directly; \\u escapes are not required by the PixelForge protocol.";
+                error = "Unsupported JSON escape.";
                 return false;
         }
     }
