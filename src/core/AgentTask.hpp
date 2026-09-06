@@ -12,6 +12,7 @@ enum class TaskState {
     AwaitingAgentDecision,
     Accepted,
     Rejected,
+    Aborted,
     Finished
 };
 
@@ -42,6 +43,7 @@ public:
     std::uint64_t begin(std::string prompt);
     bool accept(int width, int height, std::string* error = nullptr);
     bool reject(std::string reason, std::string* error = nullptr);
+    bool abort(std::string reason, std::string* error = nullptr);
     bool finish(std::string summary, std::string* error = nullptr);
 
     void set_content_reference(ReferenceSlot reference);
@@ -49,6 +51,9 @@ public:
 
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
+    [[nodiscard]] bool terminal() const noexcept {
+        return state_ == TaskState::Rejected || state_ == TaskState::Aborted || state_ == TaskState::Finished;
+    }
 
 private:
     PixelDocument* document_ = nullptr;
