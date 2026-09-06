@@ -220,7 +220,7 @@ void paint(HWND hwnd) {
     draw_canvas(dc, canvas);
 
     const int rx = client.right - right;
-    const int ref_height = std::max(180, (client.bottom - 30) / 2);
+    const int ref_height = std::max(180, static_cast<int>((client.bottom - 30) / 2));
     RECT content{rx + 8, 8, client.right - 8, 8 + ref_height};
     RECT style{rx + 8, 16 + ref_height, client.right - 8, client.bottom - 8};
     draw_reference(dc, content, g_app.content_reference, L"CONTENT REFERENCE");
