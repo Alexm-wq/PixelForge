@@ -8,6 +8,24 @@ using Microsoft::WRL::ComPtr;
 
 namespace pixelforge::win32 {
 
+namespace {
+
+struct ScopedComApartment {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    ~ScopedComApartment() {
+        if (SUCCEEDED(result)) CoUninitialize();
+    }
+
+    [[nodiscard]] bool usable() const noexcept {
+        // RPC_E_CHANGED_MODE means this thread already has a different COM
+        // apartment (the GUI uses STA). COM is still initialized and WIC is usable.
+        return SUCCEEDED(result) || result == RPC_E_CHANGED_MODE;
+    }
+};
+
+} // namespace
+
 static std::wstring hresult_message(HRESULT hr) {
     wchar_t* buffer = nullptr;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -28,6 +46,12 @@ static bool create_factory(ComPtr<IWICImagingFactory>& factory, std::wstring& er
 }
 
 bool load_image_wic(const std::wstring& path, ImageData& out, std::wstring& error) {
+    ScopedComApartment com;
+    if (!com.usable()) {
+        error = hresult_message(com.result);
+        return false;
+    }
+
     ComPtr<IWICImagingFactory> factory;
     if (!create_factory(factory, error)) return false;
 
@@ -73,6 +97,12 @@ bool save_png_wic(const std::wstring& path, int width, int height,
                   const std::vector<std::uint32_t>& argb, std::wstring& error) {
     if (width <= 0 || height <= 0 || argb.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
         error = L"Canvas is empty or malformed.";
+        return false;
+    }
+
+    ScopedComApartment com;
+    if (!com.usable()) {
+        error = hresult_message(com.result);
         return false;
     }
 
