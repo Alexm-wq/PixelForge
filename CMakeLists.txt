@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(pixelforge_core
     src/core/PixelDocument.cpp
     src/core/AgentTask.cpp
+    src/core/AgentCommands.cpp
 )
 target_include_directories(pixelforge_core PUBLIC src/core)
 
