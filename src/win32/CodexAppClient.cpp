@@ -500,7 +500,7 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
         ",\"approvalPolicy\":\"never\",\"sandbox\":\"read-only\",\"ephemeral\":true,"
         "\"serviceName\":\"PixelForge\",\"developerInstructions\":" + json_quote(developer) + "}";
     std::string thread_result;
-    if (!request("thread/start", thread_params, thread_result, error)) return false;
+    if (!this->request("thread/start", thread_params, thread_result, error)) return false;
     const std::string thread_id = nested_string(thread_result, {"thread", "id"});
     if (thread_id.empty()) {
         error = L"Codex App Server did not return a thread id.";
@@ -515,7 +515,7 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
     const std::string turn_params = "{\"threadId\":" + json_quote(thread_id) +
         ",\"input\":[{\"type\":\"text\",\"text\":" + json_quote(turn_text) + "}]}";
     std::string turn_result;
-    if (!request("turn/start", turn_params, turn_result, error)) return false;
+    if (!this->request("turn/start", turn_params, turn_result, error)) return false;
 
     if (status) status(L"Codex: working in PixelForge...");
     for (;;) {
