@@ -1,5 +1,7 @@
 #include "CodexAppClient.hpp"
 #include "PipeBridge.hpp"
+#include "RecordMcpServer.hpp"
+#include "SessionRecorder.hpp"
 
 // Keep the original GUI implementation as the rendering/editing surface, but
 // rename its entrypoint and window proc in this translation unit. The automatic
@@ -25,8 +27,11 @@ constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
 
 pixelforge::win32::CodexAppClient g_codex_client;
+pixelforge::win32::SessionRecorder g_session_recorder;
 std::unique_ptr<pixelforge::win32::PipeMcpHost> g_pipe_host;
+std::unique_ptr<pixelforge::win32::RecordMcpHost> g_record_pipe_host;
 std::wstring g_pipe_name;
+std::wstring g_record_pipe_name;
 std::wstring g_repo_root;
 std::wstring g_executable_path;
 HWND g_codex_status = nullptr;
@@ -61,6 +66,14 @@ void post_codex_status(HWND hwnd, std::wstring text) {
     if (!PostMessageW(hwnd, WM_CODEX_STATUS, 0, reinterpret_cast<LPARAM>(owned))) delete owned;
 }
 
+void finalize_recording_if_needed(HWND hwnd) {
+    if (!g_session_recorder.active()) return;
+    std::wstring recording_error;
+    if (!g_session_recorder.stop(recording_error)) {
+        post_codex_status(hwnd, L"Recording finalize error: " + recording_error);
+    }
+}
+
 void start_automatic_generation(HWND hwnd) {
     if (g_codex_client.busy()) {
         show_error(hwnd, L"Codex is already working on the current PixelForge task.");
@@ -73,8 +86,9 @@ void start_automatic_generation(HWND hwnd) {
         show_error(hwnd, L"Enter a PixelForge prompt before generating.");
         return;
     }
-    if (g_repo_root.empty() || g_executable_path.empty() || g_pipe_name.empty()) {
-        show_error(hwnd, L"PixelForge could not resolve its repo/executable/agent bridge paths.");
+    if (g_repo_root.empty() || g_executable_path.empty() || g_pipe_name.empty() || g_record_pipe_name.empty() ||
+        !g_pipe_host || !g_record_pipe_host) {
+        show_error(hwnd, L"PixelForge could not resolve or start its Codex bridge services.");
         return;
     }
 
@@ -90,6 +104,7 @@ void start_automatic_generation(HWND hwnd) {
     request.repo_root = g_repo_root;
     request.executable_path = g_executable_path;
     request.pipe_name = g_pipe_name;
+    request.record_pipe_name = g_record_pipe_name;
     request.prompt = prompt;
     request.agent_contract = read_utf8_file(std::filesystem::path(g_repo_root) / L"config" / L"agent_system_prompt.md");
 
@@ -101,6 +116,10 @@ void start_automatic_generation(HWND hwnd) {
             PostMessageW(hwnd, WM_AGENT_UPDATED, 0, 0);
         },
         [hwnd](bool ok, std::wstring message) {
+            // Safety net: if the agent requested recording but failed to stop it,
+            // finalize the local MP4 when the Codex turn ends.
+            finalize_recording_if_needed(hwnd);
+
             AgentTaskSnapshot snapshot;
             {
                 std::lock_guard lock(g_state_mutex);
@@ -123,6 +142,7 @@ void start_automatic_generation(HWND hwnd) {
         error);
 
     if (!started) {
+        finalize_recording_if_needed(hwnd);
         post_codex_status(hwnd, L"Codex: idle.");
         show_error(hwnd, error);
     }
@@ -153,13 +173,15 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     }
 
     if (msg == WM_TIMER && wparam == CODEX_REFRESH_TIMER) {
-        if (g_codex_client.busy()) InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_codex_client.busy() || g_session_recorder.active()) InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
     if (msg == WM_DESTROY) {
         KillTimer(hwnd, CODEX_REFRESH_TIMER);
         g_codex_client.shutdown();
+        finalize_recording_if_needed(hwnd);
+        if (g_record_pipe_host) g_record_pipe_host->stop();
         if (g_pipe_host) g_pipe_host->stop();
         return pixelforge_legacy_wndproc(hwnd, msg, wparam, lparam);
     }
@@ -179,9 +201,9 @@ std::vector<std::wstring> command_line_args() {
     return out;
 }
 
-std::wstring bridge_pipe_argument(const std::vector<std::wstring>& args) {
+std::wstring option_argument(const std::vector<std::wstring>& args, std::wstring_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
-        if (args[i] == L"--bridge") return args[i + 1];
+        if (args[i] == option) return args[i + 1];
     }
     return {};
 }
@@ -196,8 +218,11 @@ bool has_arg(const std::vector<std::wstring>& args, std::wstring_view wanted) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show) {
     const auto args = command_line_args();
 
-    if (const auto pipe = bridge_pipe_argument(args); !pipe.empty()) {
+    if (const auto pipe = option_argument(args, L"--bridge"); !pipe.empty()) {
         return pixelforge::win32::run_mcp_bridge_stdio(pipe);
+    }
+    if (const auto pipe = option_argument(args, L"--record-bridge"); !pipe.empty()) {
+        return pixelforge::win32::run_record_bridge_stdio(pipe);
     }
 
     // Preserve the manual "Codex launches PixelForge as its MCP server" mode.
@@ -209,6 +234,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     g_executable_path = executable_path();
     g_repo_root = find_repo_root(g_executable_path);
     g_pipe_name = pixelforge::win32::make_agent_pipe_name();
+    g_record_pipe_name = pixelforge::win32::make_record_pipe_name();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = automatic_wndproc;
@@ -245,6 +271,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         g_pipe_host.reset();
     }
 
+    pixelforge::win32::RecordMcpBindings record_bindings;
+    record_bindings.recorder = &g_session_recorder;
+    record_bindings.task = &g_app.task;
+    record_bindings.state_mutex = &g_state_mutex;
+    record_bindings.hwnd = hwnd;
+    record_bindings.recording_directory = (std::filesystem::path(g_repo_root) / L"recordings").wstring();
+    g_record_pipe_host = std::make_unique<pixelforge::win32::RecordMcpHost>();
+    std::wstring record_pipe_error;
+    if (!g_record_pipe_host->start(g_record_pipe_name, std::move(record_bindings), record_pipe_error)) {
+        show_error(hwnd, record_pipe_error);
+        g_record_pipe_host.reset();
+    }
+
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -252,6 +291,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     }
 
     g_codex_client.shutdown();
+    finalize_recording_if_needed(hwnd);
+    if (g_record_pipe_host) g_record_pipe_host->stop();
     if (g_pipe_host) g_pipe_host->stop();
     if (SUCCEEDED(com)) CoUninitialize();
     return static_cast<int>(msg.wParam);
