@@ -8,6 +8,7 @@
 #include <fstream>
 #include <optional>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -321,6 +322,10 @@ bool CodexAppClient::generate_async(CodexGenerateRequest request,
     worker_ = std::thread([this, request = std::move(request), status = std::move(status), completion = std::move(completion)]() mutable {
         std::wstring run_error;
         const bool ok = run_generation(request, status, run_error);
+        // A fresh app-server per art task prevents old image/tool history from
+        // remaining resident and guarantees the named-pipe MCP connection is
+        // released before the next task begins.
+        stop_process();
         busy_.store(false, std::memory_order_relaxed);
         if (completion) completion(ok, ok ? L"Codex turn completed." : run_error);
     });
@@ -396,6 +401,11 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
                                                        &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     std::vector<std::wstring> args;
+    // Clear inherited MCP servers for this dedicated art turn. Loading unrelated
+    // browser/dev MCPs adds startup latency and can even stall an otherwise pure
+    // PixelForge task if one of those servers is unhealthy.
+    args.push_back(L"-c");
+    args.push_back(L"mcp_servers={}");
     args.push_back(L"-c");
     args.push_back(L"mcp_servers.pixelforge.command=" + toml_basic_string(request.executable_path));
     args.push_back(L"-c");
@@ -487,7 +497,7 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
         "- Call task.finish only after a final visual inspection.";
 
     const std::string thread_params = "{\"cwd\":" + json_quote(cwd) +
-        ",\"approvalPolicy\":\"never\",\"sandbox\":\"readOnly\",\"ephemeral\":true,"
+        ",\"approvalPolicy\":\"never\",\"sandbox\":\"read-only\",\"ephemeral\":true,"
         "\"serviceName\":\"PixelForge\",\"developerInstructions\":" + json_quote(developer) + "}";
     std::string thread_result;
     if (!request("thread/start", thread_params, thread_result, error)) return false;
@@ -690,7 +700,6 @@ void CodexAppClient::stop_process() {
         output = std::exchange(stdout_read_, nullptr);
         log = std::exchange(stderr_log_, nullptr);
         process_id_ = 0;
-        receive_buffer_.clear();
         configured_repo_root_.clear();
         configured_executable_.clear();
         configured_pipe_name_.clear();
@@ -704,6 +713,7 @@ void CodexAppClient::stop_process() {
     }
     if (output) CloseHandle(output);
     if (log) CloseHandle(log);
+    receive_buffer_.clear();
 }
 
 } // namespace pixelforge::win32
