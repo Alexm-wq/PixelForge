@@ -4,7 +4,31 @@ Agent-native pixel-art editor for Codex.
 
 PixelForge is a native C++ pixel editor designed around a compact agent protocol. The GUI is for the user; Codex edits the exact same live document through MCP rather than GUI automation.
 
-## Implemented workflow
+## Automatic workflow
+
+The default PixelForge executable now drives Codex directly through Codex App Server.
+
+Normal use is:
+
+1. Launch `build/Release/PixelForge.exe` normally — no command-line arguments.
+2. Load an optional **Content Reference**.
+3. Load an optional **Style Reference**.
+4. Enter the artwork prompt.
+5. Click **Generate with Codex**.
+6. PixelForge creates the task, starts a dedicated Codex App Server art turn, exposes the live document through a private named-pipe MCP bridge, and updates the canvas while Codex works.
+7. Codex chooses the canvas size, draws/refines the sprite, then calls `task.finish`, `task.reject`, or `task.abort`.
+
+You do **not** need to open a Codex chat or send a second prompt. PixelForge uses the existing local Codex CLI login. If `codex.exe`/`codex.cmd` is not on PATH, set `PIXELFORGE_CODEX_EXE` to its full path.
+
+Automatic art turns are intentionally isolated: Codex runs with `approvalPolicy=never`, a read-only filesystem sandbox, and only the PixelForge MCP server injected for that turn. Artwork changes therefore go through PixelForge's revisioned pixel tools rather than shell/file edits. A fresh ephemeral Codex context is used for each Generate operation.
+
+Codex App Server diagnostics are written to:
+
+```text
+build/pixelforge-codex-app-server.log
+```
+
+## Implemented editor/agent features
 
 - Dependency-free Win32 C++20 UI (Win32/GDI/WIC only)
 - Editable nearest-neighbor pixel canvas
@@ -15,7 +39,9 @@ PixelForge is a native C++ pixel editor designed around a compact agent protocol
 - Lossless transparent PNG export
 - Revisioned atomic batch edits
 - Delta undo/redo
-- Live stdio MCP server via `PixelForge.exe --mcp`
+- Automatic Generate → Codex App Server integration
+- Private named-pipe MCP bridge into the already-open GUI document
+- Manual stdio MCP mode via `PixelForge.exe --mcp`
 - Six-tool compact MCP surface rather than many micro-tools
 - Palette-indexed compact patches with exact `#AARRGGBB` fallback
 - Cached render observations with observation IDs
@@ -47,20 +73,15 @@ ctest --test-dir build -C Release --output-on-failure
 
 The executable will be under `build/Release/PixelForge.exe` for the standard Visual Studio generator layout.
 
-For a repeatable configure/build/test workflow, run `./build.ps1` from PowerShell.
-Use `./build.ps1 -Configuration Debug` for Debug or add `-Run` to open the tested
-GUI. Requires CMake, Visual Studio 2022 C++ Build Tools and a Windows SDK.
-The script works relative to its own folder and does not pull Git changes or
-terminate an existing editor. Close the application before rebuilding its EXE.
+For a repeatable configure/build/test workflow, run `./build.ps1` from PowerShell. Use `./build.ps1 -Configuration Debug` for Debug or add `-Run` to open the tested GUI. Requires CMake, Visual Studio 2022 C++ Build Tools and a Windows SDK.
 
-CTest includes always-active core checks and a real MCP integration test that
-launches hidden app instances, draws a gem, checks revisions/history/cache behavior
-and verifies PNG pixels and transparency. Its example output is
-`build/test-output/mcp-gem.png`. Windows CI publishes the executable and prompt.
+The user's incremental `rebuild_pixelforge.bat` workflow remains compatible with the same target/output path.
 
-## Connect Codex
+## Manual Codex-driven MCP mode
 
-Copy the example block from `config/codex_mcp.toml.example` into your Codex `~/.codex/config.toml`:
+Automatic Generate does **not** require a global PixelForge MCP entry in `~/.codex/config.toml`; PixelForge injects a temporary private bridge into the Codex App Server process itself.
+
+For development/debugging where Codex should launch PixelForge as an ordinary MCP server, the old mode is still supported. Copy the example from `config/codex_mcp.toml.example`:
 
 ```toml
 [mcp_servers.pixelforge]
@@ -70,15 +91,15 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 ```
 
-Start a new Codex session after changing the MCP configuration. Codex owns the stdio pipes and launches PixelForge automatically. The PixelForge GUI opens normally, but the same process also serves MCP.
+In this manual mode, Codex owns the stdio pipes and launches PixelForge. Do not pre-launch `PixelForge.exe --mcp` yourself.
 
-Do **not** manually launch `PixelForge.exe --mcp` before Codex. A stdio MCP server must be launched by the MCP client that owns its stdin/stdout pipes.
+`--bridge <pipe>` is an internal headless mode used by automatic Generate. It forwards Codex MCP stdio to the named-pipe server owned by the already-open PixelForge GUI; it does not create a second document or second editor window.
 
 ## Efficient agent workflow
 
-A typical task should be roughly:
+A typical task is:
 
-1. `pixelforge_task(get)` to read a task entered in the GUI, or `begin` when Codex originates it.
+1. `pixelforge_task(get)` to read the GUI-created task.
 2. Read content/style references once with `pixelforge_view`.
 3. `accept` with the requested/inferred pixel canvas size.
 4. Optionally set a compact working palette once.
@@ -86,7 +107,7 @@ A typical task should be roughly:
 6. Request a render only when visual judgment is useful.
 7. Reuse `known_observation` to avoid retransmitting unchanged images.
 8. Use cropped renders/inspection during local cleanup rather than repeatedly observing the whole canvas.
-9. `finish`, then export the native-resolution PNG.
+9. Final whole-sprite visual inspection, then `finish`.
 
 Patch grammar:
 
@@ -104,19 +125,13 @@ L,x0,y0,x1,y1,c         exact integer line
 
 Canvas renders are cached by task, revision, crop, and integer scale. They are encoded as lossless PNG with nearest-neighbor scaling. If Codex supplies the returned `known_observation` ID for the same unchanged render, PixelForge returns only an `unchanged` response instead of sending the image again.
 
-Content and style references are also observation-addressed and are sent at their original resolution rather than silently downscaled.
+Content and style references are observation-addressed and sent at their original loaded resolution rather than silently downscaled.
 
 ## Agent contract
 
-The ready-to-use system prompt is **`config/agent_system_prompt.md`**. Have the
-drawing agent read this file before using the six tools, or put its contents in
-the agent's system instructions. The build also copies it beside `PixelForge.exe`.
-It contains exact arguments, patch examples, limits, visual refinement guidance,
-stale-revision recovery and the finish/export workflow.
+The system contract is `config/agent_system_prompt.md`. Automatic Generate injects it into the Codex thread as developer instructions, so the agent does not need an extra filesystem read to learn PixelForge's scope and workflow. The build also copies the file beside `PixelForge.exe`.
 
-PixelForge currently edits one in-memory canvas. Export before closing: there is
-no project save/reopen, canvas import, layer or animation support. Reference slots
-load images for observation; they do not import pixels into the canvas.
+PixelForge currently edits one in-memory canvas. Export before closing: there is no project save/reopen, canvas import, layer or animation support. Reference slots load images for observation; they do not import pixels into the canvas.
 
 See:
 
