@@ -1,6 +1,13 @@
-# Copy this block into ~/.codex/config.toml on Windows.
-# Codex launches PixelForge itself; do not pre-launch --mcp manually because
-# stdio MCP requires Codex to own the process pipes.
+# OPTIONAL MANUAL MODE ONLY.
+#
+# Normal PixelForge usage does NOT require this block. Launch PixelForge.exe,
+# load references, enter a prompt, and click "Generate with Codex"; PixelForge
+# starts Codex App Server and injects a private named-pipe MCP bridge itself.
+#
+# Use this config only when you want an ordinary Codex session to launch and
+# control PixelForge directly as a stdio MCP server.
+# Do not pre-launch PixelForge.exe --mcp because the MCP client must own its
+# stdin/stdout pipes.
 
 [mcp_servers.pixelforge]
 command = 'C:\dev\PixelForge\build\Release\PixelForge.exe'
