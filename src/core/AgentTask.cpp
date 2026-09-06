@@ -47,6 +47,20 @@ bool AgentTaskController::reject(std::string reason, std::string* error) {
     return true;
 }
 
+bool AgentTaskController::abort(std::string reason, std::string* error) {
+    if (state_ != TaskState::Accepted) {
+        if (error) *error = "task.abort is only valid after the agent accepted the task.";
+        return false;
+    }
+    if (reason.empty()) {
+        if (error) *error = "task.abort requires a user-facing reason.";
+        return false;
+    }
+    state_ = TaskState::Aborted;
+    status_message_ = std::move(reason);
+    return true;
+}
+
 bool AgentTaskController::finish(std::string summary, std::string* error) {
     if (state_ != TaskState::Accepted) {
         if (error) *error = "task.finish requires an accepted task.";
@@ -86,6 +100,7 @@ const char* task_state_name(TaskState state) noexcept {
         case TaskState::AwaitingAgentDecision: return "AWAITING AGENT";
         case TaskState::Accepted: return "ACCEPTED";
         case TaskState::Rejected: return "REJECTED";
+        case TaskState::Aborted: return "ABORTED";
         case TaskState::Finished: return "FINISHED";
     }
     return "UNKNOWN";
