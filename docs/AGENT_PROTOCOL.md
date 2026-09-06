@@ -1,106 +1,144 @@
-# Agent protocol
+# PixelForge agent protocol
 
-The C++ core exposes a stable typed command router in `src/core/AgentCommands.*`. The future MCP/stdio adapter should remain thin and map wire commands directly onto this surface.
+PixelForge exposes a live stdio MCP server when launched as:
 
-## Task lifecycle
-
-### `task.get`
-Returns the active task, original user prompt, reference metadata, current revision, state, canvas metadata, and hard editor limits.
-
-### `task.accept`
-Agent semantic decision that the prompt is in scope.
-
-```json
-{"task_id":7,"width":64,"height":64}
+```text
+PixelForge.exe --mcp
 ```
 
-The editor does not decide whether the prompt is pixel art. It validates only the concrete canvas request and resource limits, creates the canvas, and returns the new revision.
+The native GUI remains visible. MCP and mouse editing operate on the same revisioned `PixelDocument`.
 
-### `task.reject`
-Agent semantic decision to terminate before editing.
+## Design rule
 
-```json
-{"task_id":7,"reason":"PixelForge produces pixel-art assets; this task requests a photorealistic painting."}
+Agent efficiency is optimized without reducing artwork fidelity:
+
+- the canvas remains full 32-bit ARGB;
+- edits are exact deterministic pixel operations;
+- palette indices compress the wire format only;
+- any color can always be supplied as exact `#AARRGGBB`;
+- renders are lossless PNG with nearest-neighbor integer scaling;
+- content/style references are returned at original resolution;
+- unchanged observations are addressed by IDs and do not need retransmission.
+
+## MCP tool surface
+
+Only six broad tools are exposed so Codex does not carry a large catalog of micro-tools.
+
+### `pixelforge_task`
+
+Actions:
+
+- `begin`
+- `get`
+- `accept`
+- `reject`
+- `abort`
+- `finish`
+
+The **agent owns semantic scope**. PixelForge never guesses whether the user's request is appropriate for pixel art.
+
+`accept` selects the canvas dimensions. PixelForge validates only hard limits.
+
+`reject` is used before editing for a request outside the pixel-art editor's scope.
+
+`abort` is used after acceptance only when a concrete technical blocker is discovered.
+
+`finish` requires the current document revision.
+
+`get` supports `known_task`, `known_revision`, and `known_state`; when all still match, the response is a compact `unchanged` result instead of repeating the prompt/references.
+
+### `pixelforge_edit`
+
+Applies one atomic patch at an expected revision.
+
+Patch grammar:
+
+```text
+P,x,y,c                 single pixel
+H,x,y,len,c             horizontal run
+V,x,y,len,c             vertical run
+R,x,y,width,height,c    filled rectangle
+L,x0,y0,x1,y1,c         integer line
 ```
 
-This is a terminal task state. The reason is agent-authored and user-facing.
+`c` is either a palette index or exact `#AARRGGBB`.
 
-### `task.abort`
-Technical failure discovered after the agent already accepted the task.
+Example:
 
-```json
-{"task_id":7,"reason":"The requested explicit canvas exceeds the active editor resource limit."}
+```text
+H,12,14,8,4;H,11,15,10,4;P,15,13,#FFFFFFFF;L,8,20,17,27,2
 ```
 
-`abort` is not a second semantic classifier. It exists so an accepted task can terminate cleanly if a concrete blocker is discovered later.
+One call can carry up to 20,000 operations. If any operation is malformed or invalid/out-of-bounds, the complete transaction is cancelled.
 
-### `task.finish`
-Marks an accepted task complete. It is revision-guarded so the agent cannot finish a sprite after the user or another client changed it behind its back.
+A successful batch increments the document revision once regardless of how many pixels changed.
 
-```json
-{"task_id":7,"expected_revision":18,"summary":"Finished 64x64 queen sprite."}
+### `pixelforge_view`
+
+Actions:
+
+- `render`
+- `content_reference`
+- `style_reference`
+- `inspect`
+
+`render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, and scale. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
+
+`content_reference` and `style_reference` use the same observation-ID rule and return the original image data rather than silently reducing reference quality.
+
+`inspect` returns row-major run-length encoded exact pixel values and is capped at 4096 pixels. Use visual renders for larger areas.
+
+### `pixelforge_palette`
+
+Actions:
+
+- `get`
+- `set`
+
+Palette values are comma-separated `AARRGGBB` colors, up to 256 entries. The palette is an agent-side compression dictionary; it never quantizes existing artwork.
+
+### `pixelforge_history`
+
+Actions:
+
+- `undo`
+- `redo`
+
+Both require task ID + expected revision.
+
+### `pixelforge_io`
+
+Currently exposes lossless native-resolution PNG `export` with task/revision validation.
+
+## Revision discipline
+
+Every edit/history command carries:
+
+```text
+task_id
+expected_revision
 ```
 
-## Editing commands
+If the user manually changes the sprite while Codex is working, a stale command fails instead of overwriting newer work. Codex should inspect/re-render the relevant area and continue from the returned current revision.
 
-All agent edits are atomic and revision-guarded:
+## Recommended observation cadence
 
-```json
-{
-  "task_id":7,
-  "expected_revision":18,
-  "ops":[
-    {"kind":"horizontal_run","x":12,"y":20,"width":14,"argb":"ff36505a"},
-    {"kind":"line","x":19,"y":10,"x2":25,"y2":18,"argb":"ff78aab0"}
-  ]
-}
-```
+Do not render after every batch.
 
-Implemented primitive kinds:
+Prefer:
 
-- `set_pixel`
-- `fill_rect`
-- `horizontal_run`
-- `vertical_run`
-- `line`
+1. establish silhouette with a large batch;
+2. render whole sprite;
+3. refine anatomy/shading by region with large patches;
+4. render only changed crops;
+5. use compact `inspect` for exact cluster cleanup;
+6. final whole-sprite render;
+7. finish + export.
 
-A batch is all-or-nothing. One malformed/out-of-bounds operation cancels the entire transaction. A successful batch increments the document revision once regardless of how many pixels changed.
+This keeps visual quality high while avoiding unnecessary image/tool round-trips.
 
-## Inspection and history
+## Transport
 
-The router also exposes:
+The MCP stdio transport uses newline-delimited JSON-RPC. PixelForge compacts internal formatting at the wire boundary so every response occupies exactly one transport line.
 
-- region inspection at an expected revision
-- undo at an expected revision
-- redo at an expected revision
-
-These use the same task-id/revision guards as editing.
-
-## Concurrency rules
-
-Every mutating agent command targets both a `task_id` and, after acceptance, an `expected_revision`.
-
-- `stale_task`: the user started/replaced the task; the agent must stop operating on the old task.
-- `stale_revision`: the document changed since the agent last observed it; the agent must refresh before editing.
-
-This is intentional. PixelForge may be open while the user manually edits the same canvas.
-
-## Intended compact MCP surface
-
-The final adapter should expose only a few coarse tools:
-
-- `task` — get / accept / reject / abort / finish
-- `inspect` — metadata / region / palette / lint / revision deltas
-- `render` — cached visual observation of full canvas or crop
-- `edit` — semantic batched primitives
-- `patch` — compact indexed pixel-run patches
-- `history` — checkpoint / undo / redo / compare
-- `io` — open / save / export
-
-Do not expose one tool per pixel operation. Batchability and observation caching are first-class requirements.
-
-## Validation boundary
-
-**Agent:** semantic scope, prompt interpretation, canvas-size choice, art decisions, completion/refusal.
-
-**Editor:** bounds, file decoding, dimensions, coordinate validity, resource caps, transactional consistency, revision conflicts.
+The server supports the legacy initialize/tools flow used by stdio MCP clients and also recognizes the current `server/discover` method.
