@@ -18,7 +18,7 @@ using Microsoft::WRL::ComPtr;
 namespace pixelforge::win32 {
 namespace {
 
-constexpr std::uint64_t kMaxReferencePixels = 512ull * 512ull;
+constexpr std::uint64_t kMaxReferencePixels = 256ull * 256ull;
 
 int base64_value(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -92,14 +92,17 @@ bool resize_png(const std::vector<std::uint8_t>& input,
     if (input.empty() || input.size() > static_cast<std::size_t>(MAXDWORD)) return false;
 
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool uninit = SUCCEEDED(com);
+    // Destroy WIC interfaces before leaving the apartment, on every return path.
+    struct ApartmentGuard {
+        bool active;
+        ~ApartmentGuard() { if (active) CoUninitialize(); }
+    } apartment{SUCCEEDED(com)};
     if (FAILED(com) && com != RPC_E_CHANGED_MODE) return false;
 
     ComPtr<IWICImagingFactory> factory;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
-        if (uninit) CoUninitialize();
         return false;
     }
 
@@ -121,13 +124,11 @@ bool resize_png(const std::vector<std::uint8_t>& input,
     UINT source_height = 0;
     if (SUCCEEDED(hr)) hr = frame->GetSize(&source_width, &source_height);
     if (FAILED(hr) || source_width == 0 || source_height == 0) {
-        if (uninit) CoUninitialize();
         return false;
     }
 
     fit_area(source_width, source_height, delivered_width, delivered_height);
     if (delivered_width == source_width && delivered_height == source_height) {
-        if (uninit) CoUninitialize();
         return false;
     }
 
@@ -183,7 +184,6 @@ bool resize_png(const std::vector<std::uint8_t>& input,
         }
     }
 
-    if (uninit) CoUninitialize();
     return SUCCEEDED(hr) && !output.empty();
 }
 

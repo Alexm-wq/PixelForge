@@ -39,7 +39,7 @@ BOOL WINAPI pixelforge_mcp_write_file(HANDLE file,
     if (has_delimiter) compact.push_back('\n');
 
     // Content/style references are capped by total delivered pixel area at
-    // 512x512 (262,144 pixels). The full-resolution reference remains loaded
+    // 256x256 (65,536 pixels). The full-resolution reference remains loaded
     // in PixelForge; canvas render observations are never modified here.
     std::string delivered = pixelforge::win32::limit_reference_response(compact);
 

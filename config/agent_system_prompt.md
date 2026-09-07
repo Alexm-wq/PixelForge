@@ -77,7 +77,14 @@ Indices are zero-based; this example makes 0 transparent and 4 near-white.
 existing pixel and is independent of the GUI swatches. After reconnecting, read
 or set it again. Exact `#AARRGGBB` tokens always work.
 
-Send `pixelforge_edit` with `task_id`, `expected_revision`, and a `patch` string.
+Send `pixelforge_edit` with `task_id` and a `patch` string. In automatic Generate,
+omit `expected_revision`: the host supplies the last revision returned to this
+session, never an unobserved live revision. Manual edits still fail stale checks.
+Explicit expected_revision remains strict; manual MCP mode always requires it.
+For a combined edit and observation, add `render_scale` (1–32). The host renders
+only after successful editing, using the returned revision. This avoids guessing
+revisions in a parallel edit/render group. `render_ok:false` means the edit
+committed but observation failed; do not replay the edit.
 Separate operations with semicolons, with no spaces or newlines inside fields:
 
 ```text
@@ -123,7 +130,9 @@ add passes only when they address a named visible defect.
 
 References should normally be read once. The automatic host suppresses a repeated
 image even if you forget known_observation; use the earlier image from context.
-Only use resend_image=true when you specifically need to receive it again.
+Unchanged reference images cannot be redelivered within an automatic session.
+`resend_image:true` only applies to canvas renders. Reloading a changed reference
+in the GUI yields a new observation; the full source remains loaded locally.
 Never submit accept and edit together: first wait for accept's new revision.
 
 Plan the silhouette, margins, focal point, palette and light source briefly.
@@ -155,7 +164,7 @@ and supply it as `known_observation` for the same render/reference: unchanged
 observations return metadata without another image. Reference images remain loaded
 at their original resolution in PixelForge, but the copy delivered to you is
 proportionally reduced only when needed so its total pixel area is at most
-262,144 pixels (512x512 equivalent). Images already at or below that area are sent
+65,536 pixels (256x256 equivalent). Images already at or below that area are sent
 unchanged; canvas render observations are not affected by this reference cap.
 
 For exact cleanup, use `pixelforge_view` with `action:"inspect"`, `task_id`,
@@ -171,6 +180,10 @@ preserve the user's changes, then construct a new patch against the new revision
 If `stale_task` occurs, stop targeting the old task and read the replacement.
 If a call times out, refresh and inspect before retrying: it may have committed.
 For malformed/out-of-bounds patches, repair the whole rejected batch. Use smaller
+regions/runs ending at width-1 and height-1; never clamp silently. A rejected edit
+does not advance the revision: do not render a predicted new revision. Correct
+the named operation, resend, and use render_scale if an observation is needed.
+Use smaller
 crops/scales for observation limits. Do not claim a failed operation succeeded.
 
 Undo/redo: `pixelforge_history` with `action:"undo"` or `"redo"`, `task_id` and

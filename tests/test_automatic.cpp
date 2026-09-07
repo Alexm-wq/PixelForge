@@ -96,6 +96,42 @@ int main(int argc, char**) {
         tools.stop();
         CHECK(GetStdHandle(STD_INPUT_HANDLE) == stdin_before && GetStdHandle(STD_OUTPUT_HANDLE) == stdout_before);
     }
+    {
+        std::wstring error;
+        const auto reference_path = std::filesystem::path(exe).parent_path() / L"automatic-reference.png";
+        CHECK(save_png_wic(reference_path.wstring(), 512, 512, std::vector<std::uint32_t>(512 * 512, 0xff123456), error));
+        CHECK(load_image_wic(reference_path.wstring(), content, error));
+        content_path = reference_path.wstring();
+        CHECK(tools.start(bindings, recording, error));
+        const auto id = std::to_string(task.begin("Automatic state and observations"));
+        auto reference_args = "{\"action\":\"content_reference\",\"task_id\":" + id + "}";
+        const auto first = tools.call("pixelforge_view", reference_args);
+        CHECK(first.success && !first.image_base64.empty());
+        FlatJsonObject metadata; std::string parse_error;
+        CHECK(parse_flat_json_object(first.text, metadata, parse_error));
+        CHECK(*metadata.get_i64("width") * *metadata.get_i64("height") <= 65536);
+        CHECK(content.width == 512 && content.height == 512);
+        reference_args.pop_back(); reference_args += ",\"resend_image\":true}";
+        const auto repeat = tools.call("pixelforge_view", reference_args);
+        CHECK(repeat.success && repeat.image_base64.empty());
+        CHECK(tools.call("pixelforge_task", "{\"action\":\"accept\",\"task_id\":" + id + ",\"width\":96,\"height\":64}").success);
+        auto edited = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"R,0,0,96,64,#FF112233\",\"render_scale\":2}");
+        CHECK(edited.success && !edited.image_base64.empty());
+        const auto revision = document.revision();
+        auto rejected = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"H,0,0,97,#FFFFFFFF\",\"render_scale\":2}");
+        CHECK(!rejected.success && rejected.image_base64.empty() && document.revision() == revision);
+        CHECK(tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"P,0,0,#FFFFFFFF\"}").success);
+        {
+            auto mouse = document.begin_transaction();
+            CHECK(mouse.set_pixel(1, 1, 0xff445566)); CHECK(mouse.commit());
+        }
+        auto stale = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"P,1,1,#FFFFFFFF\"}");
+        CHECK(!stale.success && document.pixel(1,1) == 0xff445566);
+        CHECK(tools.call("pixelforge_task", "{\"action\":\"get\"}").success);
+        CHECK(tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"P,1,1,#FFFFFFFF\"}").success);
+        tools.stop();
+        std::cout << "Passed cached references, preview cap, edit/render, rejected batches and concurrent user edits.\n";
+    }
     for (const auto mode : {L"success", L"incomplete", L"errors", L"stall", L"cancel"}) {
         SetEnvironmentVariableW(L"PIXELFORGE_TEST_MODE", mode);
         std::wstring error; CHECK(tools.start(bindings, recording, error));

@@ -63,7 +63,7 @@ Agent efficiency is optimized without reducing artwork fidelity:
 - any color can always be supplied as exact `#AARRGGBB`;
 - canvas renders are lossless PNG with nearest-neighbor integer scaling;
 - content/style references are optional and remain full resolution inside PixelForge;
-- the reference copy sent to Codex is proportionally reduced only when total pixel area exceeds 262,144 pixels (512x512 equivalent);
+- the reference copy sent to Codex is proportionally reduced only when total pixel area exceeds 65,536 pixels (256x256 equivalent);
 - unchanged observations are addressed by IDs and do not need retransmission;
 - recording video is never part of an agent observation.
 
@@ -103,7 +103,7 @@ Actions: `render`, `content_reference`, `style_reference`, `inspect`.
 
 `render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, scale and pixel content. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
 
-Reference actions observe the original loaded snapshot but the transport-delivered PNG is capped by total area, not side length: images with `width * height <= 262144` are sent unchanged; larger images are proportionally reduced until the delivered area is at most 262,144 pixels. Thus `1024x256` is unchanged, while `2048x256` is reduced. Canvas renders are not subject to this reference cap. References are optional. `inspect` returns row-major run-length encoded exact pixels and is capped at 4096 pixels.
+Reference actions observe the original loaded snapshot but the transport-delivered PNG is capped by total area, not side length: images with `width * height <= 65536` are sent unchanged; larger images are proportionally reduced until the delivered area is at most 65,536 pixels. Thus `256x256` is unchanged, while `512x512` is reduced. Canvas renders are not subject to this reference cap. References are optional. `inspect` returns row-major run-length encoded exact pixels and is capped at 4096 pixels.
 
 ### `pixelforge_palette`
 
@@ -144,3 +144,23 @@ Do not render after every batch. Prefer: establish silhouette with a large batch
 ## Transport
 
 PixelForge MCP uses newline-delimited JSON-RPC. The artwork server compacts internal formatting at the wire boundary so every response occupies one transport line. Automatic Generate adds a separate Codex App Server JSONL control channel above MCP. PixelForge owns that control channel; Codex-launched bridge processes own only their MCP stdio channels and contain no artwork/video state.
+
+### Automatic session efficiency
+
+Automatic tools retain the last observed task/revision outside the model. An
+omitted expected_revision uses that observed revision; it never substitutes the
+live document revision. Concurrent mouse edits still reject stale commands.
+Manual MCP retains explicit expected_revision requirements.
+
+Automatic pixelforge_edit accepts optional render_scale (1–32). A successful edit
+can return its render in the same call; a rejected edit returns no image and leaves
+revision unchanged. If rendering fails after a commit, render_ok is false while
+ok stays true; do not replay the committed edit. Plain successful edits return
+only ok, revision and changed_pixels.
+
+Reference previews now have a 65,536-pixel area budget, retaining the full loaded
+source locally. The automatic session supplies known observation IDs and cannot
+resend identical reference images, even with resend_image=true. That option only
+redelivers canvas renders. A changed loaded reference produces a new observation.
+This avoids repeated delivery; it does not remove earlier images or tool history
+from Codex's existing context. No fixed 10–20k context or token saving is promised.

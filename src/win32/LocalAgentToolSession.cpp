@@ -143,6 +143,9 @@ bool LocalAgentToolSession::start(AgentMcpBindings bindings,
     receive_buffer_.clear();
     next_id_ = 1;
     delivered_observations_.clear();
+    reference_observations_.clear();
+    observed_task_ = 0;
+    has_observed_revision_ = false;
     running_.store(true, std::memory_order_relaxed);
 
     server_thread_ = std::thread([this] {
@@ -186,7 +189,50 @@ void LocalAgentToolSession::stop() {
 LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_view arguments_json) {
     std::lock_guard lock(call_mutex_);
     if (tool == "pixelforge_record") return call_record_tool(arguments_json);
-    return call_art_tool(tool, arguments_json);
+    FlatJsonObject args; std::string error;
+    if (!parse_flat_json_object(arguments_json, args, error))
+        return {false, "{\"ok\":false,\"error\":\"invalid_arguments\"}"};
+    std::string effective(arguments_json);
+    const auto task_id = args.get_i64("task_id");
+    const bool needs_revision = tool == "pixelforge_edit" || tool == "pixelforge_history" || tool == "pixelforge_io" ||
+        (tool == "pixelforge_task" && args.get("action") == "finish") ||
+        (tool == "pixelforge_view" && (args.get("action") == "render" || args.get("action") == "inspect"));
+    // Use only a revision already returned to this agent, never the live
+    // document revision. A subsequent mouse edit must still cause rejection.
+    if (needs_revision && !args.contains("expected_revision") && has_observed_revision_ &&
+        task_id && *task_id >= 0 && static_cast<std::uint64_t>(*task_id) == observed_task_) {
+        const auto end = effective.find_last_of('}');
+        effective.insert(end, ",\"expected_revision\":" + std::to_string(observed_revision_));
+    }
+    const auto scale = args.get_i64("render_scale");
+    if (tool == "pixelforge_edit" && args.contains("render_scale") && (!scale || *scale < 1 || *scale > 32))
+        return {false, "{\"ok\":false,\"error\":\"invalid_render_scale\",\"message\":\"Use an integer from 1 to 32; edit not applied.\"}"};
+    auto result = call_art_tool(tool, effective);
+    FlatJsonObject fields;
+    if (parse_flat_json_object(result.text, fields, error)) {
+        const auto returned_task = fields.get_i64("task_id");
+        const auto revision = fields.get_i64("revision");
+        if (result.success && revision && *revision >= 0 && (returned_task || task_id)) {
+            observed_task_ = static_cast<std::uint64_t>(returned_task.value_or(task_id.value_or(0)));
+            observed_revision_ = static_cast<std::uint64_t>(*revision);
+            has_observed_revision_ = true;
+        }
+        if (result.success && tool == "pixelforge_task" && args.get("action") == "begin") has_observed_revision_ = false;
+        if (result.success && tool == "pixelforge_edit" && scale && task_id && revision) {
+            const auto view = call_art_tool("pixelforge_view", "{\"action\":\"render\",\"task_id\":" + std::to_string(*task_id) +
+                ",\"expected_revision\":" + std::to_string(*revision) + ",\"scale\":" + std::to_string(*scale) + "}");
+            // Rendering may fail independently (e.g. a concurrent user edit).
+            // Never report the committed edit as failed or invite a replay.
+            result.text.pop_back();
+            result.text += ",\"render_ok\":" + std::string(view.success ? "true" : "false") + ",\"render\":" + json_quote(view.text) + "}";
+            result.image_base64 = view.image_base64;
+            result.image_mime = view.image_mime;
+        }
+        if (result.success && tool == "pixelforge_edit" && !scale && revision) {
+            result.text = "{\"ok\":true,\"revision\":" + std::to_string(*revision) + ",\"changed_pixels\":" + fields.get("changed_pixels", "0") + "}";
+        }
+    }
+    return result;
 }
 
 LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std::string_view arguments_json) {
@@ -194,7 +240,14 @@ LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std:
         return {false, "{\"ok\":false,\"error\":\"local_tool_session_unavailable\"}"};
 
     const auto id = next_id_++;
-    const std::string args = arguments_json.empty() ? "{}" : std::string(arguments_json);
+    std::string args = arguments_json.empty() ? "{}" : std::string(arguments_json);
+    FlatJsonObject request_fields; std::string parse_error;
+    parse_flat_json_object(args, request_fields, parse_error);
+    const auto action = request_fields.get("action");
+    const bool reference = tool == "pixelforge_view" && (action == "content_reference" || action == "style_reference");
+    const auto known = reference_observations_.find(action);
+    if (reference && known != reference_observations_.end() && !request_fields.contains("known_observation"))
+        args.insert(args.find_last_of('}'), ",\"known_observation\":" + json_quote(known->second));
     const std::string request = "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(id) +
         ",\"method\":\"tools/call\",\"params\":{\"name\":" + json_quote(tool) +
         ",\"arguments\":" + args + "}}";
@@ -217,14 +270,15 @@ LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std:
     }
     if (result.success && !result.image_base64.empty()) {
         const auto observation = find_string_value(result.text, "observation");
+        if (reference && !observation.empty()) reference_observations_[action] = observation;
         FlatJsonObject args; std::string ignored;
         parse_flat_json_object(arguments_json, args, ignored);
-        const bool resend = args.get_bool("resend_image").value_or(false);
+        const bool resend = !reference && args.get_bool("resend_image").value_or(false);
         if (!observation.empty() && !delivered_observations_.insert(observation).second && !resend) {
             result.image_base64.clear();
             result.image_mime.clear();
             result.text = "{\"ok\":true,\"unchanged\":true,\"observation\":" + json_quote(observation) +
-                ",\"message\":\"This exact image was already delivered in this session. Use it from context; continue drawing. Set resend_image=true only if you need it delivered again.\"}";
+                ",\"message\":\"This exact image is already in this session's context. Reuse it; no image bytes resent.\"}";
         }
     }
     return result;
@@ -317,11 +371,11 @@ std::string pixelforge_dynamic_tools_json() {
     // are used only by automatic App Server generation; manual --mcp remains.
     return R"JSON([
 {"type":"function","name":"pixelforge_task","description":"PixelForge task lifecycle. Use get first; accept pixel-art tasks with a chosen canvas size; reject incompatible requests; abort technical blockers after acceptance; finish only when complete.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
-{"type":"function","name":"pixelforge_edit","description":"Apply one atomic exact-pixel patch. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c. c is palette index or #AARRGGBB. Always pass current task_id and revision.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"}},"required":["task_id","expected_revision","patch"]}},
-{"type":"function","name":"pixelforge_view","description":"Observe PixelForge. render returns a lossless canvas PNG; content_reference/style_reference return reference images capped to 262144 delivered pixels; inspect returns compact exact pixels.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean","description":"Explicitly redeliver an image already seen this session; normally omit."}},"required":["action","task_id"]}},
+{"type":"function","name":"pixelforge_edit","description":"Apply one atomic exact-pixel patch. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c. c is palette index or #AARRGGBB. Pass task_id. Omit expected_revision to use the last revision observed by this session; explicit revisions are validated strictly. Use render_scale to inspect only after a successful edit.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32,"description":"Optional: render after a successful edit at its returned revision. No render on rejection."}},"required":["task_id","patch"]}},
+{"type":"function","name":"pixelforge_view","description":"Observe PixelForge. render returns a lossless canvas PNG; content_reference/style_reference return reference images capped to 65536 delivered pixels; inspect returns compact exact pixels.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean","description":"Redeliver an unchanged canvas render. Cannot resend unchanged references."}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_palette","description":"Get or replace the compact palette dictionary. Colors are comma-separated AARRGGBB; exact #AARRGGBB colors remain available in patches.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"colors":{"type":"string"}},"required":["action"]}},
-{"type":"function","name":"pixelforge_history","description":"Revision-guarded undo/redo for the accepted task.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["undo","redo"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"}},"required":["action","task_id","expected_revision"]}},
-{"type":"function","name":"pixelforge_io","description":"Export the current canvas losslessly to native-resolution PNG.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"path":{"type":"string"}},"required":["action","task_id","expected_revision","path"]}},
+{"type":"function","name":"pixelforge_history","description":"Revision-guarded undo/redo for the accepted task.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["undo","redo"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"}},"required":["action","task_id"]}},
+{"type":"function","name":"pixelforge_io","description":"Export the current canvas losslessly to native-resolution PNG.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"path":{"type":"string"}},"required":["action","task_id","path"]}},
 {"type":"function","name":"pixelforge_record","description":"Local-only session recording. Use only when the user explicitly asks to record. start before first canvas mutation, stop after final inspection. Video stays local and is never returned.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","stop"]},"task_id":{"type":"integer"},"fps":{"type":"integer","minimum":1,"maximum":60}},"required":["action","task_id"]}}
 ])JSON";
 }

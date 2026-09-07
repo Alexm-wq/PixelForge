@@ -194,7 +194,10 @@ void SessionRecorder::capture_loop() {
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = height; // bottom-up matches Media Foundation RGB convention
+    // MF_MT_DEFAULT_STRIDE above is positive, so scanline zero must be
+    // the top row. A positive DIB height would store the bottom row first
+    // and vertically invert the encoded video.
+    bmi.bmiHeader.biHeight = -height;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -228,6 +231,8 @@ void SessionRecorder::capture_loop() {
             last_error_ = L"PixelForge window capture failed.";
             break;
         }
+        // Complete GDI writes before reading the DIB memory for the encoder.
+        GdiFlush();
 
         ComPtr<IMFMediaBuffer> buffer;
         ComPtr<IMFSample> sample;
