@@ -1,6 +1,7 @@
 #include "PipeBridge.hpp"
 
 #include <windows.h>
+#include <sddl.h>
 
 #include <array>
 #include <chrono>
@@ -12,6 +13,37 @@ namespace {
 
 constexpr DWORD kPipeBufferBytes = 1024u * 1024u;
 constexpr DWORD kBridgeChunkBytes = 64u * 1024u;
+
+class LocalPipeSecurity {
+public:
+    LocalPipeSecurity() {
+        // Codex may launch MCP children with a restricted/low-integrity token.
+        // The pipe name is unguessable per PixelForge process and remote clients
+        // are explicitly rejected, so granting local Everyone access is safe and
+        // avoids a medium-integrity mandatory-label handshake failure.
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;GA;;;WD)S:(ML;;NW;;;LW)",
+                SDDL_REVISION_1,
+                &descriptor_,
+                nullptr)) {
+            attributes_.nLength = sizeof(attributes_);
+            attributes_.lpSecurityDescriptor = descriptor_;
+            attributes_.bInheritHandle = FALSE;
+        }
+    }
+
+    ~LocalPipeSecurity() {
+        if (descriptor_) LocalFree(descriptor_);
+    }
+
+    SECURITY_ATTRIBUTES* get() noexcept {
+        return descriptor_ ? &attributes_ : nullptr;
+    }
+
+private:
+    PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+    SECURITY_ATTRIBUTES attributes_{};
+};
 
 bool copy_bytes(HANDLE input, HANDLE output, std::atomic_bool& stopped) {
     std::array<char, kBridgeChunkBytes> buffer{};
@@ -77,15 +109,16 @@ void PipeMcpHost::stop() {
 
 void PipeMcpHost::serve() {
     while (!stop_requested_.load(std::memory_order_relaxed)) {
+        LocalPipeSecurity security;
         HANDLE pipe = CreateNamedPipeW(
             pipe_name_.c_str(),
             PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             kPipeBufferBytes,
             kPipeBufferBytes,
             0,
-            nullptr);
+            security.get());
         if (pipe == INVALID_HANDLE_VALUE) return;
 
         const BOOL connected = ConnectNamedPipe(pipe, nullptr)
@@ -97,10 +130,9 @@ void PipeMcpHost::serve() {
             continue;
         }
 
-        // Reuse the existing, fully tested MCP implementation without creating
-        // a second PixelDocument. run_mcp_stdio reads the process std handles,
-        // so temporarily route those handles to this private pipe. PixelForge
-        // is a GUI subsystem process and does not otherwise use stdin/stdout.
+        // Reuse the existing MCP implementation without creating a second
+        // PixelDocument. This currently routes the GUI process std handles only
+        // for the lifetime of the connected artwork bridge.
         HANDLE old_input = GetStdHandle(STD_INPUT_HANDLE);
         HANDLE old_output = GetStdHandle(STD_OUTPUT_HANDLE);
         SetStdHandle(STD_INPUT_HANDLE, pipe);
@@ -119,11 +151,12 @@ int run_mcp_bridge_stdio(const std::wstring& pipe_name) {
     if (pipe_name.empty()) return 2;
 
     HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 60; ++attempt) {
+    for (int attempt = 0; attempt < 80; ++attempt) {
         pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_PIPE_BUSY && GetLastError() != ERROR_FILE_NOT_FOUND) return 3;
+        const DWORD error = GetLastError();
+        if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND && error != ERROR_ACCESS_DENIED) return 3;
         WaitNamedPipeW(pipe_name.c_str(), 250);
     }
     if (pipe == INVALID_HANDLE_VALUE) return 4;
