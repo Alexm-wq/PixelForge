@@ -30,6 +30,7 @@ int mock_server() {
         else if (method == "thread/start") {
             CHECK(line.find("pixelforge_edit") != std::string::npos);
             CHECK(line.find("pixelforge_program") != std::string::npos);
+            CHECK(line.find("MASKPOLY") != std::string::npos);
             CHECK(!nested_string(line, {"params", "baseInstructions"}).empty());
             emit("{\"id\":" + id + ",\"result\":{\"thread\":{\"id\":\"test-thread\"}}}");
         } else if (method == "turn/start") {
@@ -49,7 +50,9 @@ int mock_server() {
             emit("{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"text\":\"Drawing the silhouette now.\"}}}");
             emit("{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"tokenUsage\":{\"total\":{\"inputTokens\":1000,\"cachedInputTokens\":900,\"outputTokens\":10},\"last\":{\"inputTokens\":500,\"cachedInputTokens\":450,\"outputTokens\":5}}}}");
             if (mode != L"incomplete") {
-                text = invoke(1, "task", "{\"action\":\"accept\",\"task_id\":" + task_id + ",\"width\":8,\"height\":8}");
+                // GUI tasks already carry their canvas dimensions. Omitting width/height
+                // exercises LocalAgentToolSession's accept-size inheritance path.
+                text = invoke(1, "task", "{\"action\":\"accept\",\"task_id\":" + task_id + "}");
                 CHECK(parse_flat_json_object(text, task, error));
                 auto rev = std::to_string(*task.get_i64("revision"));
                 text = invoke(2, "edit", "{\"task_id\":" + task_id + ",\"expected_revision\":" + rev + ",\"patch\":\"R,1,1,6,6,#FF123456\"}");

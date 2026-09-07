@@ -269,6 +269,34 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             return {false, "{\"ok\":false,\"error\":\"program_compile_internal\"}"};
     }
 
+    // GUI-created tasks already know their current canvas dimensions. Avoid a
+    // wasted accept failure when the model omits width/height by inheriting any
+    // missing dimension from the authoritative task snapshot. Explicit values
+    // still win, so intentional resize requests keep working unchanged.
+    if (effective_tool == "pixelforge_task" && args.get("action") == "accept" &&
+        (!args.contains("width") || !args.contains("height"))) {
+        const auto accept_task_id = args.get_i64("task_id");
+        if (accept_task_id && *accept_task_id >= 0) {
+            AgentTaskSnapshot snap;
+            {
+                std::lock_guard state_lock(*bindings_.state_mutex);
+                snap = bindings_.task->snapshot();
+            }
+            if (snap.id == static_cast<std::uint64_t>(*accept_task_id) &&
+                snap.canvas_width > 0 && snap.canvas_height > 0) {
+                std::string defaults;
+                if (!args.contains("width")) defaults += ",\"width\":" + std::to_string(snap.canvas_width);
+                if (!args.contains("height")) defaults += ",\"height\":" + std::to_string(snap.canvas_height);
+                const auto end = effective.find_last_of('}');
+                if (end != std::string::npos) {
+                    effective.insert(end, defaults);
+                    if (!parse_flat_json_object(effective, args, error))
+                        return {false, "{\"ok\":false,\"error\":\"accept_defaults_internal\"}"};
+                }
+            }
+        }
+    }
+
     const auto task_id = args.get_i64("task_id");
     const bool needs_revision = effective_tool == "pixelforge_edit" || effective_tool == "pixelforge_history" || effective_tool == "pixelforge_io" ||
         (effective_tool == "pixelforge_task" && args.get("action") == "finish") ||
@@ -533,8 +561,8 @@ bool LocalAgentToolSession::read_line(std::string& line) {
 
 std::string pixelforge_dynamic_tools_json() {
     return R"JSON([
-{"type":"function","name":"pixelforge_task","description":"Manage the PixelForge task state and canvas dimensions.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
-{"type":"function","name":"pixelforge_program","description":"Apply a stateful raster program to the current canvas and optionally return a rendered image. Commands, one per line or semicolon: CLEAR c; P x y c; H x y len c; V x y len c; R x y w h c; BOX x y w h c; L x0 y0 x1 y1 c; ELLIPSE/FELLIPSE cx cy rx ry c; CIRCLE/FCIRCLE cx cy r c; Q x0 y0 cx cy x1 y1 c; C x0 y0 c1x c1y c2x c2y x1 y1 c; POLY/FPOLY c x0 y0 x1 y1 x2 y2 [...]; COPY/FLIPX/FLIPY/FLIPXY sx sy w h dx dy. Colors are palette index or #AARRGGBB.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"program":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","program"]}},
+{"type":"function","name":"pixelforge_task","description":"Manage PixelForge task state. Start with get. For accept, width/height are optional on an existing GUI task: omitted dimensions inherit the task's current canvas size; specify them only when intentionally changing size.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
+{"type":"function","name":"pixelforge_program","description":"Apply one stateful raster program to the current canvas and optionally render. Prefer named masks and bulk operations over thousands of primitive commands. Core geometry includes CLEAR/P/H/V/R/BOX/L/ELLIPSE/FELLIPSE/CIRCLE/FCIRCLE/Q/C/POLY/FPOLY/COPY/FLIPX/FLIPY/FLIPXY. Named-mask operations: MASKRECT/MASKELLIPSE/MASKPOLY/MASKCLEAR, FILLMASK, SHADE, CLUSTERS, DITHER, OUTLINE. See base instructions for exact grammar. Colors are palette index or #AARRGGBB.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"program":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","program"]}},
 {"type":"function","name":"pixelforge_edit","description":"Apply an exact pixel patch and optionally return a rendered image. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","patch"]}},
 {"type":"function","name":"pixelforge_view","description":"Return a canvas render, exact pixel inspection, or the supplied content/style reference image.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean"}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_palette","description":"Get or set the palette as comma-separated AARRGGBB colors.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"colors":{"type":"string"}},"required":["action"]}},
