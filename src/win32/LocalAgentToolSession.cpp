@@ -65,8 +65,6 @@ bool parse_json_string(std::string_view text, std::size_t& p, std::string& out) 
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
             default:
-                // PixelForge-generated JSON does not emit \u escapes in tool
-                // text; keep the parser deliberately small and deterministic.
                 return false;
         }
     }
@@ -167,7 +165,6 @@ bool LocalAgentToolSession::start(AgentMcpBindings bindings,
     }
 
     bindings_ = bindings;
-    // Ending the local tool session must never close the real GUI.
     bindings_.close_window_on_exit = false;
     bindings_.input = server_in;
     bindings_.output = server_out;
@@ -276,8 +273,6 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
     const bool needs_revision = effective_tool == "pixelforge_edit" || effective_tool == "pixelforge_history" || effective_tool == "pixelforge_io" ||
         (effective_tool == "pixelforge_task" && args.get("action") == "finish") ||
         (effective_tool == "pixelforge_view" && (args.get("action") == "render" || args.get("action") == "inspect"));
-    // Use only a revision already returned to this agent, never an unobserved
-    // live revision. Concurrent mouse edits still cause the mutation to reject.
     if (needs_revision && !args.contains("expected_revision") && has_observed_revision_ &&
         task_id && *task_id >= 0 && static_cast<std::uint64_t>(*task_id) == observed_task_) {
         const auto end = effective.find_last_of('}');
@@ -294,8 +289,6 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
     if (parse_flat_json_object(result.text, fields, error)) {
         const auto returned_task = fields.get_i64("task_id");
         const auto revision = fields.get_i64("revision");
-        // A stale-revision response contains the authoritative revision. Remember
-        // it so the next omitted-revision render/inspect does not fail again.
         if (revision && *revision >= 0 && (returned_task || task_id)) {
             observed_task_ = static_cast<std::uint64_t>(returned_task.value_or(task_id.value_or(0)));
             observed_revision_ = static_cast<std::uint64_t>(*revision);
@@ -307,8 +300,6 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (result.success && effective_tool == "pixelforge_edit" && scale && task_id && revision) {
             const auto view = call_art_tool("pixelforge_view", "{\"action\":\"render\",\"task_id\":" + std::to_string(*task_id) +
                 ",\"expected_revision\":" + std::to_string(*revision) + ",\"scale\":" + std::to_string(*scale) + "}");
-            // Rendering may fail independently. The edit is already committed;
-            // never invite a replay because observation failed.
             FlatJsonObject view_fields;
             std::string ignored;
             parse_flat_json_object(view.text, view_fields, ignored);
@@ -335,12 +326,14 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             }
             result.text += "}";
         } else if (result.success && effective_tool == "pixelforge_view" && args.get("action") != "inspect") {
-            // Paths and crop bookkeeping are useful to the host but add little to
-            // model context. Keep only the state needed for subsequent decisions.
             const auto observation = fields.get("observation");
             if (!observation.empty()) {
                 result.text = "{\"ok\":true,\"observation\":" + json_quote(observation);
                 if (fields.get_bool("unchanged").value_or(false)) result.text += ",\"unchanged\":true";
+                if (fields.get_bool("already_seen").value_or(false)) result.text += ",\"already_seen\":true";
+                if (fields.get_bool("do_not_call_again").value_or(false)) result.text += ",\"do_not_call_again\":true";
+                const auto message = fields.get("message");
+                if (!message.empty()) result.text += ",\"message\":" + json_quote(message);
                 if (const auto rev = fields.get_i64("revision")) result.text += ",\"revision\":" + std::to_string(*rev);
                 if (const auto w = fields.get_i64("width")) result.text += ",\"width\":" + std::to_string(*w);
                 if (const auto h = fields.get_i64("height")) result.text += ",\"height\":" + std::to_string(*h);
@@ -348,8 +341,6 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                 result.text += "}";
             }
         } else if (result.success && effective_tool == "pixelforge_task" && args.get("action") != "get") {
-            // Task.get carries the user prompt and limits. Subsequent lifecycle
-            // calls only need compact state/revision metadata.
             result.text = "{\"ok\":true";
             if (returned_task) result.text += ",\"task_id\":" + std::to_string(*returned_task);
             if (revision) result.text += ",\"revision\":" + std::to_string(*revision);
@@ -375,9 +366,6 @@ LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std:
     const auto action = request_fields.get("action");
     const bool reference = tool == "pixelforge_view" && (action == "content_reference" || action == "style_reference");
 
-    // Strong reference dedupe: compare the currently loaded in-memory snapshot
-    // before asking the MCP server to encode it again. A changed GUI reference
-    // gets a new hash and is delivered normally.
     if (reference) {
         const auto known = reference_observations_.find(action);
         if (known != reference_observations_.end()) {
@@ -388,7 +376,10 @@ LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std:
                 current_observation = observation_for_reference(image, action == "style_reference" ? "style" : "content");
             }
             if (!current_observation.empty() && current_observation == known->second) {
-                return {true, "{\"ok\":true,\"unchanged\":true,\"observation\":" + json_quote(current_observation) + "}"};
+                return {true,
+                    "{\"ok\":true,\"unchanged\":true,\"already_seen\":true,\"do_not_call_again\":true,\"observation\":" +
+                    json_quote(current_observation) +
+                    ",\"message\":\"This unchanged reference was already delivered earlier in the turn. Reuse the prior image from context; do not request this reference again unless the host reports that it changed.\"}"};
             }
         }
     }
@@ -525,13 +516,11 @@ bool LocalAgentToolSession::read_line(std::string& line) {
 }
 
 std::string pixelforge_dynamic_tools_json() {
-    // Automatic generation gets one high-level raster-program tool in addition
-    // to the exact manual patch surface. This trades tool turns for local work.
     return R"JSON([
 {"type":"function","name":"pixelforge_task","description":"PixelForge task lifecycle. Use get first; accept with canvas size; finish only when complete.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
 {"type":"function","name":"pixelforge_program","description":"Preferred automatic drawing tool. Run one stateful raster program against the current canvas, then commit its exact diff atomically. Geometry is clipped locally, so edge overshoot does not waste a model turn. Commands, one per line/semicolon: CLEAR c; P x y c; H x y len c; V x y len c; R x y w h c; BOX x y w h c; L x0 y0 x1 y1 c; ELLIPSE/FELLIPSE cx cy rx ry c; CIRCLE/FCIRCLE cx cy r c; Q x0 y0 cx cy x1 y1 c; C x0 y0 c1x c1y c2x c2y x1 y1 c; POLY/FPOLY c x0 y0 x1 y1 x2 y2 [...]; COPY/FLIPX/FLIPY/FLIPXY sx sy w h dx dy. Colors are palette index or #AARRGGBB. Use render_scale to inspect only after successful commit.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"program":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","program"]}},
 {"type":"function","name":"pixelforge_edit","description":"Exact cleanup patch only. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c. Use program for broad drawing. render_scale combines commit+observation.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","patch"]}},
-{"type":"function","name":"pixelforge_view","description":"Observe only when visual judgment is needed. render returns canvas PNG; content_reference/style_reference return a capped reference once; inspect returns exact RLE pixels.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean"}},"required":["action","task_id"]}},
+{"type":"function","name":"pixelforge_view","description":"Observe only when visual judgment is needed. render returns canvas PNG; inspect returns exact RLE pixels. content_reference and style_reference are one-shot reference fetches: call each present reference at most once per task unless the host explicitly reports that the underlying reference changed. The returned reference image remains available in the turn context after the first successful call. Repeated unchanged reference calls waste a model turn and must not be made.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean"}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_palette","description":"Get/set compact palette dictionary as comma-separated AARRGGBB colors.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"colors":{"type":"string"}},"required":["action"]}},
 {"type":"function","name":"pixelforge_history","description":"Revision-guarded undo/redo.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["undo","redo"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_io","description":"Export current canvas losslessly to native PNG.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"path":{"type":"string"}},"required":["action","task_id","path"]}},
