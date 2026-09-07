@@ -6,6 +6,7 @@
 #include <mfreadwrite.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <vector>
@@ -44,8 +45,18 @@ bool set_video_type(IMFMediaType* type, REFGUID subtype, int width, int height, 
 } // namespace
 
 SessionRecorder::~SessionRecorder() {
+    permit_finalization();
     std::wstring ignored;
     stop(ignored);
+}
+
+void SessionRecorder::set_user_review_gate(bool enabled) noexcept {
+    user_review_gate_.store(enabled, std::memory_order_relaxed);
+    if (!enabled) finalization_permitted_.store(true, std::memory_order_relaxed);
+}
+
+void SessionRecorder::permit_finalization() noexcept {
+    finalization_permitted_.store(true, std::memory_order_relaxed);
 }
 
 bool SessionRecorder::start(HWND hwnd, std::wstring output_path, int fps, std::wstring& error) {
@@ -61,8 +72,15 @@ bool SessionRecorder::start(HWND hwnd, std::wstring output_path, int fps, std::w
         error = L"Recording output path is empty.";
         return false;
     }
-    if (active_.load(std::memory_order_relaxed) || worker_.joinable()) {
-        error = L"A PixelForge recording is already active.";
+
+    // Revision passes reuse the same recording. Treat repeated start requests as
+    // idempotent while the demo recorder is already running.
+    if (active_.load(std::memory_order_relaxed)) {
+        error.clear();
+        return true;
+    }
+    if (worker_.joinable()) {
+        error = L"A PixelForge recording worker is already active.";
         return false;
     }
 
@@ -80,6 +98,7 @@ bool SessionRecorder::start(HWND hwnd, std::wstring output_path, int fps, std::w
     stop_requested_.store(false, std::memory_order_relaxed);
     active_.store(false, std::memory_order_relaxed);
     frames_written_.store(0, std::memory_order_relaxed);
+    finalization_permitted_.store(false, std::memory_order_relaxed);
     {
         std::lock_guard lock(state_mutex_);
         init_done_ = false;
@@ -99,6 +118,15 @@ bool SessionRecorder::start(HWND hwnd, std::wstring output_path, int fps, std::w
 }
 
 bool SessionRecorder::stop(std::wstring& error) {
+    // In automatic/demo mode an agent pass is not the end of the task. Ignore
+    // recorder stop calls until the host releases this gate after user approval.
+    if (active_.load(std::memory_order_relaxed) &&
+        user_review_gate_.load(std::memory_order_relaxed) &&
+        !finalization_permitted_.load(std::memory_order_relaxed)) {
+        error.clear();
+        return true;
+    }
+
     stop_requested_.store(true, std::memory_order_relaxed);
     if (worker_.joinable()) worker_.join();
     active_.store(false, std::memory_order_relaxed);
