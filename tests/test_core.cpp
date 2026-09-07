@@ -66,6 +66,7 @@ int main() {
     auto invalid = pixel; invalid.x = INT_MAX;
     auto rev = routed.revision();
     CHECK(!router.edit(id, rev, {pixel, invalid}).ok);
+    CHECK(router.edit(id, rev, {pixel, invalid}).message.find("Operation 2") != std::string::npos);
     CHECK(routed.pixel(1, 1) == 0 && routed.revision() == rev);
     auto reset = pixel; reset.argb = 0;
     auto result = router.edit(id, rev, {pixel, reset});

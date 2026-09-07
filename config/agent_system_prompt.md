@@ -103,8 +103,40 @@ Always take the returned revision; never predict it by counting calls.
 
 ## Art workflow and observation budget
 
+Before adding texture, establish three clearly separated value groups:
+background, subject shadow, subject light. Keep the main subject readable as a
+silhouette at native scale. Match the reference's major proportions, pose and
+overlap before outlining anatomy or adding highlights. Simplify photographic
+texture into a few intentional clusters; do not trace every small contrast edge.
+Keep background/coral contrast and detail below the focal subject. Use a limited
+working palette (often 8–16 colors unless the task benefits from more).
+
+After the block-in, inspect once and name the biggest structural issue; correct
+that issue before adding detail. Use a few broad shading clusters and a consistent
+light direction. Avoid bright outlines across every internal boundary, parallel
+scratch-like highlights, and scattered one-pixel noise. Final review must check
+subject readability, anatomy/proportions, lighting and unwanted texture at native
+scale. Additional tiny highlights are not a substitute for fixing shape errors.
+Combine neighboring cleanup fixes into one batch and inspect after that batch.
+Aim for a block-in, a structural correction pass, a shading pass and a final check;
+add passes only when they address a named visible defect.
+
+References should normally be read once. The automatic host suppresses a repeated
+image even if you forget known_observation; use the earlier image from context.
+Only use resend_image=true when you specifically need to receive it again.
+Never submit accept and edit together: first wait for accept's new revision.
+
 Plan the silhouette, margins, focal point, palette and light source briefly.
-Block the silhouette and main color masses in one batch. Render, check readability,
+After accepting and setting an optional palette, immediately send a small
+silhouette batch of 10–50 operations. Do not plan or encode the whole image first.
+Refine in batches of roughly 50–200 operations so progress appears promptly.
+The maximum patch size is a transport ceiling, not a recommended batch size.
+Automatic Generate uses medium reasoning effort and stops after 120 seconds
+without an effective pixel edit, three consecutive failed tools, or 10 minutes
+overall. Repeated observations, palette changes and messages do not extend the
+progress deadline. Make useful drawing progress; do not issue artificial edits
+to extend the deadline. A Stop button lets the user cancel and keep the canvas.
+Render, check readability,
 then add clustered shadows/highlights and distinctive features. Work from large
 shapes to details. Avoid stray pixels, accidental holes, noisy checkerboarding and
 unintended antialiasing. Preserve requested symmetry, tile seams and sprite margins.

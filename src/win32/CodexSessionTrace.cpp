@@ -30,6 +30,9 @@ std::filesystem::path find_repo_root() {
 }
 
 std::filesystem::path trace_path() {
+    wchar_t override_path[32768]{};
+    const auto size = GetEnvironmentVariableW(L"PIXELFORGE_TRACE_PATH", override_path, 32768);
+    if (size && size < 32768) return override_path;
     const auto root = find_repo_root();
     if (!root.empty()) return root / L"build" / L"pixelforge-codex-session.log";
     return std::filesystem::temp_directory_path() / L"pixelforge-codex-session.log";
@@ -105,6 +108,10 @@ void reset_locked() {
     const auto path = trace_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
+    if (std::filesystem::exists(path, ec)) {
+        auto previous = path; previous += L".previous";
+        std::filesystem::copy_file(path, previous, std::filesystem::copy_options::overwrite_existing, ec);
+    }
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (file) file << timestamp() << " session=start\n";
     g_session_started = true;
@@ -125,7 +132,7 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     else entry += " event";
     if (!id.empty()) entry += " id=" + id;
 
-    // Keep only small scalar metadata. Never log params/input/result/data/patch.
+    // Transport summary; semantic tool results are logged by the dispatcher.
     const auto type = scalar_string(line, "type");
     const auto server = scalar_string(line, "server");
     const auto tool = scalar_string(line, "tool");
@@ -140,6 +147,14 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     if (!status.empty()) entry += " status=" + status;
     if (!model.empty()) entry += " model=" + model;
     if (!code.empty()) entry += " code=" + code;
+    if (method == "thread/tokenUsage/updated") {
+        for (const auto key : {"totalTokens", "inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens"}) {
+            const auto value = scalar_number(line, key);
+            if (!value.empty()) entry += " " + std::string(key) + "=" + value;
+        }
+    }
+    if (method == "item/completed" && type == "agentMessage")
+        entry += " text=" + scalar_string(line, "text");
 
     // Error text is useful diagnostically, but ordinary agent/user text is not
     // logged. Restrict message capture to explicit errors/failures.
@@ -166,6 +181,13 @@ void feed_locked(std::string& pending, std::string_view direction, const void* d
 }
 
 } // namespace
+
+void codex_trace_detail(std::string_view text) {
+    std::lock_guard lock(g_trace_mutex);
+    std::string single_line(text);
+    for (auto& c : single_line) if (c == '\n' || c == '\r') c = ' ';
+    append_locked(single_line);
+}
 
 void codex_trace_tx_bytes(const void* data, DWORD size) {
     std::lock_guard lock(g_trace_mutex);

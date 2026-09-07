@@ -20,6 +20,9 @@ struct CodexGenerateRequest {
     std::string prompt;
     std::string agent_contract;
     LocalAgentToolSession* tool_session = nullptr;
+    // Deadlines measure useful tool progress, not incoming telemetry.
+    std::uint64_t progress_timeout_ms = 120000;
+    std::uint64_t total_timeout_ms = 600000;
 };
 
 class CodexAppClient {
@@ -38,6 +41,7 @@ public:
                         std::wstring& error);
 
     void shutdown();
+    void cancel() noexcept { cancel_requested_.store(true); }
     [[nodiscard]] bool busy() const noexcept { return busy_.load(std::memory_order_relaxed); }
 
 private:
@@ -62,6 +66,7 @@ private:
     HANDLE stdin_write_ = nullptr;
     HANDLE stdout_read_ = nullptr;
     HANDLE stderr_log_ = nullptr;
+    HANDLE process_job_ = nullptr;
     DWORD process_id_ = 0;
     std::string receive_buffer_;
     std::int64_t next_request_id_ = 1;
@@ -69,6 +74,14 @@ private:
     std::wstring configured_repo_root_;
     std::wstring configured_executable_;
     LocalAgentToolSession* active_tool_session_ = nullptr;
+    StatusCallback active_status_;
+    std::uint64_t progress_deadline_ = 0;
+    std::uint64_t total_deadline_ = 0;
+    std::uint64_t progress_timeout_ms_ = 120000;
+    std::wstring failure_reason_;
+    unsigned consecutive_tool_errors_ = 0;
+    bool received_edit_ = false;
+    std::atomic_bool cancel_requested_{false};
 
     std::atomic_bool busy_{false};
     std::atomic_bool shutting_down_{false};

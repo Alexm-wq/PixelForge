@@ -164,3 +164,40 @@ See:
 - `config/codex_mcp.toml.example`
 - `docs/AGENT_PROTOCOL.md`
 - `docs/ARCHITECTURE.md`
+
+## Automatic-generation diagnostics and stopping
+
+Generate uses the configured model with medium reasoning effort. It asks for a
+small first silhouette batch, followed by incremental refinement. It stops after
+120 seconds without an effective pixel edit, three consecutive tool failures,
+or 10 minutes overall. Background usage/status events do not reset these limits.
+Use **Stop** to cancel the running session and keep the current canvas. There is
+no automatic retry that silently spends more usage.
+
+The status panel distinguishes reasoning from tool execution and displays agent
+messages and tool failures. Detailed local diagnostics are in:
+
+- `build/pixelforge-codex-session.log`: tool/action, success, elapsed time,
+  revision/change counts, error text, agent messages and token counts.
+- `build/pixelforge-codex-session.log.previous`: preceding run.
+- `build/pixelforge-codex-app-server.log`: child-process stderr.
+
+Image/video bytes and raw patch strings are omitted. Agent messages may quote
+parts of the drawing request. Logs describe the JSONL actually sent on the wire.
+
+`ctest --test-dir build -C Release --output-on-failure` includes offline automatic
+client tests with a fake app server: repeated sessions, actual pixel tools and
+image results, incomplete turns, failed tools, telemetry-only stalls and Stop.
+These tests make no model requests. Offline test traces go to
+`build/Release/offline-session.log`, keeping real session diagnostics separate.
+
+Automatic turns now supply a concise pixel-art base instruction instead of the
+standard coding-agent base prompt. Repeated observation images are suppressed
+within a session even if the agent forgets its observation ID; `resend_image:true`
+explicitly requests another copy. Rejected geometry reports the failing operation
+number and coordinates so the agent can repair it without inspecting a blank canvas.
+The session log includes `USAGE scope=total` and `scope=last`, separating cached
+and uncached input from generated output; these counters are not an account-limit
+percentage or a dollar charge. Drawing instructions require a silhouette/value/
+proportion check before texture. This improves the workflow, but artistic quality
+still depends on the model and must be judged visually.

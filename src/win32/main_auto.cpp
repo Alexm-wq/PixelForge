@@ -26,6 +26,7 @@ namespace {
 
 constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
+constexpr int ID_STOP_CODEX = 1020;
 
 pixelforge::win32::CodexAppClient g_codex_client;
 pixelforge::win32::SessionRecorder g_session_recorder;
@@ -174,16 +175,26 @@ void start_automatic_generation(HWND hwnd) {
 LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_CREATE) {
         const LRESULT result = pixelforge_legacy_wndproc(hwnd, msg, wparam, lparam);
-        if (HWND generate = GetDlgItem(hwnd, ID_BEGIN)) SetWindowTextW(generate, L"Generate with Codex");
+        if (HWND generate = GetDlgItem(hwnd, ID_BEGIN)) {
+            SetWindowTextW(generate, L"Generate with Codex");
+            MoveWindow(generate, 12, 162, 232, 28, TRUE);
+        }
+        CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                      252, 162, 72, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STOP_CODEX)), nullptr, nullptr);
         HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         g_codex_status = CreateWindowW(L"STATIC", L"Codex: idle.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      12, 270, 420, 24, hwnd, nullptr, nullptr, nullptr);
+                                      12, 600, 312, 120, hwnd, nullptr, nullptr, nullptr);
         if (g_codex_status) SendMessageW(g_codex_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         SetTimer(hwnd, CODEX_REFRESH_TIMER, 200, nullptr);
         return result;
     }
     if (msg == WM_COMMAND && LOWORD(wparam) == ID_BEGIN) {
         start_automatic_generation(hwnd);
+        return 0;
+    }
+    if (msg == WM_COMMAND && LOWORD(wparam) == ID_STOP_CODEX) {
+        g_codex_client.cancel();
+        post_codex_status(hwnd, L"Codex: stopping; existing canvas will be kept.");
         return 0;
     }
     if (msg == WM_CODEX_STATUS) {

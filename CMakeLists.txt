@@ -20,7 +20,7 @@ if(WIN32)
         src/win32/AgentMcpServerFramed.cpp
         src/win32/ReferenceResponseLimiter.cpp
         src/win32/PipeBridge.cpp
-        src/win32/CodexAppClientDynamicIsolated.cpp
+        src/win32/CodexAppClientDynamic.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/LocalAgentToolSession.cpp
         src/win32/SessionRecorder.cpp
@@ -49,6 +49,16 @@ if(BUILD_TESTING)
     add_test(NAME pixelforge_core_tests COMMAND pixelforge_core_tests)
     set_tests_properties(pixelforge_core_tests PROPERTIES TIMEOUT 60)
     if(WIN32)
+        add_executable(pixelforge_automatic_tests tests/test_automatic.cpp
+            src/win32/LocalAgentToolSession.cpp src/win32/AgentMcpServerFramed.cpp
+            src/win32/ReferenceResponseLimiter.cpp src/win32/ImageIO.cpp
+            src/win32/SessionRecorder.cpp src/win32/CodexSessionTrace.cpp)
+        target_include_directories(pixelforge_automatic_tests PRIVATE src/win32)
+        target_compile_definitions(pixelforge_automatic_tests PRIVATE UNICODE _UNICODE NOMINMAX)
+        target_link_libraries(pixelforge_automatic_tests PRIVATE pixelforge_core
+            user32 gdi32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
+        add_test(NAME pixelforge_automatic_tests COMMAND pixelforge_automatic_tests)
+        set_tests_properties(pixelforge_automatic_tests PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
         find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
         add_test(NAME pixelforge_mcp_tests COMMAND "${POWERSHELL_EXECUTABLE}"
             -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mcp.ps1"

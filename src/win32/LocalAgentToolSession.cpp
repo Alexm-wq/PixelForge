@@ -132,7 +132,9 @@ bool LocalAgentToolSession::start(AgentMcpBindings bindings,
 
     bindings_ = bindings;
     // Ending the local tool session must never close the real GUI.
-    bindings_.hwnd = nullptr;
+    bindings_.close_window_on_exit = false;
+    bindings_.input = server_in;
+    bindings_.output = server_out;
     record_bindings_ = std::move(record_bindings);
     server_input_read_ = server_in;
     client_input_write_ = client_in;
@@ -140,16 +142,11 @@ bool LocalAgentToolSession::start(AgentMcpBindings bindings,
     server_output_write_ = server_out;
     receive_buffer_.clear();
     next_id_ = 1;
+    delivered_observations_.clear();
     running_.store(true, std::memory_order_relaxed);
 
     server_thread_ = std::thread([this] {
-        const HANDLE old_input = GetStdHandle(STD_INPUT_HANDLE);
-        const HANDLE old_output = GetStdHandle(STD_OUTPUT_HANDLE);
-        SetStdHandle(STD_INPUT_HANDLE, server_input_read_);
-        SetStdHandle(STD_OUTPUT_HANDLE, server_output_write_);
         run_mcp_stdio(bindings_);
-        SetStdHandle(STD_INPUT_HANDLE, old_input);
-        SetStdHandle(STD_OUTPUT_HANDLE, old_output);
         if (server_input_read_) {
             CloseHandle(server_input_read_);
             server_input_read_ = nullptr;
@@ -215,9 +212,20 @@ LocalToolResult LocalAgentToolSession::call_art_tool(std::string_view tool, std:
     result.image_base64 = find_string_value(response, "data");
     result.image_mime = find_string_value(response, "mimeType");
     if (result.text.empty()) {
-        result.text = result.success
-            ? "{\"ok\":true}"
-            : "{\"ok\":false,\"error\":\"malformed_local_tool_response\"}";
+        result.success = false;
+        result.text = "{\"ok\":false,\"error\":\"malformed_local_tool_response\"}";
+    }
+    if (result.success && !result.image_base64.empty()) {
+        const auto observation = find_string_value(result.text, "observation");
+        FlatJsonObject args; std::string ignored;
+        parse_flat_json_object(arguments_json, args, ignored);
+        const bool resend = args.get_bool("resend_image").value_or(false);
+        if (!observation.empty() && !delivered_observations_.insert(observation).second && !resend) {
+            result.image_base64.clear();
+            result.image_mime.clear();
+            result.text = "{\"ok\":true,\"unchanged\":true,\"observation\":" + json_quote(observation) +
+                ",\"message\":\"This exact image was already delivered in this session. Use it from context; continue drawing. Set resend_image=true only if you need it delivered again.\"}";
+        }
     }
     return result;
 }
@@ -310,7 +318,7 @@ std::string pixelforge_dynamic_tools_json() {
     return R"JSON([
 {"type":"function","name":"pixelforge_task","description":"PixelForge task lifecycle. Use get first; accept pixel-art tasks with a chosen canvas size; reject incompatible requests; abort technical blockers after acceptance; finish only when complete.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
 {"type":"function","name":"pixelforge_edit","description":"Apply one atomic exact-pixel patch. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c. c is palette index or #AARRGGBB. Always pass current task_id and revision.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"}},"required":["task_id","expected_revision","patch"]}},
-{"type":"function","name":"pixelforge_view","description":"Observe PixelForge. render returns a lossless canvas PNG; content_reference/style_reference return reference images capped to 262144 delivered pixels; inspect returns compact exact pixels.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"}},"required":["action","task_id"]}},
+{"type":"function","name":"pixelforge_view","description":"Observe PixelForge. render returns a lossless canvas PNG; content_reference/style_reference return reference images capped to 262144 delivered pixels; inspect returns compact exact pixels.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean","description":"Explicitly redeliver an image already seen this session; normally omit."}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_palette","description":"Get or replace the compact palette dictionary. Colors are comma-separated AARRGGBB; exact #AARRGGBB colors remain available in patches.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"colors":{"type":"string"}},"required":["action"]}},
 {"type":"function","name":"pixelforge_history","description":"Revision-guarded undo/redo for the accepted task.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["undo","redo"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"}},"required":["action","task_id","expected_revision"]}},
 {"type":"function","name":"pixelforge_io","description":"Export the current canvas losslessly to native-resolution PNG.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"path":{"type":"string"}},"required":["action","task_id","expected_revision","path"]}},

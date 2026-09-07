@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 namespace pixelforge::win32 {
 
@@ -61,6 +62,7 @@ private:
     std::string receive_buffer_;
     std::uint64_t next_id_ = 1;
     std::atomic_bool running_{false};
+    std::unordered_set<std::string> delivered_observations_;
 };
 
 // JSON array suitable for thread/start.dynamicTools.

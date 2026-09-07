@@ -20,6 +20,9 @@ struct AgentMcpBindings {
     std::wstring* style_path = nullptr;
     std::mutex* state_mutex = nullptr;
     HWND hwnd = nullptr;
+    HANDLE input = nullptr;
+    HANDLE output = nullptr;
+    bool close_window_on_exit = true;
 };
 
 // Serves PixelForge as a compact local MCP stdio server while the same process

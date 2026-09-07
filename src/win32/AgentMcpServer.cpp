@@ -44,9 +44,10 @@ std::string wide_to_utf8(std::wstring_view text) {
     return out;
 }
 
+struct LineReader {
+    char buffer[16384];
+    DWORD available = 0, cursor = 0;
 bool read_line(HANDLE input, std::string& line) {
-    static char buffer[16384];
-    static DWORD available = 0, cursor = 0;
     line.clear();
     for (;;) {
         if (cursor == available) {
@@ -59,6 +60,7 @@ bool read_line(HANDLE input, std::string& line) {
         if (line.size() > 8u * 1024u * 1024u) return false;
     }
 }
+};
 
 bool write_line(HANDLE output, std::string_view line) {
     std::string framed(line);
@@ -834,13 +836,14 @@ int run_mcp_stdio(AgentMcpBindings bindings) {
     if (!bindings.document || !bindings.task || !bindings.content_reference || !bindings.style_reference ||
         !bindings.content_path || !bindings.style_path || !bindings.state_mutex) return 2;
 
-    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE input = bindings.input ? bindings.input : GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE output = bindings.output ? bindings.output : GetStdHandle(STD_OUTPUT_HANDLE);
     if (!input || input == INVALID_HANDLE_VALUE || !output || output == INVALID_HANDLE_VALUE) return 3;
 
     Server server(bindings);
+    LineReader reader;
     std::string line;
-    while (read_line(input, line)) {
+    while (reader.read_line(input, line)) {
         if (line.empty()) continue;
         std::string method_raw, id_raw, params_raw;
         if (!extract_member_raw(line, "method", method_raw)) {
@@ -911,7 +914,7 @@ int run_mcp_stdio(AgentMcpBindings bindings) {
         if (!notification) write_line(output, make_error(id_raw, -32601, "Method not found."));
     }
 
-    if (bindings.hwnd) PostMessageW(bindings.hwnd, WM_CLOSE, 0, 0);
+    if (bindings.hwnd && bindings.close_window_on_exit) PostMessageW(bindings.hwnd, WM_CLOSE, 0, 0);
     return 0;
 }
 

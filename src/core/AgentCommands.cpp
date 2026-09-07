@@ -144,7 +144,8 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
     }
 
     auto tx = document_->begin_transaction();
-    for (const auto& op : operations) {
+    for (std::size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
+        const auto& op = operations[operation_index];
         bool accepted = false;
         switch (op.kind) {
             case AgentPixelOpKind::SetPixel:
@@ -183,7 +184,11 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
         if (!accepted) {
             tx.cancel();
             return result(false, AgentErrorCode::EditRejected,
-                          "One or more pixel operations were outside the valid canvas or malformed; no changes were applied.");
+                          "Operation " + std::to_string(operation_index + 1) + " is out of bounds or malformed: x=" +
+                          std::to_string(op.x) + ", y=" + std::to_string(op.y) + ", width=" + std::to_string(op.width) +
+                          ", height=" + std::to_string(op.height) + ", x2=" + std::to_string(op.x2) + ", y2=" +
+                          std::to_string(op.y2) + ". Canvas=" + std::to_string(document_->width()) + "x" +
+                          std::to_string(document_->height()) + ". Fix this operation and resend the batch; no changes were applied.");
         }
     }
 
