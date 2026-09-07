@@ -4,10 +4,6 @@
 #include "RecordMcpServer.hpp"
 #include "SessionRecorder.hpp"
 
-// Keep the original GUI implementation as the rendering/editing surface, but
-// rename its entrypoint and window proc in this translation unit. The automatic
-// host below intercepts Generate and lifecycle messages without duplicating the
-// mature canvas/reference UI code.
 #define wWinMain pixelforge_legacy_wWinMain
 #define wndproc pixelforge_legacy_wndproc
 #include "main_mcp.cpp"
@@ -42,14 +38,29 @@ std::wstring executable_path() {
     return std::wstring(buffer.data(), count);
 }
 
-std::wstring find_repo_root(const std::wstring& exe) {
-    std::filesystem::path current = std::filesystem::path(exe).parent_path();
-    for (int depth = 0; depth < 8 && !current.empty(); ++depth) {
+std::wstring find_repo_root_from(std::filesystem::path current) {
+    for (int depth = 0; depth < 12 && !current.empty(); ++depth) {
         std::error_code ec;
         const bool has_cmake = std::filesystem::exists(current / L"CMakeLists.txt", ec);
+        ec.clear();
         const bool has_config = std::filesystem::exists(current / L"config" / L"agent_system_prompt.md", ec);
         if (has_cmake && has_config) return current.wstring();
-        current = current.parent_path();
+        const auto parent = current.parent_path();
+        if (parent == current) break;
+        current = parent;
+    }
+    return {};
+}
+
+std::wstring find_repo_root(const std::wstring& exe) {
+    if (!exe.empty()) {
+        if (auto root = find_repo_root_from(std::filesystem::path(exe).parent_path()); !root.empty())
+            return root;
+    }
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec) {
+        if (auto root = find_repo_root_from(cwd); !root.empty()) return root;
     }
     return {};
 }
@@ -105,8 +116,8 @@ void start_automatic_generation(HWND hwnd) {
         show_error(hwnd, L"Enter a PixelForge prompt before generating.");
         return;
     }
-    if (g_repo_root.empty() || g_executable_path.empty()) {
-        show_error(hwnd, L"PixelForge could not resolve its repository or executable path.");
+    if (g_repo_root.empty()) {
+        show_error(hwnd, L"PixelForge could not resolve its repository root. Run the executable from inside the PixelForge checkout or build directory.");
         return;
     }
 
@@ -127,7 +138,7 @@ void start_automatic_generation(HWND hwnd) {
 
     pixelforge::win32::CodexGenerateRequest request;
     request.repo_root = g_repo_root;
-    request.executable_path = g_executable_path;
+    request.executable_path = g_executable_path.empty() ? g_repo_root : g_executable_path;
     request.prompt = prompt;
     request.agent_contract = read_utf8_file(std::filesystem::path(g_repo_root) / L"config" / L"agent_system_prompt.md");
     request.tool_session = &g_local_tool_session;
@@ -140,7 +151,6 @@ void start_automatic_generation(HWND hwnd) {
             PostMessageW(hwnd, WM_AGENT_UPDATED, 0, 0);
         },
         [hwnd](bool ok, std::wstring message) {
-            // The App Server has finished using dynamic tools at this point.
             g_local_tool_session.stop();
             finalize_recording_if_needed(hwnd);
 
@@ -244,8 +254,6 @@ bool has_arg(const std::vector<std::wstring>& args, std::wstring_view wanted) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show) {
     const auto args = command_line_args();
 
-    // Keep old bridge modes for manual diagnostics/backward compatibility. The
-    // normal Generate path no longer uses either one.
     if (const auto pipe = option_argument(args, L"--bridge"); !pipe.empty())
         return pixelforge::win32::run_mcp_bridge_stdio(pipe);
     if (const auto pipe = option_argument(args, L"--record-bridge"); !pipe.empty())
