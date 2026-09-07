@@ -2,11 +2,13 @@
 
 #include <windows.h>
 #include <objidl.h>
+#include <ole2.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,16 +32,16 @@ int base64_value(unsigned char c) {
 bool base64_decode(std::string_view text, std::vector<std::uint8_t>& out) {
     out.clear();
     out.reserve((text.size() / 4) * 3);
-    int value = 0;
+    std::uint32_t value = 0;
     int bits = -8;
     for (unsigned char c : text) {
         if (c == '=') break;
         const int v = base64_value(c);
         if (v < 0) return false;
-        value = (value << 6) | v;
+        value = (value << 6) | static_cast<std::uint32_t>(v);
         bits += 6;
         if (bits >= 0) {
-            out.push_back(static_cast<std::uint8_t>((value >> bits) & 0xff));
+            out.push_back(static_cast<std::uint8_t>((value >> bits) & 0xffu));
             bits -= 8;
         }
     }
@@ -146,9 +148,7 @@ bool resize_png(const std::vector<std::uint8_t>& input,
     if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(nullptr, TRUE, &output_stream);
 
     ComPtr<IWICBitmapEncoder> encoder;
-    if (SUCCEEDED(hr)) {
-        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    }
+    if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
     if (SUCCEEDED(hr)) hr = encoder->Initialize(output_stream.Get(), WICBitmapEncoderNoCache);
 
     ComPtr<IWICBitmapFrameEncode> out_frame;
