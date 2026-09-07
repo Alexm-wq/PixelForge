@@ -12,13 +12,14 @@
 
 namespace pixelforge::win32 {
 
+class LocalAgentToolSession;
+
 struct CodexGenerateRequest {
     std::wstring repo_root;
     std::wstring executable_path;
-    std::wstring pipe_name;
-    std::wstring record_pipe_name;
     std::string prompt;
     std::string agent_contract;
+    LocalAgentToolSession* tool_session = nullptr;
 };
 
 class CodexAppClient {
@@ -67,8 +68,7 @@ private:
 
     std::wstring configured_repo_root_;
     std::wstring configured_executable_;
-    std::wstring configured_pipe_name_;
-    std::wstring configured_record_pipe_name_;
+    LocalAgentToolSession* active_tool_session_ = nullptr;
 
     std::atomic_bool busy_{false};
     std::atomic_bool shutting_down_{false};
