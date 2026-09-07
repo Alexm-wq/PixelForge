@@ -65,6 +65,7 @@ private:
     std::atomic_bool running_{false};
     std::unordered_set<std::string> delivered_observations_;
     std::unordered_map<std::string, std::string> reference_observations_;
+    std::unordered_map<std::string, std::string> render_observations_;
     std::uint64_t observed_task_ = 0;
     std::uint64_t observed_revision_ = 0;
     bool has_observed_revision_ = false;

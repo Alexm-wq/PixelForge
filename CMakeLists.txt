@@ -23,6 +23,7 @@ if(WIN32)
         src/win32/CodexAppClientDynamic.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/LocalAgentToolSession.cpp
+        src/win32/PixelProgram.cpp
         src/win32/SessionRecorder.cpp
         src/win32/RecordMcpServerRestricted.cpp
     )
@@ -50,7 +51,8 @@ if(BUILD_TESTING)
     set_tests_properties(pixelforge_core_tests PROPERTIES TIMEOUT 60)
     if(WIN32)
         add_executable(pixelforge_automatic_tests tests/test_automatic.cpp
-            src/win32/LocalAgentToolSession.cpp src/win32/AgentMcpServerFramed.cpp
+            src/win32/LocalAgentToolSession.cpp src/win32/PixelProgram.cpp
+            src/win32/AgentMcpServerFramed.cpp
             src/win32/ReferenceResponseLimiter.cpp src/win32/ImageIO.cpp
             src/win32/SessionRecorder.cpp src/win32/CodexSessionTrace.cpp)
         target_include_directories(pixelforge_automatic_tests PRIVATE src/win32)

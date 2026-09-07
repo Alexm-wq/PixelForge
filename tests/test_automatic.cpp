@@ -29,6 +29,7 @@ int mock_server() {
         if (method == "initialize") emit("{\"id\":" + id + ",\"result\":{}}");
         else if (method == "thread/start") {
             CHECK(line.find("pixelforge_edit") != std::string::npos);
+            CHECK(line.find("pixelforge_program") != std::string::npos);
             CHECK(!nested_string(line, {"params", "baseInstructions"}).empty());
             emit("{\"id\":" + id + ",\"result\":{\"thread\":{\"id\":\"test-thread\"}}}");
         } else if (method == "turn/start") {
@@ -115,8 +116,18 @@ int main(int argc, char**) {
         const auto repeat = tools.call("pixelforge_view", reference_args);
         CHECK(repeat.success && repeat.image_base64.empty());
         CHECK(tools.call("pixelforge_task", "{\"action\":\"accept\",\"task_id\":" + id + ",\"width\":96,\"height\":64}").success);
-        auto edited = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"R,0,0,96,64,#FF112233\",\"render_scale\":2}");
-        CHECK(edited.success && !edited.image_base64.empty());
+
+        // High-level program: broad scene construction is expanded locally and
+        // committed as one exact diff. Deliberate overshoot must clip, not fail.
+        auto programmed = tools.call("pixelforge_program", "{\"task_id\":" + id +
+            ",\"program\":\"CLEAR #FF112233;FELLIPSE 48 32 60 20 #FF335577;BOX -2 -2 12 12 #FFFFFFFF;Q 0 63 48 -8 95 63 #FF00FF00\",\"render_scale\":2}");
+        CHECK(programmed.success && !programmed.image_base64.empty());
+        CHECK(parse_flat_json_object(programmed.text, metadata, parse_error));
+        CHECK(metadata.get_i64("commands").value_or(0) == 4);
+        CHECK(metadata.get_i64("patch_operations").value_or(0) > 0);
+        CHECK(metadata.get_i64("clipped_writes").value_or(0) > 0);
+        CHECK(document.pixel(48, 32) == 0xff335577);
+
         const auto revision = document.revision();
         auto rejected = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"H,0,0,97,#FFFFFFFF\",\"render_scale\":2}");
         CHECK(!rejected.success && rejected.image_base64.empty() && document.revision() == revision);
@@ -127,10 +138,13 @@ int main(int argc, char**) {
         }
         auto stale = tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"P,1,1,#FFFFFFFF\"}");
         CHECK(!stale.success && document.pixel(1,1) == 0xff445566);
-        CHECK(tools.call("pixelforge_task", "{\"action\":\"get\"}").success);
+        // The stale response carries the authoritative revision; the next render
+        // may omit it and should observe latest state instead of failing stale again.
+        auto latest = tools.call("pixelforge_view", "{\"action\":\"render\",\"task_id\":" + id + ",\"scale\":1}");
+        CHECK(latest.success && !latest.image_base64.empty());
         CHECK(tools.call("pixelforge_edit", "{\"task_id\":" + id + ",\"patch\":\"P,1,1,#FFFFFFFF\"}").success);
         tools.stop();
-        std::cout << "Passed cached references, preview cap, edit/render, rejected batches and concurrent user edits.\n";
+        std::cout << "Passed raster program, clipping, cached observations, edit/render and concurrent user edits.\n";
     }
     for (const auto mode : {L"success", L"incomplete", L"errors", L"stall", L"cancel"}) {
         SetEnvironmentVariableW(L"PIXELFORGE_TEST_MODE", mode);
