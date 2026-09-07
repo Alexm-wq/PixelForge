@@ -1,5 +1,6 @@
 #include "CodexSessionTrace.hpp"
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -139,6 +140,13 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     if (!status.empty()) entry += " status=" + status;
     if (!model.empty()) entry += " model=" + model;
     if (!code.empty()) entry += " code=" + code;
+
+    // Error text is useful diagnostically, but ordinary agent/user text is not
+    // logged. Restrict message capture to explicit errors/failures.
+    if (method == "error" || status == "failed" || line.find("\"error\"") != std::string_view::npos) {
+        const auto message = scalar_string(line, "message");
+        if (!message.empty()) entry += " message=" + message;
+    }
 
     append_locked(entry);
 }
