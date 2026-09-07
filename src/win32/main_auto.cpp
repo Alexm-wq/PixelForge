@@ -24,6 +24,7 @@ namespace {
 constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
 constexpr UINT WM_SHOW_USER_REVIEW = WM_APP + 21;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
+constexpr UINT_PTR RECORDING_FINALIZE_TIMER = 79;
 constexpr int ID_STOP_CODEX = 1020;
 constexpr int ID_INTELLIGENCE = 1021;
 constexpr int ID_REVIEW_FEEDBACK = 1030;
@@ -123,11 +124,25 @@ void post_codex_status(HWND hwnd, std::wstring text) {
     if (!PostMessageW(hwnd, WM_CODEX_STATUS, 0, reinterpret_cast<LPARAM>(owned))) delete owned;
 }
 
-void finalize_recording_if_needed(HWND hwnd) {
-    if (!g_session_recorder.active()) return;
+bool finalize_recording_if_needed(HWND hwnd) {
+    if (!g_session_recorder.active()) return true;
     std::wstring recording_error;
-    if (!g_session_recorder.stop(recording_error))
+    if (!g_session_recorder.stop(recording_error)) {
         post_codex_status(hwnd, L"Recording finalize error: " + recording_error);
+        return false;
+    }
+    return true;
+}
+
+void finalize_terminal_recording(HWND hwnd, std::wstring status) {
+    if (!g_session_recorder.active()) {
+        post_codex_status(hwnd, std::move(status));
+        return;
+    }
+    const auto path = g_session_recorder.output_path();
+    g_session_recorder.permit_finalization();
+    if (finalize_recording_if_needed(hwnd))
+        post_codex_status(hwnd, std::move(status) + L" Demo recording saved: " + path);
 }
 
 bool start_local_tools(HWND hwnd, std::wstring& error) {
@@ -209,9 +224,20 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                     show_error(hwnd, utf8_to_wide(error));
                     return 0;
                 }
-                post_codex_status(owner, L"Artwork accepted.");
+
+                // Keep recording for a short tail after the click so the demo
+                // captures the review popup disappearing and the accepted final state.
+                if (g_session_recorder.active()) {
+                    g_session_recorder.permit_finalization();
+                    post_codex_status(owner, L"Artwork accepted. Finalizing demo recording...");
+                } else {
+                    post_codex_status(owner, L"Artwork accepted.");
+                }
                 DestroyWindow(hwnd);
-                if (owner) PostMessageW(owner, WM_AGENT_UPDATED, 0, 0);
+                if (owner) {
+                    PostMessageW(owner, WM_AGENT_UPDATED, 0, 0);
+                    if (g_session_recorder.active()) SetTimer(owner, RECORDING_FINALIZE_TIMER, 750, nullptr);
+                }
                 return 0;
             }
             if (id == ID_REVIEW_CHANGES) {
@@ -232,7 +258,9 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                 }
                 DestroyWindow(hwnd);
                 if (owner) {
-                    post_codex_status(owner, L"Revision requested; continuing from the current canvas...");
+                    post_codex_status(owner, g_session_recorder.active()
+                        ? L"Revision requested; demo recording continues through the next pass..."
+                        : L"Revision requested; continuing from the current canvas...");
                     start_automatic_generation(owner, feedback);
                 }
                 return 0;
@@ -394,7 +422,6 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
         },
         [hwnd](bool ok, std::wstring message) {
             g_local_tool_session.stop();
-            finalize_recording_if_needed(hwnd);
 
             AgentTaskSnapshot snapshot;
             {
@@ -402,16 +429,20 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
                 snapshot = g_app.task.snapshot();
             }
             if (!ok) {
-                post_codex_status(hwnd, L"Codex error: " + message);
+                post_codex_status(hwnd, g_session_recorder.active()
+                    ? L"Codex error: " + message + L" Recording remains active so you can continue the artwork."
+                    : L"Codex error: " + message);
             } else if (snapshot.awaiting_user_review) {
-                post_codex_status(hwnd, L"Astra submitted this pass for your review.");
+                post_codex_status(hwnd, g_session_recorder.active()
+                    ? L"Astra submitted this pass for your review. Demo recording is still running."
+                    : L"Astra submitted this pass for your review.");
                 PostMessageW(hwnd, WM_SHOW_USER_REVIEW, 0, 0);
             } else if (snapshot.state == TaskState::Finished) {
                 post_codex_status(hwnd, L"Artwork complete.");
             } else if (snapshot.state == TaskState::Rejected) {
-                post_codex_status(hwnd, L"Codex rejected task: " + utf8_to_wide(snapshot.status_message));
+                finalize_terminal_recording(hwnd, L"Codex rejected task: " + utf8_to_wide(snapshot.status_message));
             } else if (snapshot.state == TaskState::Aborted) {
-                post_codex_status(hwnd, L"Codex aborted task: " + utf8_to_wide(snapshot.status_message));
+                finalize_terminal_recording(hwnd, L"Codex aborted task: " + utf8_to_wide(snapshot.status_message));
             } else {
                 post_codex_status(hwnd, L"Codex turn ended without submitting the artwork for review.");
             }
@@ -421,8 +452,9 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
 
     if (!started) {
         g_local_tool_session.stop();
-        finalize_recording_if_needed(hwnd);
-        post_codex_status(hwnd, L"Codex: idle.");
+        post_codex_status(hwnd, g_session_recorder.active()
+            ? L"Codex could not start; demo recording remains active."
+            : L"Codex: idle.");
         show_error(hwnd, error);
     }
 }
@@ -463,7 +495,9 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     }
     if (msg == WM_COMMAND && LOWORD(wparam) == ID_STOP_CODEX) {
         g_codex_client.cancel();
-        post_codex_status(hwnd, L"Codex: stopping; existing canvas will be kept.");
+        post_codex_status(hwnd, g_session_recorder.active()
+            ? L"Codex: stopping; existing canvas and demo recording will be kept."
+            : L"Codex: stopping; existing canvas will be kept.");
         return 0;
     }
     if (msg == WM_CODEX_STATUS) {
@@ -476,6 +510,15 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         maybe_show_pending_review(hwnd);
         return 0;
     }
+    if (msg == WM_TIMER && wparam == RECORDING_FINALIZE_TIMER) {
+        KillTimer(hwnd, RECORDING_FINALIZE_TIMER);
+        const auto path = g_session_recorder.output_path();
+        if (finalize_recording_if_needed(hwnd))
+            post_codex_status(hwnd, path.empty()
+                ? L"Artwork accepted."
+                : L"Artwork accepted. Demo recording saved: " + path);
+        return 0;
+    }
     if (msg == WM_TIMER && wparam == CODEX_REFRESH_TIMER) {
         maybe_show_pending_review(hwnd);
         if (g_codex_client.busy() || g_session_recorder.active() || g_review_popup_pending)
@@ -484,9 +527,11 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     }
     if (msg == WM_DESTROY) {
         KillTimer(hwnd, CODEX_REFRESH_TIMER);
+        KillTimer(hwnd, RECORDING_FINALIZE_TIMER);
         if (g_review_window) DestroyWindow(g_review_window);
         g_codex_client.shutdown();
         g_local_tool_session.stop();
+        g_session_recorder.permit_finalization();
         finalize_recording_if_needed(hwnd);
         return pixelforge_legacy_wndproc(hwnd, msg, wparam, lparam);
     }
@@ -531,6 +576,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_executable_path = executable_path();
     g_repo_root = find_repo_root(g_executable_path);
+    g_session_recorder.set_user_review_gate(true);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = automatic_wndproc;
@@ -558,6 +604,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
 
     g_codex_client.shutdown();
     g_local_tool_session.stop();
+    g_session_recorder.permit_finalization();
     finalize_recording_if_needed(hwnd);
     if (SUCCEEDED(com)) CoUninitialize();
     return static_cast<int>(msg.wParam);
