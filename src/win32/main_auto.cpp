@@ -12,6 +12,7 @@
 
 #include <shellapi.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -21,9 +22,13 @@
 namespace {
 
 constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
+constexpr UINT WM_SHOW_USER_REVIEW = WM_APP + 21;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
 constexpr int ID_STOP_CODEX = 1020;
 constexpr int ID_INTELLIGENCE = 1021;
+constexpr int ID_REVIEW_FEEDBACK = 1030;
+constexpr int ID_REVIEW_ACCEPT = 1031;
+constexpr int ID_REVIEW_CHANGES = 1032;
 
 constexpr const char* kFallbackAgentContract =
     "You are a pixel artist using PixelForge's local drawing tools. "
@@ -39,6 +44,13 @@ std::wstring g_repo_root;
 std::wstring g_executable_path;
 HWND g_codex_status = nullptr;
 HWND g_intelligence = nullptr;
+HWND g_review_window = nullptr;
+HWND g_review_feedback = nullptr;
+bool g_review_popup_pending = false;
+std::wstring g_review_summary_text;
+
+void start_automatic_generation(HWND hwnd, std::string review_feedback = {});
+void show_user_review_window(HWND owner);
 
 std::string selected_reasoning_effort() {
     if (!g_intelligence) return "medium";
@@ -139,10 +151,196 @@ bool start_local_tools(HWND hwnd, std::wstring& error) {
     return g_local_tool_session.start(bindings, std::move(record), error);
 }
 
-void start_automatic_generation(HWND hwnd) {
+void center_owned_window(HWND window, HWND owner) {
+    RECT wr{}, orc{};
+    if (!GetWindowRect(window, &wr) || !owner || !GetWindowRect(owner, &orc)) return;
+    const int width = wr.right - wr.left;
+    const int height = wr.bottom - wr.top;
+    const int x = orc.left + ((orc.right - orc.left) - width) / 2;
+    const int y = orc.top + ((orc.bottom - orc.top) - height) / 2;
+    SetWindowPos(window, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            HWND title = CreateWindowW(L"STATIC", L"Astra has finished this pass. Review the artwork, then accept it or request another pass.",
+                                       WS_CHILD | WS_VISIBLE, 18, 16, 454, 38, hwnd, nullptr, nullptr, nullptr);
+            if (title) SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+            HWND summary_label = CreateWindowW(L"STATIC", L"AGENT SUMMARY", WS_CHILD | WS_VISIBLE,
+                                               18, 62, 120, 20, hwnd, nullptr, nullptr, nullptr);
+            if (summary_label) SendMessageW(summary_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            HWND summary = CreateWindowW(L"STATIC", g_review_summary_text.empty() ? L"Artwork submitted for review." : g_review_summary_text.c_str(),
+                                         WS_CHILD | WS_VISIBLE, 18, 84, 454, 54, hwnd, nullptr, nullptr, nullptr);
+            if (summary) SendMessageW(summary, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+            HWND feedback_label = CreateWindowW(L"STATIC", L"CHANGES", WS_CHILD | WS_VISIBLE,
+                                                18, 146, 100, 20, hwnd, nullptr, nullptr, nullptr);
+            if (feedback_label) SendMessageW(feedback_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            g_review_feedback = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+                                                18, 168, 454, 92, hwnd,
+                                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REVIEW_FEEDBACK)), nullptr, nullptr);
+            if (g_review_feedback) SendMessageW(g_review_feedback, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+            HWND accept = CreateWindowW(L"BUTTON", L"Accept", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                        18, 276, 140, 32, hwnd,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REVIEW_ACCEPT)), nullptr, nullptr);
+            HWND changes = CreateWindowW(L"BUTTON", L"Request changes", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         170, 276, 302, 32, hwnd,
+                                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REVIEW_CHANGES)), nullptr, nullptr);
+            if (accept) SendMessageW(accept, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            if (changes) SendMessageW(changes, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            if (g_review_feedback) SetFocus(g_review_feedback);
+            return 0;
+        }
+        case WM_COMMAND: {
+            const int id = LOWORD(wparam);
+            HWND owner = GetWindow(hwnd, GW_OWNER);
+            if (id == ID_REVIEW_ACCEPT) {
+                std::string error;
+                {
+                    std::lock_guard lock(g_state_mutex);
+                    g_app.task.user_accept_review(&error);
+                }
+                if (!error.empty()) {
+                    show_error(hwnd, utf8_to_wide(error));
+                    return 0;
+                }
+                post_codex_status(owner, L"Artwork accepted.");
+                DestroyWindow(hwnd);
+                if (owner) PostMessageW(owner, WM_AGENT_UPDATED, 0, 0);
+                return 0;
+            }
+            if (id == ID_REVIEW_CHANGES) {
+                const std::wstring feedback_w = get_window_text(g_review_feedback);
+                if (feedback_w.find_first_not_of(L" \t\r\n") == std::wstring::npos) {
+                    show_error(hwnd, L"Enter the changes you want Astra to make.");
+                    return 0;
+                }
+                const std::string feedback = wide_to_utf8(feedback_w);
+                std::string error;
+                {
+                    std::lock_guard lock(g_state_mutex);
+                    g_app.task.user_request_changes(feedback, &error);
+                }
+                if (!error.empty()) {
+                    show_error(hwnd, utf8_to_wide(error));
+                    return 0;
+                }
+                DestroyWindow(hwnd);
+                if (owner) {
+                    post_codex_status(owner, L"Revision requested; continuing from the current canvas...");
+                    start_automatic_generation(owner, feedback);
+                }
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY: {
+            HWND owner = GetWindow(hwnd, GW_OWNER);
+            g_review_feedback = nullptr;
+            g_review_window = nullptr;
+            if (owner) {
+                EnableWindow(owner, TRUE);
+                SetForegroundWindow(owner);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+void show_user_review_window(HWND owner) {
+    if (!owner) return;
+    if (g_review_window) {
+        ShowWindow(g_review_window, SW_SHOW);
+        SetForegroundWindow(g_review_window);
+        return;
+    }
+
+    AgentTaskSnapshot snapshot;
+    {
+        std::lock_guard lock(g_state_mutex);
+        snapshot = g_app.task.snapshot();
+    }
+    if (!snapshot.awaiting_user_review) return;
+    g_review_summary_text = utf8_to_wide(snapshot.review_summary);
+
+    static ATOM review_class = 0;
+    if (!review_class) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = review_wndproc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"PixelForgeUserReviewWindow";
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        review_class = RegisterClassW(&wc);
+        if (!review_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            show_error(owner, L"Could not create the user review window.");
+            return;
+        }
+    }
+
+    g_review_window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                                      L"PixelForgeUserReviewWindow", L"Review artwork",
+                                      WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                                      CW_USEDEFAULT, CW_USEDEFAULT, 510, 360,
+                                      owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!g_review_window) {
+        show_error(owner, L"Could not open the user review window.");
+        return;
+    }
+
+    EnableWindow(owner, FALSE);
+    center_owned_window(g_review_window, owner);
+    ShowWindow(g_review_window, SW_SHOW);
+    UpdateWindow(g_review_window);
+    SetForegroundWindow(g_review_window);
+}
+
+void maybe_show_pending_review(HWND hwnd) {
+    if (!g_review_popup_pending || g_review_window || g_codex_client.busy()) return;
+
+    bool animating = false;
+    AgentTaskSnapshot snapshot;
+    {
+        std::lock_guard lock(g_state_mutex);
+        animating = g_app.playback.animating();
+        snapshot = g_app.task.snapshot();
+    }
+    if (!snapshot.awaiting_user_review) {
+        g_review_popup_pending = false;
+        return;
+    }
+    if (animating) return;
+
+    g_review_popup_pending = false;
+    show_user_review_window(hwnd);
+}
+
+void start_automatic_generation(HWND hwnd, std::string review_feedback) {
     if (g_codex_client.busy()) {
         show_error(hwnd, L"Codex is already working on the current PixelForge task.");
         return;
+    }
+
+    if (review_feedback.empty()) {
+        AgentTaskSnapshot snapshot;
+        {
+            std::lock_guard lock(g_state_mutex);
+            snapshot = g_app.task.snapshot();
+        }
+        if (snapshot.awaiting_user_review) {
+            g_review_popup_pending = false;
+            show_user_review_window(hwnd);
+            return;
+        }
     }
 
     const std::wstring prompt_w = get_window_text(g_prompt);
@@ -163,14 +361,20 @@ void start_automatic_generation(HWND hwnd) {
         return;
     }
 
-    const std::string prompt = wide_to_utf8(prompt_w);
+    std::string prompt = wide_to_utf8(prompt_w);
+    if (!review_feedback.empty()) {
+        prompt += "\n\nUser review feedback:\n" + review_feedback +
+                  "\n\nContinue editing the existing canvas. Preserve what already works and make the requested changes.";
+    }
     const std::string reasoning_effort = selected_reasoning_effort();
     {
         std::lock_guard lock(g_state_mutex);
         g_app.task.begin(prompt);
     }
     InvalidateRect(hwnd, nullptr, FALSE);
-    post_codex_status(hwnd, L"Codex: queued (" + utf8_to_wide(reasoning_effort) + L")...");
+    post_codex_status(hwnd, review_feedback.empty()
+        ? L"Codex: queued (" + utf8_to_wide(reasoning_effort) + L")..."
+        : L"Codex: revision pass queued (" + utf8_to_wide(reasoning_effort) + L")...");
 
     pixelforge::win32::CodexGenerateRequest request;
     request.repo_root = g_repo_root;
@@ -199,14 +403,17 @@ void start_automatic_generation(HWND hwnd) {
             }
             if (!ok) {
                 post_codex_status(hwnd, L"Codex error: " + message);
+            } else if (snapshot.awaiting_user_review) {
+                post_codex_status(hwnd, L"Astra submitted this pass for your review.");
+                PostMessageW(hwnd, WM_SHOW_USER_REVIEW, 0, 0);
             } else if (snapshot.state == TaskState::Finished) {
-                post_codex_status(hwnd, L"Codex: complete.");
+                post_codex_status(hwnd, L"Artwork complete.");
             } else if (snapshot.state == TaskState::Rejected) {
                 post_codex_status(hwnd, L"Codex rejected task: " + utf8_to_wide(snapshot.status_message));
             } else if (snapshot.state == TaskState::Aborted) {
                 post_codex_status(hwnd, L"Codex aborted task: " + utf8_to_wide(snapshot.status_message));
             } else {
-                post_codex_status(hwnd, L"Codex turn ended without task.finish; review the canvas/task state.");
+                post_codex_status(hwnd, L"Codex turn ended without submitting the artwork for review.");
             }
             PostMessageW(hwnd, WM_AGENT_UPDATED, 0, 0);
         },
@@ -264,12 +471,20 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         if (text && g_codex_status) SetWindowTextW(g_codex_status, text->c_str());
         return 0;
     }
+    if (msg == WM_SHOW_USER_REVIEW) {
+        g_review_popup_pending = true;
+        maybe_show_pending_review(hwnd);
+        return 0;
+    }
     if (msg == WM_TIMER && wparam == CODEX_REFRESH_TIMER) {
-        if (g_codex_client.busy() || g_session_recorder.active()) InvalidateRect(hwnd, nullptr, FALSE);
+        maybe_show_pending_review(hwnd);
+        if (g_codex_client.busy() || g_session_recorder.active() || g_review_popup_pending)
+            InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
     if (msg == WM_DESTROY) {
         KillTimer(hwnd, CODEX_REFRESH_TIMER);
+        if (g_review_window) DestroyWindow(g_review_window);
         g_codex_client.shutdown();
         g_local_tool_session.stop();
         finalize_recording_if_needed(hwnd);
