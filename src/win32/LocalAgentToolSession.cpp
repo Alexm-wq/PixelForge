@@ -64,8 +64,7 @@ bool parse_json_string(std::string_view text, std::size_t& p, std::string& out) 
             case 'n': out.push_back('\n'); break;
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
-            default:
-                return false;
+            default: return false;
         }
     }
     return false;
@@ -222,6 +221,7 @@ void LocalAgentToolSession::stop() {
 
 LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_view arguments_json) {
     std::lock_guard lock(call_mutex_);
+    if (tool == "pixelforge_pack") return call_pack_tool(arguments_json);
     if (tool == "pixelforge_record") return call_record_tool(arguments_json);
 
     FlatJsonObject args;
@@ -254,9 +254,8 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             pixels = bindings_.document->pixels();
         }
         program_result = compile_pixel_program(program, width, height, pixels);
-        if (!program_result.ok) {
+        if (!program_result.ok)
             return {false, "{\"ok\":false,\"error\":\"invalid_program\",\"message\":" + json_quote(program_result.error) + "}"};
-        }
 
         effective = "{\"task_id\":" + std::to_string(*task_id) + ",\"patch\":" + json_quote(program_result.patch);
         if (args.contains("expected_revision"))
@@ -269,10 +268,6 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             return {false, "{\"ok\":false,\"error\":\"program_compile_internal\"}"};
     }
 
-    // GUI-created tasks already know their current canvas dimensions. Avoid a
-    // wasted accept failure when the model omits width/height by inheriting any
-    // missing dimension from the authoritative task snapshot. Explicit values
-    // still win, so intentional resize requests keep working unchanged.
     if (effective_tool == "pixelforge_task" && args.get("action") == "accept" &&
         (!args.contains("width") || !args.contains("height"))) {
         const auto accept_task_id = args.get_i64("task_id");
@@ -282,8 +277,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                 std::lock_guard state_lock(*bindings_.state_mutex);
                 snap = bindings_.task->snapshot();
             }
-            if (snap.id == static_cast<std::uint64_t>(*accept_task_id) &&
-                snap.canvas_width > 0 && snap.canvas_height > 0) {
+            if (snap.id == static_cast<std::uint64_t>(*accept_task_id) && snap.canvas_width > 0 && snap.canvas_height > 0) {
                 std::string defaults;
                 if (!args.contains("width")) defaults += ",\"width\":" + std::to_string(snap.canvas_width);
                 if (!args.contains("height")) defaults += ",\"height\":" + std::to_string(snap.canvas_height);
@@ -304,8 +298,10 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
     if (needs_revision && !args.contains("expected_revision") && has_observed_revision_ &&
         task_id && *task_id >= 0 && static_cast<std::uint64_t>(*task_id) == observed_task_) {
         const auto end = effective.find_last_of('}');
-        effective.insert(end, ",\"expected_revision\":" + std::to_string(observed_revision_));
-        parse_flat_json_object(effective, args, error);
+        if (end != std::string::npos) {
+            effective.insert(end, ",\"expected_revision\":" + std::to_string(observed_revision_));
+            parse_flat_json_object(effective, args, error);
+        }
     }
 
     const auto scale = args.get_i64("render_scale");
@@ -562,6 +558,7 @@ bool LocalAgentToolSession::read_line(std::string& line) {
 std::string pixelforge_dynamic_tools_json() {
     return R"JSON([
 {"type":"function","name":"pixelforge_task","description":"Manage PixelForge task state. Start with get. For accept, width/height are optional on an existing GUI task: omitted dimensions inherit the task's current canvas size; specify them only when intentionally changing size.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","get","accept","reject","abort","finish"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"prompt":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"reason":{"type":"string"},"summary":{"type":"string"},"content_reference":{"type":"string"},"style_reference":{"type":"string"},"known_task":{"type":"integer"},"known_revision":{"type":"integer"},"known_state":{"type":"string"}},"required":["action"]}},
+{"type":"function","name":"pixelforge_pack","description":"Create and work on an arbitrary set of sprite canvases inside one task. Use create with canvases='name,group,width,height,frame|...' for variants or animation frames. program accepts normal PixelProgram syntax plus CANVAS name directives and can update many canvases in one call. view can return one canvas, a full sheet, ordered strip, or animated GIF. clone/copy reuse frames; history undoes/redoes an entire multi-canvas artistic pass; inspect reads exact pixels; export saves one canvas, a group/all PNGs, sheet/strip PNG, or animation GIF.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","program","edit","clone","copy","history","view","inspect","export"]},"task_id":{"type":"integer"},"canvases":{"type":"string"},"canvas":{"type":"string"},"group":{"type":"string"},"program":{"type":"string"},"patch":{"type":"string"},"source":{"type":"string"},"dest":{"type":"string"},"direction":{"type":"string","enum":["undo","redo"]},"mode":{"type":"string","enum":["canvas","sheet","strip","animation"]},"scope":{"type":"string","enum":["canvas","group","all","sheet","strip","animation"]},"render_scale":{"type":"integer","minimum":1,"maximum":16},"scale":{"type":"integer","minimum":1,"maximum":16},"columns":{"type":"integer","minimum":1},"fps":{"type":"integer","minimum":1,"maximum":60},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"sx":{"type":"integer"},"sy":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"path":{"type":"string"}},"required":["action","task_id"]}},
 {"type":"function","name":"pixelforge_program","description":"Apply one stateful raster program to the current canvas and optionally render. Prefer named masks and bulk operations over thousands of primitive commands. Core geometry includes CLEAR/P/H/V/R/BOX/L/ELLIPSE/FELLIPSE/CIRCLE/FCIRCLE/Q/C/POLY/FPOLY/COPY/FLIPX/FLIPY/FLIPXY. Named-mask operations: MASKRECT/MASKELLIPSE/MASKPOLY/MASKCLEAR, FILLMASK, SHADE, CLUSTERS, DITHER, OUTLINE. See base instructions for exact grammar. Colors are palette index or #AARRGGBB.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"program":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","program"]}},
 {"type":"function","name":"pixelforge_edit","description":"Apply an exact pixel patch and optionally return a rendered image. Grammar: P,x,y,c; H,x,y,len,c; V,x,y,len,c; R,x,y,w,h,c; L,x0,y0,x1,y1,c.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"patch":{"type":"string"},"render_scale":{"type":"integer","minimum":1,"maximum":32}},"required":["task_id","patch"]}},
 {"type":"function","name":"pixelforge_view","description":"Return a canvas render, exact pixel inspection, or the supplied content/style reference image.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["render","content_reference","style_reference","inspect"]},"task_id":{"type":"integer"},"expected_revision":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"scale":{"type":"integer"},"known_observation":{"type":"string"},"resend_image":{"type":"boolean"}},"required":["action","task_id"]}},

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace pixelforge::win32 {
@@ -17,6 +18,7 @@ std::string g_tx_buffer;
 std::string g_rx_buffer;
 bool g_session_started = false;
 std::uint64_t g_asset_index = 0;
+std::unordered_map<std::string, std::string> g_tool_calls;
 
 std::filesystem::path find_repo_root() {
     std::vector<wchar_t> buffer(32768, L'\0');
@@ -46,6 +48,12 @@ std::filesystem::path conversation_path() {
     return path;
 }
 
+std::filesystem::path transcript_path() {
+    auto path = trace_path();
+    path += L".transcript.md";
+    return path;
+}
+
 std::filesystem::path assets_path() {
     auto path = conversation_path();
     path += L".assets";
@@ -56,7 +64,7 @@ std::string timestamp() {
     SYSTEMTIME t{};
     GetLocalTime(&t);
     char text[32]{};
-    sprintf_s(text, "%04u-%02u-%02uT%02u:%02u:%02u.%03u",
+    std::snprintf(text, sizeof(text), "%04u-%02u-%02uT%02u:%02u:%02u.%03u",
               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     return text;
 }
@@ -89,6 +97,44 @@ std::string json_quote(std::string_view text) {
     return out;
 }
 
+bool decode_json_string(std::string_view json, std::size_t& p, std::string& out, std::size_t limit = 0) {
+    if (p >= json.size() || json[p] != '"') return false;
+    ++p;
+    out.clear();
+    while (p < json.size()) {
+        const char c = json[p++];
+        if (c == '"') return true;
+        if (c != '\\') {
+            out.push_back(c);
+        } else {
+            if (p >= json.size()) return false;
+            const char e = json[p++];
+            switch (e) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'u':
+                    // App Server diagnostics are UTF-8 already; preserve escaped
+                    // unicode visibly rather than attempting surrogate handling here.
+                    out += "\\u";
+                    for (int i = 0; i < 4 && p < json.size(); ++i) out.push_back(json[p++]);
+                    break;
+                default: out.push_back(e); break;
+            }
+        }
+        if (limit && out.size() >= limit) {
+            out += "...";
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string scalar_string(std::string_view json, std::string_view key, std::size_t limit = 160) {
     const std::string needle = "\"" + std::string(key) + "\"";
     std::size_t p = json.find(needle);
@@ -97,32 +143,8 @@ std::string scalar_string(std::string_view json, std::string_view key, std::size
     if (p == std::string_view::npos) return {};
     ++p;
     while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
-    if (p >= json.size() || json[p] != '"') return {};
-    ++p;
     std::string out;
-    while (p < json.size()) {
-        const char c = json[p++];
-        if (c == '"') return out;
-        if (c == '\\') {
-            if (p >= json.size()) return {};
-            const char e = json[p++];
-            switch (e) {
-                case '"': out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case 'n': out.push_back(' '); break;
-                case 'r': break;
-                case 't': out.push_back(' '); break;
-                default: out.push_back('?'); break;
-            }
-        } else {
-            out.push_back(c);
-        }
-        if (limit && out.size() >= limit) {
-            out += "...";
-            return out;
-        }
-    }
-    return {};
+    return decode_json_string(json, p, out, limit) ? out : std::string{};
 }
 
 std::string scalar_number(std::string_view json, std::string_view key) {
@@ -137,6 +159,51 @@ std::string scalar_number(std::string_view json, std::string_view key) {
     if (p < json.size() && json[p] == '-') ++p;
     while (p < json.size() && json[p] >= '0' && json[p] <= '9') ++p;
     return p > start ? std::string(json.substr(start, p - start)) : std::string{};
+}
+
+std::string raw_json_value(std::string_view json, std::string_view key, std::size_t limit = 1024u * 1024u) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t p = json.find(needle);
+    if (p == std::string_view::npos) return {};
+    p = json.find(':', p + needle.size());
+    if (p == std::string_view::npos) return {};
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) ++p;
+    const std::size_t start = p;
+    if (p >= json.size()) return {};
+    if (json[p] == '"') {
+        std::string decoded;
+        if (!decode_json_string(json, p, decoded, limit)) return {};
+        return decoded;
+    }
+    if (json[p] == '{' || json[p] == '[') {
+        const char open = json[p];
+        const char close = open == '{' ? '}' : ']';
+        int depth = 0;
+        bool in_string = false;
+        bool escape = false;
+        for (; p < json.size(); ++p) {
+            const char c = json[p];
+            if (in_string) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"') { in_string = true; continue; }
+            if (c == open) ++depth;
+            else if (c == close && --depth == 0) {
+                ++p;
+                const auto length = std::min(limit, p - start);
+                std::string value(json.substr(start, length));
+                if (length < p - start) value += "...";
+                return value;
+            }
+        }
+        return {};
+    }
+    while (p < json.size() && json[p] != ',' && json[p] != '}' && json[p] != ']') ++p;
+    return std::string(json.substr(start, std::min(limit, p - start)));
 }
 
 int base64_value(unsigned char c) {
@@ -199,7 +266,7 @@ std::string materialize_data_images(std::string line) {
         std::filesystem::create_directories(directory, ec);
         const auto index = ++g_asset_index;
         char number[16]{};
-        sprintf_s(number, "%04llu", static_cast<unsigned long long>(index));
+        std::snprintf(number, sizeof(number), "%04llu", static_cast<unsigned long long>(index));
         const std::string filename = std::string(number) + extension_for_mime(mime);
         const auto file_path = directory / std::filesystem::path(filename);
         std::ofstream asset(file_path, std::ios::binary | std::ios::trunc);
@@ -242,13 +309,71 @@ void append_conversation_locked(std::string_view direction, std::string_view lin
          << ",\"event\":" << sanitized << "}\n";
 }
 
+void append_transcript_locked(std::string_view heading, std::string_view body) {
+    const auto path = transcript_path();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream file(path, std::ios::binary | std::ios::app);
+    if (!file) return;
+    file << "\n## " << timestamp() << " — " << heading << "\n\n";
+    if (!body.empty()) file << body << "\n";
+}
+
+void append_transcript_event_locked(std::string_view direction,
+                                    std::string_view line,
+                                    std::string_view method,
+                                    std::string_view id,
+                                    std::string_view type,
+                                    std::string_view tool) {
+    if (method == "item/completed" && type == "userMessage") {
+        const auto text = scalar_string(line, "text", 1024u * 1024u);
+        append_transcript_locked("USER", text.empty() ? raw_json_value(line, "item") : text);
+        return;
+    }
+    if (method == "item/completed" && type == "agentMessage") {
+        const auto text = scalar_string(line, "text", 1024u * 1024u);
+        append_transcript_locked("AGENT", text);
+        return;
+    }
+    if (method == "item/tool/call") {
+        const std::string tool_name = tool.empty() ? scalar_string(line, "tool", 256) : std::string(tool);
+        if (!id.empty()) g_tool_calls[std::string(id)] = tool_name;
+        auto arguments = raw_json_value(line, "arguments");
+        if (arguments.empty()) arguments = "{}";
+        append_transcript_locked("TOOL CALL — " + tool_name,
+                                 "```json\n" + arguments + "\n```");
+        return;
+    }
+    if (direction == "TX" && method.empty() && !id.empty()) {
+        const auto it = g_tool_calls.find(std::string(id));
+        if (it != g_tool_calls.end()) {
+            auto text = scalar_string(line, "text", 1024u * 1024u);
+            if (text.empty()) text = raw_json_value(line, "result");
+            append_transcript_locked("TOOL RESULT — " + it->second,
+                                     "```text\n" + text + "\n```");
+            return;
+        }
+    }
+    if (method == "item/completed" && type == "commandExecution") {
+        const auto status = scalar_string(line, "status", 128);
+        const auto command = scalar_string(line, "command", 1024u * 1024u);
+        append_transcript_locked("COMMAND EXECUTION" + (status.empty() ? std::string{} : " — " + status), command);
+        return;
+    }
+    if (method == "turn/completed") {
+        append_transcript_locked("TURN COMPLETED", scalar_string(line, "status", 128));
+    }
+}
+
 void reset_locked() {
     const auto path = trace_path();
     const auto conversation = conversation_path();
+    const auto transcript = transcript_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     rotate_file(path);
     rotate_file(conversation);
+    rotate_file(transcript);
 
     const auto assets = assets_path();
     auto previous_assets = assets;
@@ -267,8 +392,17 @@ void reset_locked() {
     std::filesystem::create_directories(assets, ec);
 
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (file) file << timestamp() << " session=start conversation=" << conversation.string() << "\n";
+    if (file) file << timestamp() << " session=start conversation=" << conversation.string()
+                   << " transcript=" << transcript.string() << "\n";
     std::ofstream conversation_file(conversation, std::ios::binary | std::ios::trunc);
+    std::ofstream transcript_file(transcript, std::ios::binary | std::ios::trunc);
+    if (transcript_file) {
+        transcript_file << "# PixelForge agent transcript\n\n"
+                        << "Raw App Server events: `" << conversation.string() << "`\n\n"
+                        << "This transcript preserves user/agent messages and tool activity for efficiency review. "
+                           "The raw JSONL remains authoritative when exact protocol details are needed.\n";
+    }
+    g_tool_calls.clear();
     g_asset_index = 0;
     g_session_started = true;
 }
@@ -280,8 +414,6 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     if (direction == "TX" && method == "initialize") reset_locked();
     if (!g_session_started) reset_locked();
 
-    // Save the complete App Server event first. Large inline images are written
-    // as binary assets and replaced by a small trace-asset marker in the JSONL.
     append_conversation_locked(direction, line);
 
     std::string entry(direction);
@@ -319,6 +451,7 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     }
 
     append_locked(entry);
+    append_transcript_event_locked(direction, line, method, id, type, tool);
 }
 
 void feed_locked(std::string& pending, std::string_view direction, const void* data, DWORD size) {

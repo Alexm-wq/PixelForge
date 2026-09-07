@@ -49,6 +49,7 @@ public:
 private:
     LocalToolResult call_art_tool(std::string_view tool, std::string_view arguments_json);
     LocalToolResult call_record_tool(std::string_view arguments_json);
+    LocalToolResult call_pack_tool(std::string_view arguments_json);
     bool write_line(std::string_view line);
     bool read_line(std::string& line);
 
