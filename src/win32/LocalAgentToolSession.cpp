@@ -297,7 +297,23 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (result.success && effective_tool == "pixelforge_task" && args.get("action") == "begin")
             has_observed_revision_ = false;
 
-        if (result.success && effective_tool == "pixelforge_edit" && scale && task_id && revision) {
+        bool revision_accept = false;
+        if (result.success && effective_tool == "pixelforge_task" && args.get("action") == "accept") {
+            std::lock_guard state_lock(*bindings_.state_mutex);
+            revision_accept = bindings_.task->snapshot().revision_guard_active;
+        }
+
+        if (revision_accept && task_id && revision) {
+            const auto view = call_art_tool("pixelforge_view", "{\"action\":\"render\",\"task_id\":" + std::to_string(*task_id) +
+                ",\"expected_revision\":" + std::to_string(*revision) + ",\"scale\":8,\"resend_image\":true}");
+            result.text = "{\"ok\":true,\"task_id\":" + std::to_string(*task_id) +
+                ",\"revision\":" + std::to_string(*revision) +
+                ",\"state\":\"accepted\",\"revision_context\":true,\"message\":\"This is the preserved artwork the user reviewed. Continue from this exact image; do not clear or rebuild it.\"}";
+            if (view.success) {
+                result.image_base64 = view.image_base64;
+                result.image_mime = view.image_mime;
+            }
+        } else if (result.success && effective_tool == "pixelforge_edit" && scale && task_id && revision) {
             const auto view = call_art_tool("pixelforge_view", "{\"action\":\"render\",\"task_id\":" + std::to_string(*task_id) +
                 ",\"expected_revision\":" + std::to_string(*revision) + ",\"scale\":" + std::to_string(*scale) + "}");
             FlatJsonObject view_fields;
