@@ -27,6 +27,7 @@ constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
 constexpr UINT_PTR RECORDING_FINALIZE_TIMER = 79;
 constexpr int ID_STOP_CODEX = 1020;
 constexpr int ID_INTELLIGENCE = 1021;
+constexpr int ID_MODEL = 1022;
 constexpr int ID_REVIEW_FEEDBACK = 1030;
 constexpr int ID_REVIEW_ACCEPT = 1031;
 constexpr int ID_REVIEW_CHANGES = 1032;
@@ -44,6 +45,7 @@ pixelforge::win32::LocalAgentToolSession g_local_tool_session;
 std::wstring g_repo_root;
 std::wstring g_executable_path;
 HWND g_codex_status = nullptr;
+HWND g_model = nullptr;
 HWND g_intelligence = nullptr;
 HWND g_review_window = nullptr;
 HWND g_review_feedback = nullptr;
@@ -52,6 +54,30 @@ std::wstring g_review_summary_text;
 
 void start_automatic_generation(HWND hwnd, std::string review_feedback = {});
 void show_user_review_window(HWND owner);
+
+std::string selected_model() {
+    if (!g_model) return "gpt-6-astra";
+    const LRESULT selection = SendMessageW(g_model, CB_GETCURSEL, 0, 0);
+    switch (selection) {
+        case 0: return "gpt-6-astra";
+        case 1: return "gpt-5.6-sol";
+        case 2: return "gpt-5.6-terra";
+        case 3: return "gpt-5.6-luna";
+        default: return "gpt-6-astra";
+    }
+}
+
+std::wstring selected_model_label() {
+    if (!g_model) return L"GPT-6 Astra";
+    const LRESULT selection = SendMessageW(g_model, CB_GETCURSEL, 0, 0);
+    switch (selection) {
+        case 0: return L"GPT-6 Astra";
+        case 1: return L"GPT-5.6 Sol";
+        case 2: return L"GPT-5.6 Terra";
+        case 3: return L"GPT-5.6 Luna";
+        default: return L"GPT-6 Astra";
+    }
+}
 
 std::string selected_reasoning_effort() {
     if (!g_intelligence) return "medium";
@@ -180,7 +206,7 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     switch (msg) {
         case WM_CREATE: {
             HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            HWND title = CreateWindowW(L"STATIC", L"Astra has finished this pass. Review the artwork, then accept it or request another pass.",
+            HWND title = CreateWindowW(L"STATIC", L"The selected model has finished this pass. Review the artwork, then accept it or request another pass.",
                                        WS_CHILD | WS_VISIBLE, 18, 16, 454, 38, hwnd, nullptr, nullptr, nullptr);
             if (title) SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
@@ -243,7 +269,7 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             if (id == ID_REVIEW_CHANGES) {
                 const std::wstring feedback_w = get_window_text(g_review_feedback);
                 if (feedback_w.find_first_not_of(L" \t\r\n") == std::wstring::npos) {
-                    show_error(hwnd, L"Enter the changes you want Astra to make.");
+                    show_error(hwnd, L"Enter the changes you want the model to make.");
                     return 0;
                 }
                 const std::string feedback = wide_to_utf8(feedback_w);
@@ -394,6 +420,8 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
         prompt += "\n\nUser review feedback:\n" + review_feedback +
                   "\n\nContinue editing the existing canvas. Preserve what already works and make the requested changes.";
     }
+    const std::string model = selected_model();
+    const std::wstring model_label = selected_model_label();
     const std::string reasoning_effort = selected_reasoning_effort();
     {
         std::lock_guard lock(g_state_mutex);
@@ -401,8 +429,8 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
     }
     InvalidateRect(hwnd, nullptr, FALSE);
     post_codex_status(hwnd, review_feedback.empty()
-        ? L"Codex: queued (" + utf8_to_wide(reasoning_effort) + L")..."
-        : L"Codex: revision pass queued (" + utf8_to_wide(reasoning_effort) + L")...");
+        ? L"Codex: queued (" + model_label + L" / " + utf8_to_wide(reasoning_effort) + L")..."
+        : L"Codex: revision pass queued (" + model_label + L" / " + utf8_to_wide(reasoning_effort) + L")...");
 
     pixelforge::win32::CodexGenerateRequest request;
     request.repo_root = g_repo_root;
@@ -410,6 +438,7 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
     request.prompt = prompt;
     request.agent_contract = read_utf8_file(std::filesystem::path(g_repo_root) / L"config" / L"agent_system_prompt.md");
     if (request.agent_contract.empty()) request.agent_contract = kFallbackAgentContract;
+    request.model = model;
     request.reasoning_effort = reasoning_effort;
     request.tool_session = &g_local_tool_session;
 
@@ -434,8 +463,8 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
                     : L"Codex error: " + message);
             } else if (snapshot.awaiting_user_review) {
                 post_codex_status(hwnd, g_session_recorder.active()
-                    ? L"Astra submitted this pass for your review. Demo recording is still running."
-                    : L"Astra submitted this pass for your review.");
+                    ? L"The model submitted this pass for your review. Demo recording is still running."
+                    : L"The model submitted this pass for your review.");
                 PostMessageW(hwnd, WM_SHOW_USER_REVIEW, 0, 0);
             } else if (snapshot.state == TaskState::Finished) {
                 post_codex_status(hwnd, L"Artwork complete.");
@@ -470,16 +499,31 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
                       252, 162, 72, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STOP_CODEX)), nullptr, nullptr);
         HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
-        HWND intelligence_label = CreateWindowW(L"STATIC", L"INTELLIGENCE", WS_CHILD | WS_VISIBLE,
-                                                12, 272, 96, 20, hwnd, nullptr, nullptr, nullptr);
-        if (intelligence_label) SendMessageW(intelligence_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        HWND model_label = CreateWindowW(L"STATIC", L"MODEL", WS_CHILD | WS_VISIBLE,
+                                         12, 272, 44, 20, hwnd, nullptr, nullptr, nullptr);
+        if (model_label) SendMessageW(model_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        g_model = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                               56, 268, 120, 160, hwnd,
+                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_MODEL)), nullptr, nullptr);
+        if (g_model) {
+            SendMessageW(g_model, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            for (const wchar_t* label : {L"GPT-6 Astra", L"GPT-5.6 Sol", L"GPT-5.6 Terra", L"GPT-5.6 Luna"})
+                SendMessageW(g_model, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+            SendMessageW(g_model, CB_SETDROPPEDWIDTH, 180, 0);
+            SendMessageW(g_model, CB_SETCURSEL, 0, 0);
+        }
+
+        HWND level_label = CreateWindowW(L"STATIC", L"LEVEL", WS_CHILD | WS_VISIBLE,
+                                         184, 272, 44, 20, hwnd, nullptr, nullptr, nullptr);
+        if (level_label) SendMessageW(level_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         g_intelligence = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      112, 268, 212, 160, hwnd,
+                                      228, 268, 96, 160, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_INTELLIGENCE)), nullptr, nullptr);
         if (g_intelligence) {
             SendMessageW(g_intelligence, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             for (const wchar_t* label : {L"Low", L"Medium", L"High", L"Extra High", L"Max"})
                 SendMessageW(g_intelligence, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+            SendMessageW(g_intelligence, CB_SETDROPPEDWIDTH, 120, 0);
             SendMessageW(g_intelligence, CB_SETCURSEL, 1, 0);
         }
 
