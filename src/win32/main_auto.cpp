@@ -458,9 +458,7 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
                 snapshot = g_app.task.snapshot();
             }
             if (!ok) {
-                post_codex_status(hwnd, g_session_recorder.active()
-                    ? L"Codex error: " + message + L" Recording remains active so you can continue the artwork."
-                    : L"Codex error: " + message);
+                finalize_terminal_recording(hwnd, L"Codex failed: " + message);
             } else if (snapshot.awaiting_user_review) {
                 post_codex_status(hwnd, g_session_recorder.active()
                     ? L"The model submitted this pass for your review. Demo recording is still running."
@@ -473,7 +471,7 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
             } else if (snapshot.state == TaskState::Aborted) {
                 finalize_terminal_recording(hwnd, L"Codex aborted task: " + utf8_to_wide(snapshot.status_message));
             } else {
-                post_codex_status(hwnd, L"Codex turn ended without submitting the artwork for review.");
+                finalize_terminal_recording(hwnd, L"Codex failed: turn ended without submitting the artwork for review.");
             }
             PostMessageW(hwnd, WM_AGENT_UPDATED, 0, 0);
         },
@@ -481,9 +479,7 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
 
     if (!started) {
         g_local_tool_session.stop();
-        post_codex_status(hwnd, g_session_recorder.active()
-            ? L"Codex could not start; demo recording remains active."
-            : L"Codex: idle.");
+        finalize_terminal_recording(hwnd, L"Codex could not start: " + error);
         show_error(hwnd, error);
     }
 }
@@ -540,7 +536,7 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     if (msg == WM_COMMAND && LOWORD(wparam) == ID_STOP_CODEX) {
         g_codex_client.cancel();
         post_codex_status(hwnd, g_session_recorder.active()
-            ? L"Codex: stopping; existing canvas and demo recording will be kept."
+            ? L"Codex: stopping; demo recording will finalize when the stopped turn reports failure."
             : L"Codex: stopping; existing canvas will be kept.");
         return 0;
     }
