@@ -46,8 +46,27 @@ public:
         if (pixels.size() != expected) return false;
 
         bool changed = false;
-        if (waiting_for_canvas_ || width_ != width || height_ != height || shown_.size() != expected) {
+        if (waiting_for_canvas_) {
             waiting_for_canvas_ = false;
+
+            // A review/continuation creates a new task id while keeping exactly
+            // the same authoritative document. Preserve the visible canvas in
+            // that case so only the continuation edits animate in.
+            const bool same_canvas = width_ == width && height_ == height &&
+                shown_.size() == expected && authoritative_.size() == expected &&
+                authoritative_ == pixels;
+            queue_.clear();
+            if (same_canvas) {
+                revision_ = revision;
+                return false;
+            }
+
+            width_ = width;
+            height_ = height;
+            shown_.assign(expected, 0x00000000u);
+            authoritative_.assign(expected, 0x00000000u);
+            changed = true;
+        } else if (width_ != width || height_ != height || shown_.size() != expected) {
             width_ = width;
             height_ = height;
             shown_.assign(expected, 0x00000000u);
