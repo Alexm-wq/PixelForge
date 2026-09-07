@@ -19,6 +19,7 @@ struct CodexGenerateRequest {
     std::wstring executable_path;
     std::string prompt;
     std::string agent_contract;
+    std::string model = "gpt-6-astra";
     std::string reasoning_effort = "medium";
     LocalAgentToolSession* tool_session = nullptr;
     // The no-progress watchdog remains useful, but productive generations must
