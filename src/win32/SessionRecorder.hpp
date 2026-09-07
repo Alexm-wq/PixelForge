@@ -12,8 +12,9 @@
 
 namespace pixelforge::win32 {
 
-// Local-only recorder for the visible PixelForge client area. Recorded frames are
-// never exposed through MCP; agents can only start/stop/query recording state.
+// Local-only recorder for the visible PixelForge top-level window. Frames are
+// captured from the desktop so owned UI such as the user-review popup is part
+// of the demo recording too. Recorded frames are never exposed through MCP.
 class SessionRecorder {
 public:
     SessionRecorder() = default;
