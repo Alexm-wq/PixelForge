@@ -19,6 +19,7 @@ struct CodexGenerateRequest {
     std::wstring executable_path;
     std::string prompt;
     std::string agent_contract;
+    std::string reasoning_effort = "medium";
     LocalAgentToolSession* tool_session = nullptr;
     // Deadlines measure useful tool progress, not incoming telemetry.
     std::uint64_t progress_timeout_ms = 120000;

@@ -23,6 +23,7 @@ namespace {
 constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
 constexpr int ID_STOP_CODEX = 1020;
+constexpr int ID_INTELLIGENCE = 1021;
 
 constexpr const char* kFallbackAgentContract =
     "You are a pixel artist using PixelForge's local drawing tools. "
@@ -37,6 +38,20 @@ pixelforge::win32::LocalAgentToolSession g_local_tool_session;
 std::wstring g_repo_root;
 std::wstring g_executable_path;
 HWND g_codex_status = nullptr;
+HWND g_intelligence = nullptr;
+
+std::string selected_reasoning_effort() {
+    if (!g_intelligence) return "medium";
+    const LRESULT selection = SendMessageW(g_intelligence, CB_GETCURSEL, 0, 0);
+    switch (selection) {
+        case 0: return "low";
+        case 1: return "medium";
+        case 2: return "high";
+        case 3: return "xhigh";
+        case 4: return "max";
+        default: return "medium";
+    }
+}
 
 std::wstring executable_path() {
     std::vector<wchar_t> buffer(32768, L'\0');
@@ -149,12 +164,13 @@ void start_automatic_generation(HWND hwnd) {
     }
 
     const std::string prompt = wide_to_utf8(prompt_w);
+    const std::string reasoning_effort = selected_reasoning_effort();
     {
         std::lock_guard lock(g_state_mutex);
         g_app.task.begin(prompt);
     }
     InvalidateRect(hwnd, nullptr, FALSE);
-    post_codex_status(hwnd, L"Codex: queued...");
+    post_codex_status(hwnd, L"Codex: queued (" + utf8_to_wide(reasoning_effort) + L")...");
 
     pixelforge::win32::CodexGenerateRequest request;
     request.repo_root = g_repo_root;
@@ -162,6 +178,7 @@ void start_automatic_generation(HWND hwnd) {
     request.prompt = prompt;
     request.agent_contract = read_utf8_file(std::filesystem::path(g_repo_root) / L"config" / L"agent_system_prompt.md");
     if (request.agent_contract.empty()) request.agent_contract = kFallbackAgentContract;
+    request.reasoning_effort = reasoning_effort;
     request.tool_session = &g_local_tool_session;
 
     std::wstring error;
@@ -213,6 +230,20 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                       252, 162, 72, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STOP_CODEX)), nullptr, nullptr);
         HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+        HWND intelligence_label = CreateWindowW(L"STATIC", L"INTELLIGENCE", WS_CHILD | WS_VISIBLE,
+                                                12, 272, 96, 20, hwnd, nullptr, nullptr, nullptr);
+        if (intelligence_label) SendMessageW(intelligence_label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        g_intelligence = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                      112, 268, 212, 160, hwnd,
+                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_INTELLIGENCE)), nullptr, nullptr);
+        if (g_intelligence) {
+            SendMessageW(g_intelligence, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            for (const wchar_t* label : {L"Low", L"Medium", L"High", L"Extra High", L"Max"})
+                SendMessageW(g_intelligence, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+            SendMessageW(g_intelligence, CB_SETCURSEL, 1, 0);
+        }
+
         g_codex_status = CreateWindowW(L"STATIC", L"Codex: idle.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       12, 600, 312, 120, hwnd, nullptr, nullptr, nullptr);
         if (g_codex_status) SendMessageW(g_codex_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);

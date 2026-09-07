@@ -476,12 +476,17 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
         return false;
     }
 
-    if (status) status(L"Codex: reading prompt and references...");
+    std::string effort = request.reasoning_effort;
+    if (effort != "low" && effort != "medium" && effort != "high" && effort != "xhigh" && effort != "max")
+        effort = "medium";
+    codex_trace_detail("turn reasoning_effort=" + effort);
+
+    if (status) status(L"Codex: reading prompt and references (" + utf8_to_wide(effort) + L")...");
     const std::string turn_text =
         "Create the requested artwork:\n\n" + request.prompt +
         "\n\nUse the supplied PixelForge tools and work autonomously.";
     const std::string turn_params = "{\"threadId\":" + json_quote(thread_id) +
-        ",\"effort\":\"medium\"" +
+        ",\"effort\":" + json_quote(effort) +
         ",\"input\":[{\"type\":\"text\",\"text\":" + json_quote(turn_text) + "}]}";
     std::string turn_result;
     if (!this->request("turn/start", turn_params, turn_result, error)) return false;
