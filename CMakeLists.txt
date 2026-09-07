@@ -23,12 +23,12 @@ if(WIN32)
         src/win32/CodexAppClientTraced.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/SessionRecorder.cpp
-        src/win32/RecordMcpServer.cpp
+        src/win32/RecordMcpServerRestricted.cpp
     )
     target_include_directories(PixelForge PRIVATE src/core src/win32)
     target_link_libraries(PixelForge PRIVATE
         pixelforge_core
-        user32 gdi32 comdlg32 ole32 windowscodecs shell32
+        user32 gdi32 comdlg32 ole32 windowscodecs shell32 advapi32
         mfplat mfreadwrite mfuuid
     )
     target_compile_definitions(PixelForge PRIVATE UNICODE _UNICODE NOMINMAX)
