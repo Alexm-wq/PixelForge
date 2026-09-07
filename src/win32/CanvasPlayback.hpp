@@ -123,11 +123,12 @@ private:
     };
 
     static std::uint32_t duration_for(std::size_t count) noexcept {
-        // Deliberately slow presentation: the agent usually spends several seconds
-        // planning its next pass, so use that idle time to visibly draw the current one.
-        // Large commits take about 8-12 seconds; even small commits remain clearly visible.
-        const double duration = 3500.0 + std::sqrt(static_cast<double>(count)) * 115.0;
-        return static_cast<std::uint32_t>(std::clamp(duration, 4500.0, 12000.0));
+        // Intentionally very slow presentation. Astra already owns the complete
+        // authoritative canvas immediately; this merely keeps the visible UI
+        // drawing while the agent plans its next pass.
+        // Small commits take at least 15 seconds and large passes up to 35 seconds.
+        const double duration = 12000.0 + std::sqrt(static_cast<double>(count)) * 300.0;
+        return static_cast<std::uint32_t>(std::clamp(duration, 15000.0, 35000.0));
     }
 
     bool enqueue_diff(const std::vector<std::uint32_t>& before,
