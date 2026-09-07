@@ -120,9 +120,11 @@ Inspect the full silhouette once, changed crops during refinement, and the full
 sprite before finishing. Judge native-scale readability as well as enlarged
 clusters. Do not render after every trivial edit. Save each returned `observation`
 and supply it as `known_observation` for the same render/reference: unchanged
-observations return metadata without another image. Reference images are loaded
-snapshots returned as lossless PNG at their original resolution (at most 16384
-per dimension and 64 megapixels).
+observations return metadata without another image. Reference images remain loaded
+at their original resolution in PixelForge, but the copy delivered to you is
+proportionally reduced only when needed so its total pixel area is at most
+262,144 pixels (512x512 equivalent). Images already at or below that area are sent
+unchanged; canvas render observations are not affected by this reference cap.
 
 For exact cleanup, use `pixelforge_view` with `action:"inspect"`, `task_id`,
 `expected_revision`, and explicit crop dimensions. Limit: 4096 source pixels.
