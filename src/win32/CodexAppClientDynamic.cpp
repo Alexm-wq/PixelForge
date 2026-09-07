@@ -476,16 +476,18 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
         return false;
     }
 
+    std::string model = request.model.empty() ? "gpt-6-astra" : request.model;
     std::string effort = request.reasoning_effort;
     if (effort != "low" && effort != "medium" && effort != "high" && effort != "xhigh" && effort != "max")
         effort = "medium";
-    codex_trace_detail("turn reasoning_effort=" + effort);
+    codex_trace_detail("turn model=" + model + " reasoning_effort=" + effort);
 
-    if (status) status(L"Codex: reading prompt and references (" + utf8_to_wide(effort) + L")...");
+    if (status) status(L"Codex: reading prompt and references (" + utf8_to_wide(model) + L" / " + utf8_to_wide(effort) + L")...");
     const std::string turn_text =
         "Create the requested artwork:\n\n" + request.prompt +
         "\n\nUse the supplied PixelForge tools and work autonomously.";
     const std::string turn_params = "{\"threadId\":" + json_quote(thread_id) +
+        ",\"model\":" + json_quote(model) +
         ",\"effort\":" + json_quote(effort) +
         ",\"input\":[{\"type\":\"text\",\"text\":" + json_quote(turn_text) + "}]}";
     std::string turn_result;
