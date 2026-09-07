@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace pixelforge {
 
@@ -30,6 +31,7 @@ struct AgentTaskSnapshot {
     std::string status_message;
     std::string review_summary;
     bool awaiting_user_review = false;
+    bool revision_guard_active = false;
     ReferenceSlot content_reference;
     ReferenceSlot style_reference;
     int canvas_width = 0;
@@ -59,23 +61,30 @@ public:
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
     [[nodiscard]] bool awaiting_user_review() const noexcept { return awaiting_user_review_; }
+    [[nodiscard]] bool revision_guard_active() const noexcept { return revision_guard_active_; }
+    [[nodiscard]] bool revision_candidate_allowed(const std::vector<std::uint32_t>& candidate,
+                                                  std::string* error = nullptr) const;
     [[nodiscard]] bool terminal() const noexcept {
         return state_ == TaskState::Rejected || state_ == TaskState::Aborted ||
                (state_ == TaskState::Finished && !awaiting_user_review_);
     }
 
 private:
+    void clear_revision_guard();
+
     PixelDocument* document_ = nullptr;
     std::uint64_t next_id_ = 1;
     std::uint64_t id_ = 0;
     TaskState state_ = TaskState::Idle;
     bool preserve_canvas_on_accept_ = false;
     bool awaiting_user_review_ = false;
+    bool revision_guard_active_ = false;
     std::string prompt_;
     std::string status_message_;
     std::string review_summary_;
     ReferenceSlot content_reference_;
     ReferenceSlot style_reference_;
+    std::vector<std::uint32_t> revision_baseline_;
 };
 
 const char* task_state_name(TaskState state) noexcept;
