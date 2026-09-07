@@ -1,5 +1,6 @@
 #include "AgentMcpServer.hpp"
 #include "AgentTask.hpp"
+#include "CanvasPlayback.hpp"
 #include "ImageIO.hpp"
 #include "PixelDocument.hpp"
 
@@ -34,6 +35,8 @@ constexpr int ID_SAVE = 1010;
 constexpr int ID_UNDO = 1011;
 constexpr int ID_REDO = 1012;
 constexpr UINT WM_AGENT_UPDATED = WM_APP + 1;
+constexpr UINT_PTR DISPLAY_ANIMATION_TIMER = 78;
+constexpr UINT DISPLAY_ANIMATION_INTERVAL_MS = 16;
 
 struct AppState {
     PixelDocument document;
@@ -42,6 +45,7 @@ struct AppState {
     ImageData style_reference;
     std::wstring content_path;
     std::wstring style_path;
+    pixelforge::win32::CanvasPlayback playback;
     std::uint32_t active_color = 0xff50c8c8u;
     bool drawing = false;
     RECT canvas_rect{};
@@ -52,6 +56,34 @@ std::mutex g_state_mutex;
 HWND g_prompt = nullptr;
 HWND g_width = nullptr;
 HWND g_height = nullptr;
+
+void reset_playback_to_document_locked() {
+    const auto snap = g_app.task.snapshot();
+    g_app.playback.reset_to_authoritative(
+        snap.id,
+        g_app.document.width(),
+        g_app.document.height(),
+        g_app.document.revision(),
+        g_app.document.pixels());
+}
+
+bool observe_playback_locked() {
+    const auto snap = g_app.task.snapshot();
+    const bool canvas_ready = snap.state == TaskState::Accepted || snap.state == TaskState::Finished;
+    return g_app.playback.observe_authoritative(
+        snap.id,
+        canvas_ready,
+        g_app.document.width(),
+        g_app.document.height(),
+        g_app.document.revision(),
+        g_app.document.pixels());
+}
+
+bool tick_playback_locked() {
+    bool changed = observe_playback_locked();
+    changed = g_app.playback.tick(GetTickCount64()) || changed;
+    return changed;
+}
 
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return {};
@@ -177,14 +209,17 @@ void draw_canvas(HDC dc, RECT area) {
     RECT canvas{usable.left + (uw - draw_w) / 2, usable.top + (uh - draw_h) / 2,
                 usable.left + (uw - draw_w) / 2 + draw_w, usable.top + (uh - draw_h) / 2 + draw_h};
     g_app.canvas_rect = canvas;
-    std::vector<std::uint32_t> preview(g_app.document.pixels().size());
+
+    const auto& display_pixels = g_app.playback.pixels_or(g_app.document.pixels(), width, height);
+    std::vector<std::uint32_t> preview(display_pixels.size());
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            const auto argb = g_app.document.pixel(x, y);
+            const auto index = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
+            const auto argb = display_pixels[index];
             const unsigned a = argb >> 24;
             const unsigned bg = ((x + y) & 1) ? 42 : 54;
             auto blend = [&](unsigned c, unsigned b) { return (c * a + b * (255 - a) + 127) / 255; };
-            preview[static_cast<std::size_t>(y) * width + x] =
+            preview[index] =
                 (blend((argb >> 16) & 255, bg) << 16) |
                 (blend((argb >> 8) & 255, bg + 4) << 8) | blend(argb & 255, bg + 7);
         }
@@ -217,6 +252,7 @@ void draw_canvas(HDC dc, RECT area) {
     const auto snap = g_app.task.snapshot();
     std::wstring info = std::to_wstring(width) + L"x" + std::to_wstring(height) +
                         L"   revision " + std::to_wstring(snap.document_revision);
+    if (g_app.playback.animating()) info += L"   drawing...";
     draw_text(dc, static_cast<int>(area.left) + 8, static_cast<int>(area.bottom) - 24, info, RGB(160, 168, 172));
 }
 
@@ -293,7 +329,7 @@ void paint_pixel(HWND hwnd, int mx, int my, bool erase) {
         if (!map_canvas_point_locked(mx, my, px, py)) return;
         auto tx = g_app.document.begin_transaction();
         tx.set_pixel(px, py, erase ? 0x00000000u : g_app.active_color);
-        tx.commit();
+        if (tx.commit()) reset_playback_to_document_locked();
     }
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -394,6 +430,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             button(L"Content ref", ID_CONTENT_REF, 12, 440, 96);
             button(L"Style ref", ID_STYLE_REF, 116, 440, 96);
             button(L"Save PNG", ID_SAVE, 220, 440, 96);
+            SetTimer(hwnd, DISPLAY_ANIMATION_TIMER, DISPLAY_ANIMATION_INTERVAL_MS, nullptr);
             return 0;
         }
         case WM_COMMAND: {
@@ -402,6 +439,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 {
                     std::lock_guard lock(g_state_mutex);
                     g_app.task.begin(wide_to_utf8(get_window_text(g_prompt)));
+                    g_app.playback.note_task(g_app.task.snapshot().id);
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (id == ID_ACCEPT) {
@@ -410,9 +448,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 std::string error;
                 {
                     std::lock_guard lock(g_state_mutex);
-                    if (!g_app.task.accept(width, height, &error)) {
-                        // Show after releasing the mutex.
-                    }
+                    if (g_app.task.accept(width, height, &error)) reset_playback_to_document_locked();
                 }
                 if (!error.empty()) show_error(hwnd, utf8_to_wide(error));
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -441,13 +477,13 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             } else if (id == ID_UNDO) {
                 {
                     std::lock_guard lock(g_state_mutex);
-                    g_app.document.undo();
+                    if (g_app.document.undo()) reset_playback_to_document_locked();
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (id == ID_REDO) {
                 {
                     std::lock_guard lock(g_state_mutex);
-                    g_app.document.redo();
+                    if (g_app.document.redo()) reset_playback_to_document_locked();
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -473,15 +509,32 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             g_app.drawing = false;
             ReleaseCapture();
             return 0;
-        case WM_AGENT_UPDATED:
+        case WM_AGENT_UPDATED: {
+            {
+                std::lock_guard lock(g_state_mutex);
+                observe_playback_locked();
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        }
+        case WM_TIMER:
+            if (wparam == DISPLAY_ANIMATION_TIMER) {
+                bool changed = false;
+                {
+                    std::lock_guard lock(g_state_mutex);
+                    changed = tick_playback_locked();
+                }
+                if (changed) InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
         case WM_PAINT:
             paint(hwnd);
             return 0;
         case WM_ERASEBKGND:
             return 1;
         case WM_DESTROY:
+            KillTimer(hwnd, DISPLAY_ANIMATION_TIMER);
             PostQuitMessage(0);
             return 0;
     }
