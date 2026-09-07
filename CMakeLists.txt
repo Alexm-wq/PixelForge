@@ -34,10 +34,10 @@ if(WIN32)
         mfplat mfreadwrite mfuuid
     )
     target_compile_definitions(PixelForge PRIVATE UNICODE _UNICODE NOMINMAX)
+    # The automatic host reads config/agent_system_prompt.md directly from the
+    # repository at generation time, so copying it beside the executable is
+    # redundant and can fail on Windows if a stale destination is locked.
     add_custom_command(TARGET PixelForge POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/config/agent_system_prompt.md"
-            "$<TARGET_FILE_DIR:PixelForge>/agent_system_prompt.md"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/codex.cmd"
             "$<TARGET_FILE_DIR:PixelForge>/codex.cmd")
