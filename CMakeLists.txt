@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(PixelForge VERSION 0.4.0 LANGUAGES CXX)
+project(PixelForge VERSION 0.4.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,7 +20,7 @@ if(WIN32)
         src/win32/AgentMcpServerFramed.cpp
         src/win32/ReferenceResponseLimiter.cpp
         src/win32/PipeBridge.cpp
-        src/win32/CodexAppClientDynamic.cpp
+        src/win32/CodexAppClientDynamicIsolated.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/LocalAgentToolSession.cpp
         src/win32/SessionRecorder.cpp
