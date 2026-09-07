@@ -7,10 +7,18 @@ namespace pixelforge {
 AgentTaskController::AgentTaskController(PixelDocument& document) : document_(&document) {}
 
 std::uint64_t AgentTaskController::begin(std::string prompt) {
+    // If a host-side interruption stopped Codex while the task was still accepted,
+    // the authoritative canvas is valuable work-in-progress. Treat the next begin
+    // as a continuation and preserve that canvas when the agent accepts again.
+    preserve_canvas_on_accept_ = state_ == TaskState::Accepted && document_ &&
+        document_->width() > 0 && document_->height() > 0;
+
     id_ = next_id_++;
     prompt_ = std::move(prompt);
     state_ = TaskState::AwaitingAgentDecision;
-    status_message_ = "Waiting for agent accept/reject decision.";
+    status_message_ = preserve_canvas_on_accept_
+        ? "Continuation pending: preserve the existing canvas and accept its current dimensions."
+        : "Waiting for agent accept/reject decision.";
     return id_;
 }
 
@@ -19,6 +27,23 @@ bool AgentTaskController::accept(int width, int height, std::string* error) {
         if (error) *error = "task.accept is only valid while awaiting the agent decision.";
         return false;
     }
+
+    if (preserve_canvas_on_accept_) {
+        if (!document_ || width != document_->width() || height != document_->height()) {
+            if (error) {
+                *error = "This is a continuation of an interrupted drawing. Accept the existing canvas size " +
+                    std::to_string(document_ ? document_->width() : 0) + "x" +
+                    std::to_string(document_ ? document_->height() : 0) +
+                    "; resizing would destroy the current artwork.";
+            }
+            return false;
+        }
+        preserve_canvas_on_accept_ = false;
+        state_ = TaskState::Accepted;
+        status_message_ = "Continuation accepted; existing canvas preserved.";
+        return true;
+    }
+
     std::string resize_error;
     if (!document_->can_resize(width, height, &resize_error)) {
         if (error) *error = resize_error;
@@ -42,6 +67,7 @@ bool AgentTaskController::reject(std::string reason, std::string* error) {
         if (error) *error = "task.reject requires a user-facing reason.";
         return false;
     }
+    preserve_canvas_on_accept_ = false;
     state_ = TaskState::Rejected;
     status_message_ = std::move(reason);
     return true;
@@ -56,6 +82,7 @@ bool AgentTaskController::abort(std::string reason, std::string* error) {
         if (error) *error = "task.abort requires a user-facing reason.";
         return false;
     }
+    preserve_canvas_on_accept_ = false;
     state_ = TaskState::Aborted;
     status_message_ = std::move(reason);
     return true;
@@ -66,6 +93,7 @@ bool AgentTaskController::finish(std::string summary, std::string* error) {
         if (error) *error = "task.finish requires an accepted task.";
         return false;
     }
+    preserve_canvas_on_accept_ = false;
     state_ = TaskState::Finished;
     status_message_ = summary.empty() ? "Task finished." : std::move(summary);
     return true;
