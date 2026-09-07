@@ -71,11 +71,10 @@ public:
         if (commit.start_ms == 0) commit.start_ms = now_ms;
 
         const std::uint64_t elapsed = now_ms >= commit.start_ms ? now_ms - commit.start_ms : 0;
-        const double linear = std::clamp(
+        const double progress = std::clamp(
             static_cast<double>(elapsed) / static_cast<double>(std::max<std::uint32_t>(1, commit.duration_ms)),
             0.0, 1.0);
-        const double eased = linear * linear * (3.0 - 2.0 * linear);
-        std::size_t target = static_cast<std::size_t>(eased * static_cast<double>(commit.changes.size()));
+        std::size_t target = static_cast<std::size_t>(progress * static_cast<double>(commit.changes.size()));
         if (elapsed > 0 && target == 0 && !commit.changes.empty()) target = 1;
         target = std::min(target, commit.changes.size());
 
@@ -86,7 +85,7 @@ public:
             changed = true;
         }
 
-        if (linear >= 1.0 || commit.revealed >= commit.changes.size()) {
+        if (progress >= 1.0 || commit.revealed >= commit.changes.size()) {
             while (commit.revealed < commit.changes.size()) {
                 const auto& pixel = commit.changes[commit.revealed++];
                 if (pixel.index < shown_.size()) shown_[pixel.index] = pixel.after;
@@ -123,21 +122,12 @@ private:
         std::size_t revealed = 0;
     };
 
-    static std::uint32_t mix32(std::uint32_t value) noexcept {
-        value ^= value >> 16;
-        value *= 0x7feb352du;
-        value ^= value >> 15;
-        value *= 0x846ca68bu;
-        value ^= value >> 16;
-        return value;
-    }
-
-    static std::uint32_t duration_for(std::size_t count, std::size_t backlog) noexcept {
-        double duration = 240.0 + std::sqrt(static_cast<double>(count)) * 44.0;
-        duration = std::clamp(duration, 300.0, 2200.0);
-        if (backlog >= 4) duration = std::min(duration, 450.0);
-        else if (backlog >= 2) duration = std::min(duration, 900.0);
-        return static_cast<std::uint32_t>(duration);
+    static std::uint32_t duration_for(std::size_t count) noexcept {
+        // Deliberately slow presentation: the agent usually spends several seconds
+        // planning its next pass, so use that idle time to visibly draw the current one.
+        // Large commits take about 8-12 seconds; even small commits remain clearly visible.
+        const double duration = 3500.0 + std::sqrt(static_cast<double>(count)) * 115.0;
+        return static_cast<std::uint32_t>(std::clamp(duration, 4500.0, 12000.0));
     }
 
     bool enqueue_diff(const std::vector<std::uint32_t>& before,
@@ -150,21 +140,19 @@ private:
         commit.changes.reserve(after.size() / 4 + 1);
         for (std::size_t i = 0; i < after.size(); ++i) {
             if (before[i] == after[i]) continue;
-            const int x = static_cast<int>(i % static_cast<std::size_t>(width));
-            const int y = static_cast<int>(i / static_cast<std::size_t>(width));
-            const std::uint32_t tile_x = static_cast<std::uint32_t>(x / 4);
-            const std::uint32_t tile_y = static_cast<std::uint32_t>(y / 4);
-            const std::uint32_t tile_seed = mix32(
-                tile_x * 0x9e3779b9u ^ tile_y * 0x85ebca6bu ^ static_cast<std::uint32_t>(revision));
-            const std::uint32_t local = static_cast<std::uint32_t>((y & 3) * 4 + (x & 3));
-            commit.changes.push_back({i, after[i], (static_cast<std::uint64_t>(tile_seed) << 8) | local});
+            const std::uint64_t x = i % static_cast<std::size_t>(width);
+            const std::uint64_t y = i / static_cast<std::size_t>(width);
+            // Strictly reveal from the left side of the canvas toward the right.
+            // Within a column, reveal from top to bottom for a stable drawing sweep.
+            const std::uint64_t order = (x << 32) | y;
+            commit.changes.push_back({i, after[i], order});
         }
         if (commit.changes.empty()) return false;
 
         std::sort(commit.changes.begin(), commit.changes.end(), [](const auto& a, const auto& b) {
             return a.order < b.order;
         });
-        commit.duration_ms = duration_for(commit.changes.size(), queue_.size());
+        commit.duration_ms = duration_for(commit.changes.size());
         queue_.push_back(std::move(commit));
         return true;
     }
