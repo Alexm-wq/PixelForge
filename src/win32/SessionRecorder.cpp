@@ -136,10 +136,15 @@ void SessionRecorder::capture_loop() {
         return;
     }
 
-    RECT client{};
-    GetClientRect(hwnd_, &client);
-    int width = static_cast<int>(client.right - client.left);
-    int height = static_cast<int>(client.bottom - client.top);
+    RECT window_rect{};
+    if (!GetWindowRect(hwnd_, &window_rect)) {
+        signal_init(false, L"Could not resolve the PixelForge window bounds for recording.");
+        MFShutdown();
+        if (SUCCEEDED(com)) CoUninitialize();
+        return;
+    }
+    int width = static_cast<int>(window_rect.right - window_rect.left);
+    int height = static_cast<int>(window_rect.bottom - window_rect.top);
     // H.264 encoders commonly require even dimensions.
     width &= ~1;
     height &= ~1;
@@ -189,7 +194,10 @@ void SessionRecorder::capture_loop() {
         return;
     }
 
-    HDC source_dc = GetDC(hwnd_);
+    // Capture from the desktop rather than the client DC. This records the full
+    // PixelForge chrome, prompt/input controls, and any owned review popup that
+    // is visually over the main window.
+    HDC source_dc = GetDC(nullptr);
     HDC memory_dc = source_dc ? CreateCompatibleDC(source_dc) : nullptr;
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -208,7 +216,7 @@ void SessionRecorder::capture_loop() {
         if (old_bitmap) SelectObject(memory_dc, old_bitmap);
         if (bitmap) DeleteObject(bitmap);
         if (memory_dc) DeleteDC(memory_dc);
-        if (source_dc) ReleaseDC(hwnd_, source_dc);
+        if (source_dc) ReleaseDC(nullptr, source_dc);
         writer->Finalize();
         signal_init(false, L"Could not allocate the PixelForge recording capture surface.");
         MFShutdown();
@@ -216,6 +224,7 @@ void SessionRecorder::capture_loop() {
         return;
     }
 
+    SetStretchBltMode(memory_dc, COLORONCOLOR);
     active_.store(true, std::memory_order_relaxed);
     signal_init(true);
 
@@ -226,7 +235,18 @@ void SessionRecorder::capture_loop() {
 
     while (!stop_requested_.load(std::memory_order_relaxed) && IsWindow(hwnd_)) {
         next_frame += std::chrono::milliseconds(1000 / fps_);
-        if (!BitBlt(memory_dc, 0, 0, width, height, source_dc, 0, 0, SRCCOPY | CAPTUREBLT)) {
+
+        RECT current{};
+        if (!GetWindowRect(hwnd_, &current)) {
+            std::lock_guard lock(state_mutex_);
+            last_error_ = L"PixelForge window bounds could not be read during recording.";
+            break;
+        }
+        const int source_width = std::max(1, static_cast<int>(current.right - current.left));
+        const int source_height = std::max(1, static_cast<int>(current.bottom - current.top));
+        if (!StretchBlt(memory_dc, 0, 0, width, height,
+                        source_dc, current.left, current.top, source_width, source_height,
+                        SRCCOPY | CAPTUREBLT)) {
             std::lock_guard lock(state_mutex_);
             last_error_ = L"PixelForge window capture failed.";
             break;
@@ -271,7 +291,7 @@ void SessionRecorder::capture_loop() {
     SelectObject(memory_dc, old_bitmap);
     DeleteObject(bitmap);
     DeleteDC(memory_dc);
-    ReleaseDC(hwnd_, source_dc);
+    ReleaseDC(nullptr, source_dc);
     active_.store(false, std::memory_order_relaxed);
     MFShutdown();
     if (SUCCEEDED(com)) CoUninitialize();
