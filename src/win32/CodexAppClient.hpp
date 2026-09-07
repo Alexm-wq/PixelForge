@@ -21,9 +21,10 @@ struct CodexGenerateRequest {
     std::string agent_contract;
     std::string reasoning_effort = "medium";
     LocalAgentToolSession* tool_session = nullptr;
-    // Deadlines measure useful tool progress, not incoming telemetry.
+    // The no-progress watchdog remains useful, but productive generations must
+    // never be stopped by an arbitrary wall-clock budget.
     std::uint64_t progress_timeout_ms = 120000;
-    std::uint64_t total_timeout_ms = 600000;
+    std::uint64_t total_timeout_ms = 0x3fffffffffffffffull;
 };
 
 class CodexAppClient {
