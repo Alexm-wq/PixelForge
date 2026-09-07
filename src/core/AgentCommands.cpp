@@ -203,6 +203,16 @@ AgentCommandResult AgentCommandRouter::edit(std::uint64_t task_id,
         return result(false, AgentErrorCode::EditRejected, "Edit transaction could not be committed.");
     }
 
+    std::string guard_error;
+    if (!task_->revision_candidate_allowed(document_->pixels(), &guard_error)) {
+        if (!document_->undo()) {
+            return result(false, AgentErrorCode::EditRejected,
+                          "Revision guard rejected a destructive edit, but rollback failed. Stop and inspect the canvas before continuing.");
+        }
+        return result(false, AgentErrorCode::EditRejected,
+                      guard_error + " The edit was rolled back automatically. Render the current canvas before retrying with targeted changes.");
+    }
+
     auto out = result(true, AgentErrorCode::None, "Edit transaction committed.");
     out.changed_pixels = pending;
     return out;
