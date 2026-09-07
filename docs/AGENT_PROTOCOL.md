@@ -23,6 +23,26 @@ No global PixelForge MCP configuration is required for this automatic path.
 
 Each Generate operation uses a fresh ephemeral Codex thread with the PixelForge agent contract injected as developer instructions. The automatic art turn uses a read-only filesystem sandbox and no approvals; artwork therefore goes through PixelForge tools rather than repository/source writes. The task-scoped App Server is terminated after the turn to release bridge and observation context.
 
+PixelForge does not currently pin a Codex model in `thread/start`; the installed Codex CLI/config chooses its default. The compact per-run trace records `model=...` whenever App Server reports the selected model.
+
+## Automatic-run diagnostics
+
+Each Generate run truncates and rewrites:
+
+```text
+build/pixelforge-codex-session.log
+```
+
+This compact trace records App Server RPC/notification method names, request IDs, item/tool metadata, turn status, reported model, and compact failure messages. It deliberately does not record raw prompts, pixel patches, image/base64 data, reference bytes, agent prose, or recording video.
+
+Codex App Server stderr remains separate in:
+
+```text
+build/pixelforge-codex-app-server.log
+```
+
+Use the session trace for a turn that consumed usage but ended without `task.finish`; use stderr for process/config/auth/crash diagnostics.
+
 ## Manual MCP path
 
 For development/debugging, PixelForge can still be launched by any stdio MCP client as:
@@ -41,8 +61,9 @@ Agent efficiency is optimized without reducing artwork fidelity:
 - edits are exact deterministic pixel operations;
 - palette indices compress the wire format only;
 - any color can always be supplied as exact `#AARRGGBB`;
-- renders are lossless PNG with nearest-neighbor integer scaling;
-- content/style references are optional and returned at original loaded resolution;
+- canvas renders are lossless PNG with nearest-neighbor integer scaling;
+- content/style references are optional and remain full resolution inside PixelForge;
+- the reference copy sent to Codex is proportionally reduced only when total pixel area exceeds 262,144 pixels (512x512 equivalent);
 - unchanged observations are addressed by IDs and do not need retransmission;
 - recording video is never part of an agent observation.
 
@@ -82,7 +103,7 @@ Actions: `render`, `content_reference`, `style_reference`, `inspect`.
 
 `render` accepts a canvas crop and integer scale. Render cache keys include task ID, revision, crop, scale and pixel content. The returned observation ID can be passed back as `known_observation`; unchanged images then return metadata only.
 
-Reference actions return the loaded reference snapshot as lossless PNG at original resolution. References are optional. `inspect` returns row-major run-length encoded exact pixels and is capped at 4096 pixels.
+Reference actions observe the original loaded snapshot but the transport-delivered PNG is capped by total area, not side length: images with `width * height <= 262144` are sent unchanged; larger images are proportionally reduced until the delivered area is at most 262,144 pixels. Thus `1024x256` is unchanged, while `2048x256` is reduced. Canvas renders are not subject to this reference cap. References are optional. `inspect` returns row-major run-length encoded exact pixels and is capped at 4096 pixels.
 
 ### `pixelforge_palette`
 
