@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -15,6 +16,7 @@ std::mutex g_trace_mutex;
 std::string g_tx_buffer;
 std::string g_rx_buffer;
 bool g_session_started = false;
+std::uint64_t g_asset_index = 0;
 
 std::filesystem::path find_repo_root() {
     std::vector<wchar_t> buffer(32768, L'\0');
@@ -38,15 +40,56 @@ std::filesystem::path trace_path() {
     return std::filesystem::temp_directory_path() / L"pixelforge-codex-session.log";
 }
 
+std::filesystem::path conversation_path() {
+    auto path = trace_path();
+    path += L".conversation.jsonl";
+    return path;
+}
+
+std::filesystem::path assets_path() {
+    auto path = conversation_path();
+    path += L".assets";
+    return path;
+}
+
 std::string timestamp() {
     SYSTEMTIME t{};
     GetLocalTime(&t);
     char text[32]{};
-    sprintf_s(text, "%02u:%02u:%02u.%03u", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    sprintf_s(text, "%04u-%02u-%02uT%02u:%02u:%02u.%03u",
+              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     return text;
 }
 
-std::string scalar_string(std::string_view json, std::string_view key) {
+std::string json_quote(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 16);
+    out.push_back('"');
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out += "\\u00";
+                    out.push_back(hex[(c >> 4) & 0xf]);
+                    out.push_back(hex[c & 0xf]);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string scalar_string(std::string_view json, std::string_view key, std::size_t limit = 160) {
     const std::string needle = "\"" + std::string(key) + "\"";
     std::size_t p = json.find(needle);
     if (p == std::string_view::npos) return {};
@@ -74,7 +117,7 @@ std::string scalar_string(std::string_view json, std::string_view key) {
         } else {
             out.push_back(c);
         }
-        if (out.size() >= 160) {
+        if (limit && out.size() >= limit) {
             out += "...";
             return out;
         }
@@ -96,6 +139,89 @@ std::string scalar_number(std::string_view json, std::string_view key) {
     return p > start ? std::string(json.substr(start, p - start)) : std::string{};
 }
 
+int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+bool base64_decode(std::string_view text, std::vector<std::uint8_t>& out) {
+    out.clear();
+    out.reserve((text.size() / 4) * 3);
+    std::uint32_t value = 0;
+    int bits = -8;
+    for (unsigned char c : text) {
+        if (c == '=') break;
+        const int v = base64_value(c);
+        if (v < 0) return false;
+        value = (value << 6) | static_cast<std::uint32_t>(v);
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<std::uint8_t>((value >> bits) & 0xffu));
+            bits -= 8;
+        }
+    }
+    return true;
+}
+
+std::string extension_for_mime(std::string_view mime) {
+    if (mime == "image/png") return ".png";
+    if (mime == "image/jpeg" || mime == "image/jpg") return ".jpg";
+    if (mime == "image/webp") return ".webp";
+    if (mime == "image/gif") return ".gif";
+    return ".bin";
+}
+
+std::string materialize_data_images(std::string line) {
+    std::size_t search_from = 0;
+    for (;;) {
+        const auto uri = line.find("data:image/", search_from);
+        if (uri == std::string::npos) break;
+        const auto marker = line.find(";base64,", uri);
+        if (marker == std::string::npos) break;
+        const auto end = line.find('"', marker + 8);
+        if (end == std::string::npos) break;
+
+        const std::string mime = line.substr(uri + 5, marker - (uri + 5));
+        const std::size_t data_start = marker + 8;
+        const std::string_view encoded(line.data() + data_start, end - data_start);
+        std::vector<std::uint8_t> bytes;
+        if (!base64_decode(encoded, bytes)) {
+            search_from = end + 1;
+            continue;
+        }
+
+        std::error_code ec;
+        const auto directory = assets_path();
+        std::filesystem::create_directories(directory, ec);
+        const auto index = ++g_asset_index;
+        char number[16]{};
+        sprintf_s(number, "%04llu", static_cast<unsigned long long>(index));
+        const std::string filename = std::string(number) + extension_for_mime(mime);
+        const auto file_path = directory / std::filesystem::path(filename);
+        std::ofstream asset(file_path, std::ios::binary | std::ios::trunc);
+        if (asset && !bytes.empty())
+            asset.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+
+        const std::string replacement = "trace-asset:" + filename + ";mime=" + mime +
+            ";bytes=" + std::to_string(bytes.size()) + ";base64_chars=" + std::to_string(encoded.size());
+        line.replace(uri, end - uri, replacement);
+        search_from = uri + replacement.size();
+    }
+    return line;
+}
+
+void rotate_file(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return;
+    auto previous = path;
+    previous += L".previous";
+    std::filesystem::copy_file(path, previous, std::filesystem::copy_options::overwrite_existing, ec);
+}
+
 void append_locked(std::string_view text) {
     const auto path = trace_path();
     std::error_code ec;
@@ -104,16 +230,46 @@ void append_locked(std::string_view text) {
     if (file) file << timestamp() << " " << text << "\n";
 }
 
-void reset_locked() {
-    const auto path = trace_path();
+void append_conversation_locked(std::string_view direction, std::string_view line) {
+    const auto path = conversation_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    if (std::filesystem::exists(path, ec)) {
-        auto previous = path; previous += L".previous";
-        std::filesystem::copy_file(path, previous, std::filesystem::copy_options::overwrite_existing, ec);
+    std::ofstream file(path, std::ios::binary | std::ios::app);
+    if (!file) return;
+    const std::string sanitized = materialize_data_images(std::string(line));
+    file << "{\"trace_timestamp\":" << json_quote(timestamp())
+         << ",\"direction\":" << json_quote(direction)
+         << ",\"event\":" << sanitized << "}\n";
+}
+
+void reset_locked() {
+    const auto path = trace_path();
+    const auto conversation = conversation_path();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    rotate_file(path);
+    rotate_file(conversation);
+
+    const auto assets = assets_path();
+    auto previous_assets = assets;
+    previous_assets += L".previous";
+    std::filesystem::remove_all(previous_assets, ec);
+    ec.clear();
+    if (std::filesystem::exists(assets, ec)) {
+        ec.clear();
+        std::filesystem::rename(assets, previous_assets, ec);
+        if (ec) {
+            ec.clear();
+            std::filesystem::remove_all(assets, ec);
+        }
     }
+    ec.clear();
+    std::filesystem::create_directories(assets, ec);
+
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (file) file << timestamp() << " session=start\n";
+    if (file) file << timestamp() << " session=start conversation=" << conversation.string() << "\n";
+    std::ofstream conversation_file(conversation, std::ios::binary | std::ios::trunc);
+    g_asset_index = 0;
     g_session_started = true;
 }
 
@@ -121,10 +277,12 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     const std::string method = scalar_string(line, "method");
     const std::string id = scalar_number(line, "id");
 
-    // The first initialize request uniquely marks a new Generate run. Truncate
-    // here so old sessions never contaminate diagnostics.
     if (direction == "TX" && method == "initialize") reset_locked();
     if (!g_session_started) reset_locked();
+
+    // Save the complete App Server event first. Large inline images are written
+    // as binary assets and replaced by a small trace-asset marker in the JSONL.
+    append_conversation_locked(direction, line);
 
     std::string entry(direction);
     if (!method.empty()) entry += " method=" + method;
@@ -132,7 +290,6 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
     else entry += " event";
     if (!id.empty()) entry += " id=" + id;
 
-    // Transport summary; semantic tool results are logged by the dispatcher.
     const auto type = scalar_string(line, "type");
     const auto server = scalar_string(line, "server");
     const auto tool = scalar_string(line, "tool");
@@ -154,12 +311,10 @@ void trace_line_locked(std::string_view direction, std::string_view line) {
         }
     }
     if (method == "item/completed" && type == "agentMessage")
-        entry += " text=" + scalar_string(line, "text");
+        entry += " text=" + scalar_string(line, "text", 1024);
 
-    // Error text is useful diagnostically, but ordinary agent/user text is not
-    // logged. Restrict message capture to explicit errors/failures.
     if (method == "error" || status == "failed" || line.find("\"error\"") != std::string_view::npos) {
-        const auto message = scalar_string(line, "message");
+        const auto message = scalar_string(line, "message", 1024);
         if (!message.empty()) entry += " message=" + message;
     }
 
@@ -177,7 +332,7 @@ void feed_locked(std::string& pending, std::string_view direction, const void* d
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (!line.empty()) trace_line_locked(direction, line);
     }
-    if (pending.size() > 1024u * 1024u) pending.clear();
+    if (pending.size() > 64u * 1024u * 1024u) pending.clear();
 }
 
 } // namespace
