@@ -1,6 +1,17 @@
 #include "CodexSessionTrace.hpp"
+#include "CodexAppClient.hpp"
 
 #include <windows.h>
+
+#include <algorithm>
+#include <charconv>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -29,6 +40,9 @@ BOOL WINAPI pixelforge_codex_write_file(HANDLE file,
 
 } // namespace
 
+// All headers used by CodexAppClient.cpp are included above. The macros below
+// therefore intercept only its runtime pipe calls rather than leaking into STL
+// or Windows header declarations.
 #define ReadFile pixelforge_codex_read_file
 #define WriteFile pixelforge_codex_write_file
 #include "CodexAppClient.cpp"
