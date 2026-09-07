@@ -419,7 +419,6 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
         return false;
     }
     CloseHandle(pi.hThread);
-    // Closing the session must stop launcher grandchildren too (cmd -> codex).
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -468,17 +467,19 @@ bool CodexAppClient::run_generation(const CodexGenerateRequest& request,
     if (!developer.empty()) developer += "\n\n";
     developer +=
         "PixelForge automatic-generation host rules:\n"
-        "- PixelForge tools are supplied directly by the host as dynamic tools. Use pixelforge_task/edit/view/palette/history/io and pixelforge_record only.\n"
+        "- PixelForge tools are supplied directly by the host as dynamic tools. Use pixelforge_task/program/edit/view/palette/history/io and pixelforge_record only.\n"
         "- Do not use shell, browser, computer-use, apps, plugins, or unrelated tools for this task.\n"
         "- First call pixelforge_task with action=get. Inspect only references that are present.\n"
+        "- Content/style references are one-shot observations. After a successful content_reference or style_reference call, the returned image remains in your turn context and must be reused from there.\n"
+        "- Never call content_reference or style_reference more than once for the same unchanged reference in a task. Do not refresh or reconfirm a reference. Only call it again if the host explicitly reports that the underlying reference changed.\n"
+        "- A duplicate reference call still wastes a full model/tool turn even when PixelForge suppresses duplicate image bytes, so avoiding the call itself is mandatory.\n"
         "- You choose the canvas size through pixelforge_task accept.\n"
         "- Wait for accept to return before constructing the first edit. Never batch accept and edit in the same parallel tool group; the new revision is not known yet.\n"
+        "- Prefer pixelforge_program for broad drawing passes; use pixelforge_edit for small exact cleanup.\n"
         "- Omit expected_revision on automatic tools to reuse your last observed revision safely. Never predict a revision. Manual changes still cause stale_revision.\n"
-        "- To inspect after editing, add render_scale to pixelforge_edit instead of issuing a separate dependent render. Rejected edits are never rendered.\n"
+        "- To inspect after editing, add render_scale to pixelforge_program or pixelforge_edit instead of issuing a separate dependent render. Rejected edits are never rendered.\n"
         "- After edit_rejected, fix the named operation and resend; no pixels or revision changed. Do not render the rejected batch.\n"
-        "- After accept and an optional palette call, immediately draw a small silhouette batch (10-50 operations). Do not plan the entire image before drawing.\n"
-        "- Refine in batches of roughly 50-200 operations, with visual checks. The 20,000 operation limit is a maximum, not a target.\n"
-        "- Commit visible progress frequently. The host stops runs after 120 seconds without drawing progress; messages and repeated observations do not extend this.\n"
+        "- Commit visible progress in meaningful passes. The host stops runs after 120 seconds without drawing progress; successful pixelforge_program and pixelforge_edit mutations both count as progress.\n"
         "- If recording was explicitly requested, start pixelforge_record before the first canvas mutation and stop it after final inspection.\n"
         "- Do not ask follow-up questions. Reject incompatible media, abort only hard technical blockers, and finish only after final inspection.";
 
@@ -638,7 +639,6 @@ bool CodexAppClient::write_line(std::string_view line) {
     }
     if (!input) return false;
     std::string framed(line);
-    // Trace exactly the JSONL sent on the wire, not multiline schema source.
     framed.erase(std::remove_if(framed.begin(), framed.end(), [](char c) { return c == '\r' || c == '\n'; }), framed.end());
     framed.push_back('\n');
     codex_trace_tx_bytes(framed.data(), static_cast<DWORD>(framed.size()));
@@ -686,7 +686,8 @@ void CodexAppClient::handle_server_request(std::string_view line) {
         consecutive_tool_errors_ = output.success ? 0 : consecutive_tool_errors_ + 1;
         if (consecutive_tool_errors_ >= 3) failure_reason_ = L"Stopped after three consecutive tool failures. See the session log for exact errors.";
         FlatJsonObject result_fields; std::string parse_error;
-        if (output.success && tool == "pixelforge_edit" && parse_flat_json_object(output.text, result_fields, parse_error) &&
+        const bool drawing_tool = tool == "pixelforge_edit" || tool == "pixelforge_program";
+        if (output.success && drawing_tool && parse_flat_json_object(output.text, result_fields, parse_error) &&
             result_fields.get_i64("changed_pixels").value_or(0) > 0) {
             received_edit_ = true;
             progress_deadline_ = GetTickCount64() + progress_timeout_ms_;

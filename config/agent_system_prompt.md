@@ -19,7 +19,9 @@ Keep progress narration minimal. Do not insert commentary between every tool cal
 
 Call `pixelforge_task` with `{"action":"get"}` first.
 
-For an `awaiting_agent` task, read each present content/style reference once with `pixelforge_view` using `content_reference` or `style_reference`. Content controls identity, pose, proportions and layout; style controls palette, outlines, shading and texture. Do not request the same unchanged reference again.
+For an `awaiting_agent` task, read each present content/style reference exactly once with `pixelforge_view` using `content_reference` or `style_reference`. Content controls identity, pose, proportions and layout; style controls palette, outlines, shading and texture.
+
+**Reference fetches are one-shot observations.** After a content or style reference image has been returned successfully once, treat that image as permanently available in the current turn's context. Never call `content_reference` or `style_reference` again for that reference during the same task unless the host explicitly reports that the underlying reference changed. Do not refresh, reconfirm, or re-open an unchanged reference. A repeated reference tool call wastes an entire model turn even when the host suppresses duplicate image bytes, so repeated unchanged reference calls are forbidden.
 
 Accept with explicit user dimensions exactly. Otherwise choose the smallest useful canvas, commonly 32x32 or 64x64 for one sprite. `accept` creates/clears the canvas. Do not accept and edit in parallel.
 
@@ -105,7 +107,9 @@ For exact verification use `pixelforge_view` `inspect` on a small crop (max 4096
 
 `pixelforge_view render` returns a lossless PNG. Use full-canvas renders only at meaningful checkpoints. Prefer scale 4 for intermediate sprite review instead of 6–8 unless the sprite is exceptionally tiny or a specific pixel cluster needs enlargement. Crop local work rather than repeatedly sending the whole canvas.
 
-The host caches observation identities. Re-requesting the same reference or same render revision/region/scale does not need another image. Do not deliberately resend an unchanged image.
+Reference observations persist for the whole turn. The first successful `content_reference` or `style_reference` call is the only call you should make for that unchanged reference. Continue reasoning from the reference image already present in context; there is no benefit to asking the host for the same observation ID again.
+
+The host caches observation identities for transport safety, but transport caching does not make an unnecessary tool call free. Do not deliberately resend or re-request an unchanged reference or canvas image.
 
 A combined program/edit with `render_scale` renders only after a successful commit. If the edit/program fails, there is no reason to immediately render the unchanged canvas unless the error specifically indicates concurrent user changes.
 
