@@ -24,6 +24,13 @@ constexpr UINT WM_CODEX_STATUS = WM_APP + 20;
 constexpr UINT_PTR CODEX_REFRESH_TIMER = 77;
 constexpr int ID_STOP_CODEX = 1020;
 
+constexpr const char* kFallbackAgentContract =
+    "You are a pixel artist using PixelForge's local drawing tools. "
+    "Study supplied references visually, create the requested artwork directly at native pixel resolution, "
+    "use your visual judgment, render and inspect your work, make targeted corrections, and export the native PNG. "
+    "Use pixelforge_program for broad drawing and pixelforge_edit for precise corrections. "
+    "Fetch each reference once and reuse it from context. Do not use external image generation or mouse automation.";
+
 pixelforge::win32::CodexAppClient g_codex_client;
 pixelforge::win32::SessionRecorder g_session_recorder;
 pixelforge::win32::LocalAgentToolSession g_local_tool_session;
@@ -38,13 +45,23 @@ std::wstring executable_path() {
     return std::wstring(buffer.data(), count);
 }
 
+std::wstring environment_value(std::wstring_view name) {
+    const DWORD needed = GetEnvironmentVariableW(std::wstring(name).c_str(), nullptr, 0);
+    if (!needed) return {};
+    std::wstring out(needed, L'\0');
+    const DWORD written = GetEnvironmentVariableW(std::wstring(name).c_str(), out.data(), needed);
+    if (!written || written >= out.size()) return {};
+    out.resize(written);
+    return out;
+}
+
 std::wstring find_repo_root_from(std::filesystem::path current) {
     for (int depth = 0; depth < 12 && !current.empty(); ++depth) {
         std::error_code ec;
         const bool has_cmake = std::filesystem::exists(current / L"CMakeLists.txt", ec);
         ec.clear();
-        const bool has_config = std::filesystem::exists(current / L"config" / L"agent_system_prompt.md", ec);
-        if (has_cmake && has_config) return current.wstring();
+        const bool has_source = std::filesystem::exists(current / L"src" / L"win32" / L"main_auto.cpp", ec);
+        if (has_cmake && has_source) return current.wstring();
         const auto parent = current.parent_path();
         if (parent == current) break;
         current = parent;
@@ -53,6 +70,9 @@ std::wstring find_repo_root_from(std::filesystem::path current) {
 }
 
 std::wstring find_repo_root(const std::wstring& exe) {
+    if (auto configured = environment_value(L"PIXELFORGE_REPO_ROOT"); !configured.empty()) {
+        if (auto root = find_repo_root_from(configured); !root.empty()) return root;
+    }
     if (!exe.empty()) {
         if (auto root = find_repo_root_from(std::filesystem::path(exe).parent_path()); !root.empty())
             return root;
@@ -117,7 +137,7 @@ void start_automatic_generation(HWND hwnd) {
         return;
     }
     if (g_repo_root.empty()) {
-        show_error(hwnd, L"PixelForge could not resolve its repository root. Run the executable from inside the PixelForge checkout or build directory.");
+        show_error(hwnd, L"PixelForge could not resolve its repository root. Expected a checkout containing CMakeLists.txt and src\\win32\\main_auto.cpp. You can override it with PIXELFORGE_REPO_ROOT.");
         return;
     }
 
@@ -141,6 +161,7 @@ void start_automatic_generation(HWND hwnd) {
     request.executable_path = g_executable_path.empty() ? g_repo_root : g_executable_path;
     request.prompt = prompt;
     request.agent_contract = read_utf8_file(std::filesystem::path(g_repo_root) / L"config" / L"agent_system_prompt.md");
+    if (request.agent_contract.empty()) request.agent_contract = kFallbackAgentContract;
     request.tool_session = &g_local_tool_session;
 
     std::wstring error;
