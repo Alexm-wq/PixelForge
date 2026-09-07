@@ -28,6 +28,8 @@ struct AgentTaskSnapshot {
     TaskState state = TaskState::Idle;
     std::string prompt;
     std::string status_message;
+    std::string review_summary;
+    bool awaiting_user_review = false;
     ReferenceSlot content_reference;
     ReferenceSlot style_reference;
     int canvas_width = 0;
@@ -44,15 +46,22 @@ public:
     bool accept(int width, int height, std::string* error = nullptr);
     bool reject(std::string reason, std::string* error = nullptr);
     bool abort(std::string reason, std::string* error = nullptr);
+
+    // Agent-side finish is a submission for user review. Only user_accept_review
+    // makes the submitted artwork final from PixelForge's point of view.
     bool finish(std::string summary, std::string* error = nullptr);
+    bool user_accept_review(std::string* error = nullptr);
+    bool user_request_changes(std::string feedback, std::string* error = nullptr);
 
     void set_content_reference(ReferenceSlot reference);
     void set_style_reference(ReferenceSlot reference);
 
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
+    [[nodiscard]] bool awaiting_user_review() const noexcept { return awaiting_user_review_; }
     [[nodiscard]] bool terminal() const noexcept {
-        return state_ == TaskState::Rejected || state_ == TaskState::Aborted || state_ == TaskState::Finished;
+        return state_ == TaskState::Rejected || state_ == TaskState::Aborted ||
+               (state_ == TaskState::Finished && !awaiting_user_review_);
     }
 
 private:
@@ -61,8 +70,10 @@ private:
     std::uint64_t id_ = 0;
     TaskState state_ = TaskState::Idle;
     bool preserve_canvas_on_accept_ = false;
+    bool awaiting_user_review_ = false;
     std::string prompt_;
     std::string status_message_;
+    std::string review_summary_;
     ReferenceSlot content_reference_;
     ReferenceSlot style_reference_;
 };
