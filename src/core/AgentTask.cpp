@@ -4,7 +4,20 @@
 
 namespace pixelforge {
 
+namespace {
+
+bool alpha_nonzero(std::uint32_t argb) {
+    return (argb >> 24) != 0;
+}
+
+} // namespace
+
 AgentTaskController::AgentTaskController(PixelDocument& document) : document_(&document) {}
+
+void AgentTaskController::clear_revision_guard() {
+    revision_guard_active_ = false;
+    revision_baseline_.clear();
+}
 
 std::uint64_t AgentTaskController::begin(std::string prompt) {
     // If Codex is continuing an interrupted or user-revised drawing, preserve
@@ -20,6 +33,7 @@ std::uint64_t AgentTaskController::begin(std::string prompt) {
     status_message_ = preserve_canvas_on_accept_
         ? "Continuation pending: preserve the existing canvas and accept its current dimensions."
         : "Waiting for agent accept/reject decision.";
+    if (!preserve_canvas_on_accept_) clear_revision_guard();
     return id_;
 }
 
@@ -41,7 +55,9 @@ bool AgentTaskController::accept(int width, int height, std::string* error) {
         }
         preserve_canvas_on_accept_ = false;
         state_ = TaskState::Accepted;
-        status_message_ = "Continuation accepted; existing canvas preserved.";
+        status_message_ = revision_guard_active_
+            ? "Revision continuation accepted; existing canvas preserved and protected from bulk replacement."
+            : "Continuation accepted; existing canvas preserved.";
         return true;
     }
 
@@ -54,6 +70,7 @@ bool AgentTaskController::accept(int width, int height, std::string* error) {
         if (error) *error = resize_error;
         return false;
     }
+    clear_revision_guard();
     state_ = TaskState::Accepted;
     status_message_ = "Task accepted by agent.";
     return true;
@@ -71,6 +88,7 @@ bool AgentTaskController::reject(std::string reason, std::string* error) {
     preserve_canvas_on_accept_ = false;
     awaiting_user_review_ = false;
     review_summary_.clear();
+    clear_revision_guard();
     state_ = TaskState::Rejected;
     status_message_ = std::move(reason);
     return true;
@@ -88,6 +106,7 @@ bool AgentTaskController::abort(std::string reason, std::string* error) {
     preserve_canvas_on_accept_ = false;
     awaiting_user_review_ = false;
     review_summary_.clear();
+    clear_revision_guard();
     state_ = TaskState::Aborted;
     status_message_ = std::move(reason);
     return true;
@@ -117,6 +136,7 @@ bool AgentTaskController::user_accept_review(std::string* error) {
     }
     awaiting_user_review_ = false;
     preserve_canvas_on_accept_ = false;
+    clear_revision_guard();
     status_message_ = review_summary_.empty() ? "Artwork accepted by user." : "Artwork accepted by user. " + review_summary_;
     return true;
 }
@@ -134,10 +154,55 @@ bool AgentTaskController::user_request_changes(std::string feedback, std::string
 
     awaiting_user_review_ = false;
     review_summary_.clear();
+    // Each requested pass protects exactly the image that the user reviewed.
+    revision_baseline_ = document_ ? document_->pixels() : std::vector<std::uint32_t>{};
+    revision_guard_active_ = document_ && !revision_baseline_.empty();
+
     // Put the controller back into an active state so begin() recognizes the
     // next turn as a continuation and protects the existing canvas.
     state_ = TaskState::Accepted;
-    status_message_ = "User requested changes: " + feedback;
+    status_message_ = "User requested changes; existing reviewed artwork is protected from bulk replacement: " + feedback;
+    return true;
+}
+
+bool AgentTaskController::revision_candidate_allowed(const std::vector<std::uint32_t>& candidate,
+                                                     std::string* error) const {
+    if (!revision_guard_active_ || revision_baseline_.empty()) return true;
+    if (candidate.size() != revision_baseline_.size()) {
+        if (error) *error = "Revision guard rejected a canvas-size change. Continue editing the existing artwork at its current size.";
+        return false;
+    }
+
+    std::size_t changed = 0;
+    std::size_t baseline_opaque = 0;
+    std::size_t erased_opaque = 0;
+    for (std::size_t i = 0; i < candidate.size(); ++i) {
+        const auto before = revision_baseline_[i];
+        const auto after = candidate[i];
+        if (before != after) ++changed;
+        if (alpha_nonzero(before)) {
+            ++baseline_opaque;
+            if (!alpha_nonzero(after)) ++erased_opaque;
+        }
+    }
+
+    const double changed_fraction = candidate.empty() ? 0.0 :
+        static_cast<double>(changed) / static_cast<double>(candidate.size());
+    const double erased_fraction = baseline_opaque == 0 ? 0.0 :
+        static_cast<double>(erased_opaque) / static_cast<double>(baseline_opaque);
+
+    // Revision passes may be broad, but replacing almost the entire reviewed
+    // image or erasing nearly half its painted pixels is treated as an accidental
+    // restart. The rejected edit can be retried as a smaller targeted change.
+    if (changed_fraction > 0.72 || erased_fraction > 0.45) {
+        if (error) {
+            *error = "Revision guard rejected a destructive rewrite of the reviewed artwork (" +
+                std::to_string(static_cast<int>(changed_fraction * 100.0)) + "% of canvas changed, " +
+                std::to_string(static_cast<int>(erased_fraction * 100.0)) +
+                "% of existing painted pixels erased). Preserve the current image and apply the requested changes incrementally.";
+        }
+        return false;
+    }
     return true;
 }
 
@@ -157,6 +222,7 @@ AgentTaskSnapshot AgentTaskController::snapshot() const {
     out.status_message = status_message_;
     out.review_summary = review_summary_;
     out.awaiting_user_review = awaiting_user_review_;
+    out.revision_guard_active = revision_guard_active_;
     out.content_reference = content_reference_;
     out.style_reference = style_reference_;
     out.canvas_width = document_->width();
