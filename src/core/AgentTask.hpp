@@ -60,6 +60,7 @@ private:
     std::uint64_t next_id_ = 1;
     std::uint64_t id_ = 0;
     TaskState state_ = TaskState::Idle;
+    bool preserve_canvas_on_accept_ = false;
     std::string prompt_;
     std::string status_message_;
     ReferenceSlot content_reference_;
