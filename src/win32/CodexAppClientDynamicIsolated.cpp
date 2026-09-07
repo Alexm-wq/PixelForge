@@ -93,11 +93,23 @@ BOOL WINAPI pixelforge_jsonl_write_file(HANDLE file,
     }
     if (has_delimiter) compact.push_back('\n');
 
-    DWORD actual = 0;
-    const BOOL ok = ::WriteFile(file, compact.data(), static_cast<DWORD>(compact.size()),
-                                &actual, overlapped);
-    if (bytes_written) *bytes_written = ok ? bytes_to_write : 0;
-    return ok;
+    DWORD offset = 0;
+    while (offset < compact.size()) {
+        DWORD actual = 0;
+        const BOOL ok = ::WriteFile(file, compact.data() + offset,
+                                    static_cast<DWORD>(compact.size() - offset),
+                                    &actual, overlapped);
+        if (!ok || actual == 0) {
+            if (bytes_written) *bytes_written = 0;
+            return FALSE;
+        }
+        offset += actual;
+    }
+
+    // The caller advances by the original logical JSONL frame size. Report that
+    // size after the compacted transport frame has been fully written.
+    if (bytes_written) *bytes_written = bytes_to_write;
+    return TRUE;
 }
 
 } // namespace
