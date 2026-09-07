@@ -49,6 +49,14 @@ if(BUILD_TESTING)
     target_link_libraries(pixelforge_core_tests PRIVATE pixelforge_core)
     add_test(NAME pixelforge_core_tests COMMAND pixelforge_core_tests)
     set_tests_properties(pixelforge_core_tests PROPERTIES TIMEOUT 60)
+
+    add_executable(pixelforge_pixel_program_tests
+        tests/test_pixel_program.cpp
+        src/win32/PixelProgram.cpp)
+    target_include_directories(pixelforge_pixel_program_tests PRIVATE src/win32)
+    add_test(NAME pixelforge_pixel_program_tests COMMAND pixelforge_pixel_program_tests)
+    set_tests_properties(pixelforge_pixel_program_tests PROPERTIES TIMEOUT 60)
+
     if(WIN32)
         add_executable(pixelforge_automatic_tests tests/test_automatic.cpp
             src/win32/LocalAgentToolSession.cpp src/win32/PixelProgram.cpp
