@@ -22,9 +22,9 @@ struct CodexGenerateRequest {
     std::string model = "gpt-6-astra";
     std::string reasoning_effort = "medium";
     LocalAgentToolSession* tool_session = nullptr;
-    // The no-progress watchdog remains useful, but productive generations must
-    // never be stopped by an arbitrary wall-clock budget.
-    std::uint64_t progress_timeout_ms = 120000;
+    // Automatic wall-clock and no-edit cutoffs are disabled. Slower models may
+    // reason for as long as necessary; Stop/close and real failures remain.
+    std::uint64_t progress_timeout_ms = 0x3fffffffffffffffull;
     std::uint64_t total_timeout_ms = 0x3fffffffffffffffull;
 };
 
@@ -80,7 +80,7 @@ private:
     StatusCallback active_status_;
     std::uint64_t progress_deadline_ = 0;
     std::uint64_t total_deadline_ = 0;
-    std::uint64_t progress_timeout_ms_ = 120000;
+    std::uint64_t progress_timeout_ms_ = 0x3fffffffffffffffull;
     std::wstring failure_reason_;
     unsigned consecutive_tool_errors_ = 0;
     bool received_edit_ = false;
