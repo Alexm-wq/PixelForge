@@ -165,7 +165,6 @@ std::vector<std::string> encode_patch_chunks(const ImageData& image) {
             int end = x + 1;
             while (end < image.width && argb_at(image, end, y) == color) ++end;
             const int length = end - x;
-            // New pack canvases are transparent, so transparent source runs need no write.
             if ((color >> 24) != 0) {
                 const auto c = color_token(color);
                 if (length == 1)
@@ -267,16 +266,14 @@ std::string loaded_project_prompt(const std::vector<SavedCanvas>& canvases) {
     }
 
     std::ostringstream out;
-    out << "Existing PixelForge project opened for inspection and repair.\n\n"
-        << "The project already contains " << canvases.size() << " canvases.";
+    out << "Existing PixelForge project opened.\n\n"
+        << "The project currently contains " << canvases.size() << " canvases.";
     if (!animations.empty()) {
         out << " Existing animation groups:";
         for (const auto& [group, count] : animations)
             out << " " << group << "=" << count << " frames;";
     }
-    out << "\nPreserve existing work by default. Inspect the existing pack and existing animation before deciding what to change. "
-           "Repair or refine existing canvases whenever practical. Do not call pixelforge_pack create merely to start over. "
-           "Replacing an existing pack is destructive and requires replace_existing=true; use that only when a full replacement is intentionally necessary.";
+    out << "\nYou have full artistic control over this workspace. Inspect what exists, then freely edit, restructure, add, remove, replace, or rebuild canvases and animation frames as your judgment and the user's request require. Existing work is context, not a constraint.";
     return out.str();
 }
 
@@ -329,8 +326,6 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
         }
     }
 
-    // Project restoration is the one legitimate destructive pack construction path.
-    // The normal agent-facing create path is protected once project.json exists.
     const std::string create_args = "{\"action\":\"create\",\"task_id\":" + std::to_string(restored_task_id) +
         ",\"canvases\":" + q(canvas_specs(canvases)) +
         ",\"seed_from_source\":false,\"replace_existing\":true}";
@@ -353,8 +348,6 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
         }
     }
 
-    // The pack create operation accepted the task, so subsequent Astra turns can
-    // work immediately without re-creating or re-seeding the saved project.
     summary.task_id = restored_task_id;
     summary.canvas_count = canvases.size();
     summary.manifest_path = manifest.wstring();
@@ -362,8 +355,6 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
     summary.active_directory = (std::filesystem::path(repo_root) / L"projects" /
                                 (L"task_" + std::to_wstring(restored_task_id))).wstring();
 
-    // Refresh the primary editor immediately from the first restored pack canvas.
-    // pack create/edit already operates on the same primary PixelDocument object.
     (void)primary;
     return true;
 }
