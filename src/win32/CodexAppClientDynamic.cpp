@@ -177,6 +177,84 @@ std::string nested_string(std::string_view object, std::initializer_list<std::st
     return decode_scalar_string(current);
 }
 
+struct PackFrameInfo {
+    std::string name;
+    std::string group;
+    int width = 0;
+    int height = 0;
+    int frame = -1;
+};
+
+std::vector<std::string> split_simple(std::string_view text, char delimiter) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const auto end = text.find(delimiter, start);
+        if (end == std::string_view::npos) {
+            out.emplace_back(text.substr(start));
+            break;
+        }
+        out.emplace_back(text.substr(start, end - start));
+        start = end + 1;
+    }
+    return out;
+}
+
+std::string upper_ascii(std::string value) {
+    for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return value;
+}
+
+std::vector<PackFrameInfo> parse_pack_summary_for_animation(std::string_view summary) {
+    std::vector<PackFrameInfo> out;
+    for (const auto& row : split_simple(summary, '|')) {
+        if (row.empty()) continue;
+        const auto fields = split_simple(row, ',');
+        if (fields.size() != 5) continue;
+        PackFrameInfo info;
+        info.name = fields[0];
+        info.group = fields[1];
+        auto parse_int = [](std::string_view text, int& value) {
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+            return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+        };
+        if (!parse_int(fields[2], info.width) || !parse_int(fields[3], info.height) || !parse_int(fields[4], info.frame)) continue;
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+std::vector<PackFrameInfo> select_animation_frames(const FlatJsonObject& args,
+                                                   const std::vector<PackFrameInfo>& available) {
+    std::vector<PackFrameInfo> selected;
+    const auto explicit_names = args.get("canvases");
+    const auto single = args.get("canvas");
+    const auto group = args.get("group");
+    if (!single.empty()) {
+        const auto wanted = upper_ascii(single);
+        for (const auto& frame : available)
+            if (upper_ascii(frame.name) == wanted) selected.push_back(frame);
+    } else if (!explicit_names.empty()) {
+        for (const auto& name : split_simple(explicit_names, '|')) {
+            const auto wanted = upper_ascii(name);
+            for (const auto& frame : available)
+                if (upper_ascii(frame.name) == wanted) { selected.push_back(frame); break; }
+        }
+    } else if (!group.empty()) {
+        const auto wanted = upper_ascii(group);
+        for (const auto& frame : available)
+            if (upper_ascii(frame.group) == wanted) selected.push_back(frame);
+    } else {
+        selected = available;
+    }
+    std::stable_sort(selected.begin(), selected.end(), [](const PackFrameInfo& a, const PackFrameInfo& b) {
+        if (a.frame >= 0 && b.frame >= 0 && a.frame != b.frame) return a.frame < b.frame;
+        if ((a.frame >= 0) != (b.frame >= 0)) return a.frame >= 0;
+        return a.name < b.name;
+    });
+    return selected;
+}
+
 std::wstring rpc_error_message(std::string_view line) {
     std::string error_raw;
     if (!extract_member_raw(line, "error", error_raw)) return L"Codex App Server returned an unknown RPC error.";
@@ -417,7 +495,7 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
         return false;
     }
     CloseHandle(pi.hThread);
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    HANDLE job = CreateJobObjectW(nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (job && (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
@@ -679,11 +757,73 @@ void CodexAppClient::handle_server_request(std::string_view line) {
             received_edit_ = true;
             progress_deadline_ = GetTickCount64() + progress_timeout_ms_;
         }
+
+        struct FrameObservation {
+            PackFrameInfo info;
+            LocalToolResult image;
+            int time_ms = 0;
+        };
+        std::vector<FrameObservation> animation_observations;
+        FlatJsonObject call_args;
+        std::string call_parse_error;
+        if (output.success && tool == "pixelforge_pack" && action == "view" &&
+            parse_flat_json_object(arguments, call_args, call_parse_error) &&
+            upper_ascii(call_args.get("mode")) == "ANIMATION") {
+            const auto task_id = call_args.get_i64("task_id");
+            if (task_id && *task_id >= 0) {
+                const auto list = active_tool_session_->call("pixelforge_pack",
+                    "{\"action\":\"list\",\"task_id\":" + std::to_string(*task_id) + "}");
+                FlatJsonObject list_fields;
+                std::string ignored;
+                if (list.success && parse_flat_json_object(list.text, list_fields, ignored)) {
+                    const auto available = parse_pack_summary_for_animation(list_fields.get("canvases"));
+                    const auto selected = select_animation_frames(call_args, available);
+                    const int fps = static_cast<int>(std::clamp<std::int64_t>(call_args.get_i64("fps").value_or(8), 1, 60));
+                    const bool explicit_scale = call_args.contains("scale");
+                    const int requested_scale = static_cast<int>(std::clamp<std::int64_t>(call_args.get_i64("scale").value_or(1), 1, 16));
+                    for (std::size_t i = 0; i < selected.size(); ++i) {
+                        const auto& frame = selected[i];
+                        int frame_scale = requested_scale;
+                        if (!explicit_scale) {
+                            const int extent = std::max(frame.width, frame.height);
+                            frame_scale = extent > 0 ? std::clamp(384 / extent, 1, 16) : 1;
+                        }
+                        const std::string request = "{\"action\":\"view\",\"mode\":\"canvas\",\"task_id\":" +
+                            std::to_string(*task_id) + ",\"canvas\":" + json_quote(frame.name) +
+                            ",\"scale\":" + std::to_string(frame_scale) + "}";
+                        auto frame_image = active_tool_session_->call("pixelforge_pack", request);
+                        if (!frame_image.success || frame_image.image_base64.empty()) continue;
+                        const int temporal_index = frame.frame >= 0 ? frame.frame : static_cast<int>(i);
+                        animation_observations.push_back({frame, std::move(frame_image),
+                            static_cast<int>((static_cast<std::int64_t>(temporal_index) * 1000) / fps)});
+                    }
+                    codex_trace_detail("ANIMATION observation_frames=" + std::to_string(animation_observations.size()) +
+                        " requested=" + std::to_string(selected.size()) + " fps=" + std::to_string(fps));
+                }
+            }
+        }
+
         std::string content = "[{\"type\":\"inputText\",\"text\":" + json_quote(output.text) + "}";
         if (!output.image_base64.empty()) {
             const std::string mime = output.image_mime.empty() ? "image/png" : output.image_mime;
             content += ",{\"type\":\"inputImage\",\"imageUrl\":" +
                        json_quote("data:" + mime + ";base64," + output.image_base64) + "}";
+        }
+        for (std::size_t i = 0; i < animation_observations.size(); ++i) {
+            const auto& observation = animation_observations[i];
+            std::string label = "Animation frame " + std::to_string(i + 1) + "/" +
+                std::to_string(animation_observations.size()) + ": canvas=" + observation.info.name +
+                " frame=" + std::to_string(observation.info.frame) +
+                " time_ms=" + std::to_string(observation.time_ms) +
+                ". Judge this as one ordered moment in the motion sequence.";
+            content += ",{\"type\":\"inputText\",\"text\":" + json_quote(label) + "}";
+            const std::string mime = observation.image.image_mime.empty() ? "image/png" : observation.image.image_mime;
+            content += ",{\"type\":\"inputImage\",\"imageUrl\":" +
+                       json_quote("data:" + mime + ";base64," + observation.image.image_base64) + "}";
+        }
+        if (animation_observations.size() > 1) {
+            content += ",{\"type\":\"inputText\",\"text\":" +
+                json_quote("Loop transition: after the final supplied frame, motion returns directly to the first supplied frame. Evaluate that last-to-first transition as part of animation naturalness.") + "}";
         }
         content += "]";
         write_line("{\"id\":" + id_raw + ",\"result\":{\"contentItems\":" + content +
