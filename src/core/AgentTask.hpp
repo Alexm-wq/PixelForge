@@ -55,6 +55,14 @@ public:
     void set_source_reference(ReferenceSlot reference);
     void set_content_reference(ReferenceSlot reference);
     void set_style_reference(ReferenceSlot reference);
+
+    // Project restoration needs to preserve the persisted workspace id so pack
+    // autosave continues writing to the same projects/task_N directory.
+    void set_next_task_id_for_restore(std::uint64_t task_id);
+    // Reuse an already-loaded project's accepted/finished task id for another
+    // agent turn instead of silently forking the project into a new task folder.
+    bool resume_existing_project(std::string prompt, std::string* error = nullptr);
+
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
     [[nodiscard]] bool awaiting_user_review() const noexcept { return awaiting_user_review_; }
