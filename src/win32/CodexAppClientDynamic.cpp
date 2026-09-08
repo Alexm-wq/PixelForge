@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
@@ -495,7 +496,7 @@ bool CodexAppClient::launch_server(const CodexGenerateRequest& request, std::wst
         return false;
     }
     CloseHandle(pi.hThread);
-    HANDLE job = CreateJobObjectW(nullptr);
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (job && (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
