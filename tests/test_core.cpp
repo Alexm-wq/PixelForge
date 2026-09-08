@@ -19,7 +19,9 @@ int main() {
 
     std::string error;
     CHECK(!doc.can_resize(0, 64, &error));
-    CHECK(!doc.can_resize(4096, 4096, &error));
+    // Large canvases are no longer rejected by a fixed 2048/4MP policy. The
+    // allocator/representation is the resource boundary.
+    CHECK(doc.can_resize(4096, 4096, &error));
     CHECK(doc.resize(64, 64, &error));
     const auto after_resize = doc.revision();
 
@@ -51,7 +53,6 @@ int main() {
     PixelDocument reject_doc;
     AgentTaskController rejected(reject_doc);
     rejected.begin("Make a non-pixel oil painting.");
-    // The core deliberately does not infer semantic scope. The AGENT chooses this call.
     CHECK(rejected.reject("PixelForge only handles pixel-art output.", &error));
     CHECK(rejected.state() == TaskState::Rejected);
     CHECK(reject_doc.width() == 0);
