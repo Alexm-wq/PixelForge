@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -9,9 +10,12 @@ namespace pixelforge {
 struct CanvasLimits {
     int min_width = 1;
     int min_height = 1;
-    int max_width = 2048;
-    int max_height = 2048;
-    std::uint64_t max_pixels = 4ull * 1024ull * 1024ull;
+    // No arbitrary artistic-size ceiling. PixelDocument::can_resize still checks
+    // representability and any explicitly supplied host policy; allocation itself
+    // is the final resource boundary.
+    int max_width = std::numeric_limits<int>::max();
+    int max_height = std::numeric_limits<int>::max();
+    std::uint64_t max_pixels = std::numeric_limits<std::uint64_t>::max();
 };
 
 struct PixelChange {
