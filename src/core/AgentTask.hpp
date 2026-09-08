@@ -63,6 +63,15 @@ public:
     // agent turn instead of silently forking the project into a new task folder.
     bool resume_existing_project(std::string prompt, std::string* error = nullptr);
 
+    // The Win32 host has one active artwork controller. This narrow UI accessor
+    // lets the review/persistence guard serialize the exact current document
+    // before final acceptance without coupling persistence into the core task API.
+    [[nodiscard]] static AgentTaskController* active_instance_for_ui() noexcept {
+        return active_instance_;
+    }
+    [[nodiscard]] PixelDocument* document_for_ui() noexcept { return document_; }
+    [[nodiscard]] const PixelDocument* document_for_ui() const noexcept { return document_; }
+
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
     [[nodiscard]] bool awaiting_user_review() const noexcept { return awaiting_user_review_; }
@@ -75,9 +84,23 @@ public:
                (state_ == TaskState::Finished && !awaiting_user_review_);
     }
 private:
+    struct ActiveUiRegistration {
+        AgentTaskController* owner = nullptr;
+        explicit ActiveUiRegistration(AgentTaskController* value) : owner(value) {
+            active_instance_ = value;
+        }
+        ~ActiveUiRegistration() {
+            if (active_instance_ == owner) active_instance_ = nullptr;
+        }
+        ActiveUiRegistration(const ActiveUiRegistration&) = delete;
+        ActiveUiRegistration& operator=(const ActiveUiRegistration&) = delete;
+    };
+
     void clear_revision_guard();
     void clear_user_input();
+    inline static AgentTaskController* active_instance_ = nullptr;
     PixelDocument* document_ = nullptr;
+    ActiveUiRegistration active_ui_registration_{this};
     std::uint64_t next_id_ = 1;
     std::uint64_t id_ = 0;
     TaskState state_ = TaskState::Idle;
