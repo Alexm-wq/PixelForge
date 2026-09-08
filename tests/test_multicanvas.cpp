@@ -35,8 +35,7 @@ int main() {
     const auto id = task.begin("Build a three-frame walk cycle");
     const auto id_text = std::to_string(id);
 
-    // LIST must never create a hidden fallback pack. A new pack requires an
-    // explicit CREATE, while loaded projects already have their restored pack.
+    // LIST must never create a hidden fallback pack.
     auto before_create = tools.call("pixelforge_pack",
         "{\"action\":\"list\",\"task_id\":" + id_text + "}");
     CHECK(!before_create.success);
@@ -51,29 +50,33 @@ int main() {
     CHECK(task.state() == TaskState::Accepted);
     CHECK(document.width() == 8 && document.height() == 8);
 
-    // Once a pack exists, create is destructive and must be an explicit opt-in.
-    auto blocked_replace = tools.call("pixelforge_pack",
+    // Astra has full control: CREATE may intentionally replace an existing pack,
+    // including changing the primary dimensions, without a host-side opt-in flag.
+    auto replaced = tools.call("pixelforge_pack",
         "{\"action\":\"create\",\"task_id\":" + id_text +
-        ",\"canvases\":\"replacement_00,newwalk,8,8,0|replacement_01,newwalk,8,8,1\"}");
-    CHECK(!blocked_replace.success);
-    CHECK(blocked_replace.text.find("\"error\":\"workspace_already_exists\"") != std::string::npos);
-    CHECK(blocked_replace.text.find("\"existing_pack_intact\":true") != std::string::npos);
-    CHECK(blocked_replace.text.find("\"replacement_applied\":false") != std::string::npos);
-    CHECK(blocked_replace.text.find("failed create") != std::string::npos);
-
-    auto list_after_block = tools.call("pixelforge_pack",
+        ",\"canvases\":\"replacement_00,rebuild,6,5,0|replacement_01,rebuild,6,5,1\"}");
+    CHECK(replaced.success);
+    CHECK(document.width() == 6 && document.height() == 5);
+    auto list_replaced = tools.call("pixelforge_pack",
         "{\"action\":\"list\",\"task_id\":" + id_text + "}");
-    CHECK(list_after_block.success);
-    CHECK(list_after_block.text.find("\"canvas_count\":3") != std::string::npos);
-    CHECK(list_after_block.text.find("walk_00") != std::string::npos);
-    CHECK(list_after_block.text.find("replacement_00") == std::string::npos);
+    CHECK(list_replaced.success);
+    CHECK(list_replaced.text.find("\"canvas_count\":2") != std::string::npos);
+    CHECK(list_replaced.text.find("replacement_00") != std::string::npos);
+
+    // Restore the fixture pack and continue normal tool coverage.
+    auto recreated = tools.call("pixelforge_pack",
+        "{\"action\":\"create\",\"task_id\":" + id_text +
+        ",\"canvases\":\"walk_00,walk,8,8,0|walk_01,walk,8,8,1|walk_02,walk,8,8,2\"}");
+    CHECK(recreated.success);
+    CHECK(document.width() == 8 && document.height() == 8);
 
     auto task_info = tools.call("pixelforge_task", "{\"action\":\"get\"}");
     CHECK(task_info.success);
     CHECK(task_info.text.find("\"pack_exists\":true") != std::string::npos);
     CHECK(task_info.text.find("\"pack_canvas_count\":3") != std::string::npos);
     CHECK(task_info.text.find("\"animation_groups\":\"walk:3\"") != std::string::npos);
-    CHECK(task_info.text.find("\"pack_create_requires_replace_existing\":true") != std::string::npos);
+    CHECK(task_info.text.find("\"agent_has_full_workspace_control\":true") != std::string::npos);
+    CHECK(task_info.text.find("\"pack_create_requires_replace_existing\":false") != std::string::npos);
 
     auto unknown = tools.call("pixelforge_pack",
         "{\"action\":\"view\",\"task_id\":" + id_text + ",\"mode\":\"canvas\",\"canvas\":\"does_not_exist\"}");
@@ -106,6 +109,15 @@ int main() {
     auto inspected = tools.call("pixelforge_pack",
         "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":0,\"y\":0,\"width\":8,\"height\":8}");
     CHECK(inspected.success && inspected.text.find("\"canvas\":\"walk_01\"") != std::string::npos);
+
+    auto bad_inspect = tools.call("pixelforge_pack",
+        "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":7,\"y\":7,\"width\":8,\"height\":8}");
+    CHECK(!bad_inspect.success);
+    CHECK(bad_inspect.text.find("\"error\":\"inspect_region_invalid\"") != std::string::npos);
+    CHECK(bad_inspect.text.find("\"reason\":\"out_of_bounds\"") != std::string::npos);
+    CHECK(bad_inspect.text.find("\"canvas_width\":8") != std::string::npos);
+    CHECK(bad_inspect.text.find("\"requested_x\":7") != std::string::npos);
+    CHECK(bad_inspect.text.find("\"max_area\":4096") != std::string::npos);
 
     auto undone = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"undo\"}");
@@ -147,7 +159,7 @@ int main() {
     for (std::size_t i = 0; i + 4 < gif_bytes.size(); ++i) {
         if (gif_bytes[i] == 0x21 && gif_bytes[i + 1] == 0xF9 && gif_bytes[i + 2] == 0x04) {
             ++gce_count;
-            CHECK(gif_bytes[i + 3] == 0x09); // disposal=2 + transparent-index flag
+            CHECK(gif_bytes[i + 3] == 0x09);
         }
     }
     CHECK(gce_count == 3);
@@ -155,8 +167,8 @@ int main() {
     const auto catalog = pixelforge_dynamic_tools_json();
     CHECK(catalog.find("timeline") != std::string::npos);
     CHECK(catalog.find("dests") != std::string::npos);
-    CHECK(catalog.find("replace_existing") != std::string::npos);
-    CHECK(catalog.find("DESTRUCTIVE opt-in") != std::string::npos);
+    CHECK(catalog.find("Astra may use it on an existing project") != std::string::npos);
+    CHECK(catalog.find("permitted to replace an existing pack") != std::string::npos);
 
     tools.stop();
     DestroyWindow(hwnd);
