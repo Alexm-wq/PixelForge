@@ -67,32 +67,110 @@ if(WIN32)
         PIXELFORGE_MULTI_CANVAS_TEXT
         "${PIXELFORGE_MULTI_CANVAS_TEXT}")
 
-    # INSPECT errors must be self-correcting. Return the exact request, canvas
-    # bounds, hard area limit, and the specific failed condition so Astra does
-    # not burn three retries guessing why the region was rejected.
+    # INSPECT is observational. Never fail a model turn merely because the model
+    # requested more than the canvas contains. Clip to the canvas and return the
+    # actual rectangle. There is intentionally no arbitrary pixel-area ceiling.
     string(REPLACE
 [=[        if (!rect_fits(*canvas->document, x, y, width, height) ||
             static_cast<std::uint64_t>(width) * height > 4096)
-            return {false, "{\"ok\":false,\"error\":\"inspect_region_invalid\"}"};]=]
-[=[        const bool region_fits = rect_fits(*canvas->document, x, y, width, height);
-        const bool positive_region = width > 0 && height > 0;
-        const std::uint64_t area = positive_region
-            ? static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height)
-            : 0;
-        if (!region_fits || area > 4096) {
-            const std::string reason = !positive_region ? "non_positive_size" :
-                                       (!region_fits ? "out_of_bounds" : "area_exceeds_limit");
-            return {false, "{\"ok\":false,\"error\":\"inspect_region_invalid\",\"reason\":" + quote_json(reason) +
-                          ",\"canvas\":" + quote_json(canvas->name) +
-                          ",\"canvas_width\":" + std::to_string(canvas->document->width()) +
-                          ",\"canvas_height\":" + std::to_string(canvas->document->height()) +
-                          ",\"requested_x\":" + std::to_string(x) +
-                          ",\"requested_y\":" + std::to_string(y) +
-                          ",\"requested_width\":" + std::to_string(width) +
-                          ",\"requested_height\":" + std::to_string(height) +
-                          ",\"requested_area\":" + std::to_string(area) +
-                          ",\"max_area\":4096,\"message\":\"INSPECT requires x>=0, y>=0, width>0, height>0, x+width<=canvas_width, y+height<=canvas_height, and width*height<=4096. Correct the rectangle directly; LIST is not required unless the canvas name itself is stale.\"}"};
-        }]=]
+            return {false, "{\"ok\":false,\"error\":\"inspect_region_invalid\"}"};
+        std::lock_guard state_lock(*bindings_.state_mutex);
+        return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
+                      ",\"canvas\":" + quote_json(canvas->name) +
+                      ",\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) +
+                      ",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) +
+                      ",\"rle\":" + quote_json(rle_region(*canvas->document, x, y, width, height)) + "}"};]=]
+[=[        const int canvas_width = canvas->document->width();
+        const int canvas_height = canvas->document->height();
+        const std::int64_t requested_right = static_cast<std::int64_t>(x) + std::max(0, width);
+        const std::int64_t requested_bottom = static_cast<std::int64_t>(y) + std::max(0, height);
+        const int actual_x = std::clamp(x, 0, canvas_width);
+        const int actual_y = std::clamp(y, 0, canvas_height);
+        const int actual_right = static_cast<int>(std::clamp<std::int64_t>(requested_right, actual_x, canvas_width));
+        const int actual_bottom = static_cast<int>(std::clamp<std::int64_t>(requested_bottom, actual_y, canvas_height));
+        const int actual_width = std::max(0, actual_right - actual_x);
+        const int actual_height = std::max(0, actual_bottom - actual_y);
+        const bool clipped = actual_x != x || actual_y != y || actual_width != width || actual_height != height;
+        std::lock_guard state_lock(*bindings_.state_mutex);
+        const std::string rle = actual_width > 0 && actual_height > 0
+            ? rle_region(*canvas->document, actual_x, actual_y, actual_width, actual_height)
+            : std::string{};
+        return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
+                      ",\"canvas\":" + quote_json(canvas->name) +
+                      ",\"requested_x\":" + std::to_string(x) + ",\"requested_y\":" + std::to_string(y) +
+                      ",\"requested_width\":" + std::to_string(width) + ",\"requested_height\":" + std::to_string(height) +
+                      ",\"x\":" + std::to_string(actual_x) + ",\"y\":" + std::to_string(actual_y) +
+                      ",\"width\":" + std::to_string(actual_width) + ",\"height\":" + std::to_string(actual_height) +
+                      ",\"clipped\":" + std::string(clipped ? "true" : "false") +
+                      ",\"empty\":" + std::string(actual_width == 0 || actual_height == 0 ? "true" : "false") +
+                      ",\"rle\":" + quote_json(rle) + "}"};]=]
+        PIXELFORGE_MULTI_CANVAS_TEXT
+        "${PIXELFORGE_MULTI_CANVAS_TEXT}")
+
+    # COPY follows the same best-effort rule as pixel-program writes. Work in a
+    # shared offset domain and clip to the portion that exists in both source and
+    # destination instead of rejecting the complete operation.
+    string(REPLACE
+[=[        if (!rect_fits(*source->document, sx, sy, width, height) || !rect_fits(*dest->document, dx, dy, width, height))
+            return {false, "{\"ok\":false,\"error\":\"copy_out_of_bounds\"}"};
+        std::vector<std::uint32_t> source_pixels(static_cast<std::size_t>(width) * height);
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x)
+                source_pixels[static_cast<std::size_t>(y) * width + x] = source->document->pixel(sx + x, sy + y);
+        std::size_t changed = 0;
+        {
+            std::lock_guard state_lock(*bindings_.state_mutex);
+            auto tx = dest->document->begin_transaction();
+            for (int y = 0; y < height; ++y)
+                for (int x = 0; x < width; ++x)
+                    tx.set_pixel(dx + x, dy + y, source_pixels[static_cast<std::size_t>(y) * width + x]);
+            changed = tx.pending_changes();
+            if (changed && !tx.commit()) return {false, "{\"ok\":false,\"error\":\"copy_failed\"}"};
+            if (!changed) tx.cancel();
+        }
+        if (changed) push_history(workspace, {dest->name});
+        if (dest->document == bindings_.document) PostMessageW(bindings_.hwnd, WM_APP + 1, 0, 0);
+        return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
+                      ",\"changed_pixels\":" + std::to_string(changed) + "}"};]=]
+[=[        const int requested_width = std::max(0, width);
+        const int requested_height = std::max(0, height);
+        const int start_x = std::max({0, -sx, -dx});
+        const int start_y = std::max({0, -sy, -dy});
+        const int end_x = std::min({requested_width, source->document->width() - sx, dest->document->width() - dx});
+        const int end_y = std::min({requested_height, source->document->height() - sy, dest->document->height() - dy});
+        const int actual_width = std::max(0, end_x - start_x);
+        const int actual_height = std::max(0, end_y - start_y);
+        const int actual_sx = sx + start_x;
+        const int actual_sy = sy + start_y;
+        const int actual_dx = dx + start_x;
+        const int actual_dy = dy + start_y;
+        const bool clipped = actual_width != width || actual_height != height || start_x != 0 || start_y != 0;
+        std::size_t changed = 0;
+        if (actual_width > 0 && actual_height > 0) {
+            std::vector<std::uint32_t> source_pixels(static_cast<std::size_t>(actual_width) * actual_height);
+            for (int y = 0; y < actual_height; ++y)
+                for (int x = 0; x < actual_width; ++x)
+                    source_pixels[static_cast<std::size_t>(y) * actual_width + x] = source->document->pixel(actual_sx + x, actual_sy + y);
+            {
+                std::lock_guard state_lock(*bindings_.state_mutex);
+                auto tx = dest->document->begin_transaction();
+                for (int y = 0; y < actual_height; ++y)
+                    for (int x = 0; x < actual_width; ++x)
+                        tx.set_pixel(actual_dx + x, actual_dy + y, source_pixels[static_cast<std::size_t>(y) * actual_width + x]);
+                changed = tx.pending_changes();
+                if (changed && !tx.commit()) return {false, "{\"ok\":false,\"error\":\"copy_failed\"}"};
+                if (!changed) tx.cancel();
+            }
+        }
+        if (changed) push_history(workspace, {dest->name});
+        if (dest->document == bindings_.document && changed) PostMessageW(bindings_.hwnd, WM_APP + 1, 0, 0);
+        return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
+                      ",\"changed_pixels\":" + std::to_string(changed) +
+                      ",\"clipped\":" + std::string(clipped ? "true" : "false") +
+                      ",\"empty\":" + std::string(actual_width == 0 || actual_height == 0 ? "true" : "false") +
+                      ",\"sx\":" + std::to_string(actual_sx) + ",\"sy\":" + std::to_string(actual_sy) +
+                      ",\"dx\":" + std::to_string(actual_dx) + ",\"dy\":" + std::to_string(actual_dy) +
+                      ",\"width\":" + std::to_string(actual_width) + ",\"height\":" + std::to_string(actual_height) + "}"};]=]
         PIXELFORGE_MULTI_CANVAS_TEXT
         "${PIXELFORGE_MULTI_CANVAS_TEXT}")
 
@@ -127,14 +205,6 @@ if(WIN32)
     string(REPLACE
         "DESTRUCTIVE opt-in for create when a pack already exists. Default false. Set true only after inspecting the existing pack and intentionally deciding to discard and replace the complete workspace."
         "Optional compatibility flag. Astra is already permitted to replace an existing pack without this flag."
-        PIXELFORGE_WORKSPACE_TEXT
-        "${PIXELFORGE_WORKSPACE_TEXT}")
-    string(REPLACE
-[=[    } else if (has("\"error\":\"primary_canvas_size_mismatch\"")) {]=]
-[=[    } else if (has("\"error\":\"inspect_region_invalid\"")) {
-        add_member(result.text,
-            ",\"recovery\":\"Use the returned reason, canvas_width/canvas_height, requested rectangle, and max_area to correct INSPECT directly. Do not repeat the same rectangle and do not call LIST unless the canvas name is stale.\"");
-    } else if (has("\"error\":\"primary_canvas_size_mismatch\"")) {]=]
         PIXELFORGE_WORKSPACE_TEXT
         "${PIXELFORGE_WORKSPACE_TEXT}")
     set(PIXELFORGE_WORKSPACE_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/LocalAgentToolSessionWorkspace.cpp")
