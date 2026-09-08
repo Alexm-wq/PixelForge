@@ -120,23 +120,33 @@ bool AgentTaskController::user_answer_input(std::string answer, std::string* err
     return true;
 }
 
-bool AgentTaskController::revision_candidate_allowed(const std::vector<std::uint32_t>& candidate, std::string* error) const {
-    if (!revision_guard_active_ || revision_baseline_.empty()) return true;
-    if (candidate.size() != revision_baseline_.size()) { if (error) *error = "Revision guard rejected a canvas-size change. Continue editing the existing artwork at its current size."; return false; }
-    std::size_t changed = 0, baseline_opaque = 0, erased_opaque = 0;
-    for (std::size_t i = 0; i < candidate.size(); ++i) {
-        const auto before = revision_baseline_[i], after = candidate[i];
-        if (before != after) ++changed;
-        if (alpha_nonzero(before)) { ++baseline_opaque; if (!alpha_nonzero(after)) ++erased_opaque; }
-    }
-    const double changed_fraction = candidate.empty() ? 0.0 : static_cast<double>(changed) / static_cast<double>(candidate.size());
-    const double erased_fraction = baseline_opaque == 0 ? 0.0 : static_cast<double>(erased_opaque) / static_cast<double>(baseline_opaque);
-    if (changed_fraction > 0.72 || erased_fraction > 0.45) {
-        if (error) *error = "Revision guard rejected a destructive rewrite of the reviewed artwork (" +
-            std::to_string(static_cast<int>(changed_fraction * 100.0)) + "% of canvas changed, " +
-            std::to_string(static_cast<int>(erased_fraction * 100.0)) + "% of existing painted pixels erased). Preserve the current image and apply the requested changes incrementally.";
+void AgentTaskController::set_next_task_id_for_restore(std::uint64_t task_id) {
+    if (task_id > 0) next_id_ = task_id;
+}
+
+bool AgentTaskController::resume_existing_project(std::string prompt, std::string* error) {
+    if (id_ == 0 || awaiting_user_review_ || awaiting_user_input_) {
+        if (error) *error = "The loaded project cannot resume while a user interaction or review is pending.";
         return false;
     }
+    if (state_ != TaskState::Accepted && state_ != TaskState::Finished) {
+        if (error) *error = "The loaded project can resume only from an active or accepted finished state.";
+        return false;
+    }
+    if (blank(prompt)) {
+        if (error) *error = "A project repair turn requires a prompt.";
+        return false;
+    }
+    if (state_ == TaskState::Finished) clear_revision_guard();
+    preserve_canvas_on_accept_ = false;
+    awaiting_user_review_ = false;
+    clear_user_input();
+    review_summary_.clear();
+    prompt_ = std::move(prompt);
+    state_ = TaskState::Accepted;
+    status_message_ = revision_guard_active_
+        ? "Loaded project repair resumed; reviewed artwork remains protected from destructive replacement."
+        : "Loaded project repair resumed on the existing workspace.";
     return true;
 }
 
