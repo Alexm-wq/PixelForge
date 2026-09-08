@@ -7,6 +7,8 @@ namespace pixelforge {
 namespace {
 bool alpha_nonzero(std::uint32_t argb) { return (argb >> 24) != 0; }
 bool blank(std::string_view text) { return text.find_first_not_of(" \t\r\n") == std::string_view::npos; }
+constexpr std::string_view project_naming_hint =
+    " Before finish, choose a concise human-readable project name and put 'PROJECT_NAME: <name>' on the first line of finish.summary. PixelForge persists that name in project.json when the user accepts.";
 }
 
 AgentTaskController::AgentTaskController(PixelDocument& document) : document_(&document) {}
@@ -43,6 +45,7 @@ bool AgentTaskController::accept(int width, int height, std::string* error) {
         status_message_ = revision_guard_active_
             ? "Revision continuation accepted; existing canvas preserved and protected from bulk replacement."
             : "Continuation accepted; existing canvas preserved.";
+        status_message_ += project_naming_hint;
         return true;
     }
     std::string resize_error;
@@ -53,6 +56,7 @@ bool AgentTaskController::accept(int width, int height, std::string* error) {
     clear_revision_guard();
     state_ = TaskState::Accepted;
     status_message_ = "Task accepted by agent.";
+    status_message_ += project_naming_hint;
     return true;
 }
 
@@ -97,6 +101,7 @@ bool AgentTaskController::user_request_changes(std::string feedback, std::string
     revision_guard_active_ = document_ && !revision_baseline_.empty();
     state_ = TaskState::Accepted;
     status_message_ = "User requested changes; existing reviewed artwork is protected from bulk replacement: " + feedback;
+    status_message_ += project_naming_hint;
     return true;
 }
 
@@ -170,6 +175,7 @@ bool AgentTaskController::resume_existing_project(std::string prompt, std::strin
     status_message_ = revision_guard_active_
         ? "Loaded project repair resumed; reviewed artwork remains protected from destructive replacement."
         : "Loaded project repair resumed on the existing workspace.";
+    status_message_ += project_naming_hint;
     return true;
 }
 
