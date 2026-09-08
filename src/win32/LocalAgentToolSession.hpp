@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace pixelforge::win32 {
 
@@ -31,6 +32,15 @@ struct LocalToolResult {
     std::string image_mime;
 };
 
+// Host-only project reconstruction payload. This is deliberately not part of
+// the agent tool schema: opening a project is a user/UI operation, not something
+// Astra should be able to invoke. Patches are the already-decoded native canvas
+// pixels encoded in PixelForge's compact exact-pixel grammar.
+struct LocalPackRestoreCanvas {
+    std::string name;
+    std::vector<std::string> patches;
+};
+
 class LocalAgentToolSession {
 public:
     LocalAgentToolSession() = default;
@@ -41,6 +51,13 @@ public:
     bool start(AgentMcpBindings bindings, LocalRecordBindings record_bindings, std::wstring& error);
     void stop();
     LocalToolResult call(std::string_view tool, std::string_view arguments_json);
+
+    // Trusted UI-only restore path. It bypasses the agent-facing workspace
+    // wrapper so loading N saved canvases does not autosave/re-export/re-publish
+    // the complete pack after every restored patch. The finished pack is returned
+    // as one list snapshot; ProjectLoader publishes it once after reconstruction.
+    LocalToolResult restore_project_pack(std::string_view create_arguments_json,
+                                         const std::vector<LocalPackRestoreCanvas>& canvases);
 
 private:
     LocalToolResult base_call(std::string_view tool, std::string_view arguments_json);
