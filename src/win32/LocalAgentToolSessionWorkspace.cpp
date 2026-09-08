@@ -19,14 +19,19 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace pixelforge::win32 {
 namespace {
+
+std::mutex g_pack_policy_mutex;
+std::unordered_map<AgentTaskController*, std::uint64_t> g_known_pack_tasks;
 
 std::string q(std::string_view text) {
     std::string out = "\"";
@@ -175,6 +180,69 @@ std::vector<PackUiCanvasInfo> parse_pack_summary(std::string_view summary) {
     return out;
 }
 
+std::string animation_summary(const std::vector<PackUiCanvasInfo>& canvases) {
+    std::map<std::string, std::size_t> counts;
+    for (const auto& canvas : canvases)
+        if (canvas.frame >= 0 && !canvas.group.empty()) ++counts[canvas.group];
+    std::string out;
+    for (const auto& [group, count] : counts) {
+        if (!out.empty()) out.push_back('|');
+        out += group + ":" + std::to_string(count);
+    }
+    return out;
+}
+
+bool pack_known_for(AgentTaskController* task, std::uint64_t task_id) {
+    std::lock_guard lock(g_pack_policy_mutex);
+    const auto it = g_known_pack_tasks.find(task);
+    return it != g_known_pack_tasks.end() && it->second == task_id;
+}
+
+void note_pack_for(AgentTaskController* task, std::uint64_t task_id) {
+    std::lock_guard lock(g_pack_policy_mutex);
+    g_known_pack_tasks[task] = task_id;
+}
+
+bool loaded_project_context(const AgentTaskSnapshot& snapshot) {
+    return snapshot.prompt.find("Existing PixelForge project opened") != std::string::npos ||
+           snapshot.status_message.find("Loaded project repair resumed") != std::string::npos;
+}
+
+void add_pack_failure_recovery(LocalToolResult& result, std::string_view action) {
+    if (result.success) return;
+    const auto has = [&](std::string_view token) { return result.text.find(token) != std::string::npos; };
+    if (has("\"error\":\"unknown_canvas\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"The requested canvas name does not exist. No change was applied by this failed call. Call pixelforge_pack list, copy an exact returned canvas name, then retry. Do not assume names from a failed create/copy exist.\"");
+    } else if (has("\"error\":\"render_failed\"") || has("\"error\":\"empty_selection\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"No canvases matched the requested canvas/canvases/group selector. Call pixelforge_pack list and retry with exact existing names or an existing group. This failure does not modify the pack.\"");
+    } else if (has("\"error\":\"primary_canvas_size_mismatch\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"The primary canvas already contains artwork at another size. No replacement pack was created. Preserve the current pack/canvas and edit it, or intentionally replace an existing pack only with replace_existing=true after inspecting it.\"");
+    } else if (has("\"error\":\"size_mismatch\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"clone requires source and destination canvases to have identical dimensions. Use copy with an explicit region for different-size canvases, or choose same-size canvases returned by list.\"");
+    } else if (has("\"error\":\"copy_out_of_bounds\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"The requested copy rectangle does not fit both source and destination. Inspect/list the canvas dimensions, reduce width/height or adjust sx/sy/dx/dy, then retry.\"");
+    } else if (has("\"error\":\"invalid_program\"") || has("\"error\":\"edit_rejected\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"The drawing pass was rejected. Read the message for the exact syntax/bounds problem, fix that operation, and retry the same existing canvas. Do not create a replacement pack to recover from a drawing error.\"");
+    } else if (has("\"error\":\"invalid_state\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"Refresh pixelforge_task get and follow the reported task state. Pack edits require an accepted active task; view/inspect/export may remain available after finish.\"");
+    } else if (has("\"error\":\"pack_not_created\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"There is no pack for this task. For a genuinely new multi-canvas task, create one pack once. For a loaded project, do not invent a replacement; refresh task/list because the restored pack should already exist.\"");
+    } else {
+        add_member(result.text,
+            ",\"recovery\":\"Do not chain guesses after a failed tool call. Read the error, refresh pixelforge_task get or pixelforge_pack list when state/names may be stale, then retry only with corrected arguments.\"");
+    }
+    if (action == "create")
+        add_member(result.text, ",\"no_new_canvases_created\":true");
+}
+
 std::string base64_encode_ws(const std::vector<std::uint8_t>& bytes) {
     static constexpr char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -278,7 +346,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
     FlatJsonObject args;
     std::string parse_error;
     if (!parse_flat_json_object(arguments_json.empty() ? "{}" : arguments_json, args, parse_error))
-        return {false, "{\"ok\":false,\"error\":\"invalid_arguments\"}"};
+        return {false, "{\"ok\":false,\"error\":\"invalid_arguments\",\"message\":\"Arguments must be a valid JSON object matching the tool schema. Fix the malformed arguments; do not retry unchanged.\"}"};
 
     auto workspace_root = [&]() {
         std::filesystem::path recordings(record_bindings_.recording_directory);
@@ -362,13 +430,13 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
 
     if (tool == "pixelforge_dialog") {
         const auto task_id = args.get_i64("task_id");
-        if (!task_id) return {false, "{\"ok\":false,\"error\":\"task_id_required\"}"};
+        if (!task_id) return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
         const std::string reason = args.get("reason"), question = args.get("question"), suggestions = args.get("suggestions");
         std::string state_error;
         {
             std::lock_guard lock(*bindings_.state_mutex);
             if (bindings_.task->snapshot().id != static_cast<std::uint64_t>(*task_id))
-                return {false, "{\"ok\":false,\"error\":\"stale_task\"}"};
+                return {false, "{\"ok\":false,\"error\":\"stale_task\",\"message\":\"The task id changed. Call pixelforge_task get and retry against the returned task_id.\"}"};
             if (!bindings_.task->request_user_input(reason, question, suggestions, &state_error))
                 return {false, "{\"ok\":false,\"error\":\"dialog_rejected\",\"message\":" + q(state_error) + "}"};
         }
@@ -378,7 +446,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (!agent_interaction_ask_user(reason, question, suggestions, answer, cancelled, ui_error)) {
             std::lock_guard lock(*bindings_.state_mutex);
             bindings_.task->user_answer_input("PixelForge could not open the user dialog.", nullptr);
-            return {false, "{\"ok\":false,\"error\":\"dialog_ui_failed\"}"};
+            return {false, "{\"ok\":false,\"error\":\"dialog_ui_failed\",\"message\":\"PixelForge could not open the user dialog. Do not repeatedly retry it; continue only if the blocked choice can be safely resolved without user input.\"}"};
         }
         {
             std::lock_guard lock(*bindings_.state_mutex);
@@ -391,16 +459,16 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
 
     if (tool == "pixelforge_reference") {
         const auto task_id = args.get_i64("task_id");
-        if (!task_id) return {false, "{\"ok\":false,\"error\":\"task_id_required\"}"};
+        if (!task_id) return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
         {
             std::lock_guard lock(*bindings_.state_mutex);
             if (bindings_.task->snapshot().id != static_cast<std::uint64_t>(*task_id))
-                return {false, "{\"ok\":false,\"error\":\"stale_task\"}"};
+                return {false, "{\"ok\":false,\"error\":\"stale_task\",\"message\":\"The task id changed. Call pixelforge_task get and retry against the returned task_id.\"}"};
         }
         const std::string reference = args.get("reference"), action = args.get("action");
         ImageData image;
         if (!get_reference(bindings_, reference, image))
-            return {false, "{\"ok\":false,\"error\":\"reference_unavailable\"}"};
+            return {false, "{\"ok\":false,\"error\":\"reference_unavailable\",\"message\":\"That reference role is not currently loaded. Do not retry unchanged; use another available reference role or continue without it.\"}"};
         if (action == "palette") {
             const auto n = static_cast<std::size_t>(std::clamp<std::int64_t>(args.get_i64("max_colors").value_or(20), 1, 256));
             std::size_t unique = 0;
@@ -414,9 +482,9 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             {
                 std::lock_guard lock(*bindings_.state_mutex);
                 if (bindings_.task->snapshot().state != TaskState::Accepted)
-                    return {false, "{\"ok\":false,\"error\":\"task_not_accepted\"}"};
+                    return {false, "{\"ok\":false,\"error\":\"task_not_accepted\",\"message\":\"Reference seeding requires an accepted active task. Refresh pixelforge_task get before retrying.\"}"};
                 if (!seed_document(*bindings_.document, image, error))
-                    return {false, "{\"ok\":false,\"error\":\"seed_failed\",\"message\":" + q(error) + "}"};
+                    return {false, "{\"ok\":false,\"error\":\"seed_failed\",\"message\":" + q(error + " Seed only into a same-size accepted canvas; otherwise use the reference visually rather than retrying unchanged.") + "}"};
                 observed_revision_ = bindings_.document->revision();
                 has_observed_revision_ = true;
             }
@@ -433,7 +501,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                           ",\"height\":" + std::to_string(image.height) + ",\"observation\":\"source:image\"}",
                     std::move(png), "image/png"};
         }
-        return {false, "{\"ok\":false,\"error\":\"unknown_reference_action\"}"};
+        return {false, "{\"ok\":false,\"error\":\"unknown_reference_action\",\"message\":\"Supported pixelforge_reference actions are view, palette, and seed.\"}"};
     }
 
     if (tool == "pixelforge_task" && args.get("action") == "get") {
@@ -445,6 +513,30 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                                     ",\"source_height\":" + std::to_string(source.height) +
                                     ",\"source_semantics\":\"editable image; seed and modify it unless instructed otherwise\"");
         else add_member(result.text, ",\"source_present\":false");
+
+        AgentTaskSnapshot snapshot;
+        { std::lock_guard lock(*bindings_.state_mutex); snapshot = bindings_.task->snapshot(); }
+        const bool known_pack = snapshot.id != 0 && pack_known_for(bindings_.task, snapshot.id);
+        const bool loaded_project = loaded_project_context(snapshot);
+        if (known_pack || loaded_project) {
+            const auto list = base_call("pixelforge_pack", "{\"action\":\"list\",\"task_id\":" + std::to_string(snapshot.id) + "}");
+            if (list.success) {
+                FlatJsonObject fields; std::string ignored;
+                if (parse_flat_json_object(list.text, fields, ignored)) {
+                    const auto canvases = parse_pack_summary(fields.get("canvases"));
+                    const auto animations = animation_summary(canvases);
+                    std::size_t animation_group_count = animations.empty() ? 0u : 1u;
+                    animation_group_count += static_cast<std::size_t>(std::count(animations.begin(), animations.end(), '|'));
+                    add_member(result.text,
+                        ",\"pack_exists\":true,\"loaded_project\":" + std::string(loaded_project ? "true" : "false") +
+                        ",\"pack_revision\":" + std::to_string(std::max<std::int64_t>(0, fields.get_i64("revision").value_or(0))) +
+                        ",\"pack_canvas_count\":" + std::to_string(canvases.size()) +
+                        ",\"animation_group_count\":" + std::to_string(animation_group_count) +
+                        ",\"animation_groups\":" + q(animations) +
+                        ",\"preserve_existing_by_default\":true,\"pack_create_requires_replace_existing\":true");
+                }
+            }
+        }
         return result;
     }
 
@@ -460,7 +552,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             const auto requested_w = args.get_i64("width");
             const auto requested_h = args.get_i64("height");
             if ((requested_w && *requested_w != source.width) || (requested_h && *requested_h != source.height))
-                return {false, "{\"ok\":false,\"error\":\"source_size_mismatch\",\"message\":\"Exact Source editing starts at Source dimensions. Ask the user with pixelforge_dialog or explicitly set seed_from_source=false if a different size is intentional.\"}"};
+                return {false, "{\"ok\":false,\"error\":\"source_size_mismatch\",\"message\":\"Exact Source editing starts at Source dimensions. Use the Source dimensions, ask the user if a resize is materially required, or explicitly set seed_from_source=false. Retrying the same conflicting dimensions will not work.\"}"};
             if (!args.contains("width")) set_json_integer_member(forwarded, "width", source.width);
             if (!args.contains("height")) set_json_integer_member(forwarded, "height", source.height);
         }
@@ -489,30 +581,54 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
 
     if (tool == "pixelforge_pack" && args.get("action") == "create") {
         const auto task_id_value = args.get_i64("task_id");
+        if (!task_id_value || *task_id_value < 0)
+            return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
+        const auto task_id = static_cast<std::uint64_t>(*task_id_value);
+        const bool replace_existing = args.get_bool("replace_existing").value_or(false);
+        if (pack_known_for(bindings_.task, task_id) && !replace_existing) {
+            auto existing = base_call("pixelforge_pack", "{\"action\":\"list\",\"task_id\":" + std::to_string(task_id) + "}");
+            std::string existing_summary;
+            if (existing.success) {
+                FlatJsonObject fields; std::string ignored;
+                if (parse_flat_json_object(existing.text, fields, ignored))
+                    existing_summary = fields.get("canvases");
+            }
+            return {false,
+                "{\"ok\":false,\"error\":\"workspace_already_exists\",\"existing_pack_intact\":true,\"replacement_applied\":false,"
+                "\"message\":\"This task already has a canvas pack. pixelforge_pack create replaces the complete pack and is therefore blocked by default. Inspect/list and edit the existing canvases. Only set replace_existing=true after deliberately deciding that the entire existing pack should be discarded.\","
+                "\"recovery\":\"Call pixelforge_pack list and continue with program/edit/clone/copy/view on exact existing canvas names. A blocked create creates no new canvas names, so do not reference names from that failed create.\","
+                "\"existing_canvases\":" + q(existing_summary) + "}"};
+        }
+
         ImageData source; std::wstring path;
         const bool seed_source = agent_interaction_source_snapshot(source, path) && !flag_false(args, "seed_from_source");
         auto result = base_call(tool, arguments_json);
-        if (!result.success || !seed_source) {
-            if (result.success && task_id_value) refresh_pack(static_cast<std::uint64_t>(*task_id_value));
+        if (!result.success) {
+            add_pack_failure_recovery(result, "create");
+            return result;
+        }
+        note_pack_for(bindings_.task, task_id);
+        if (!seed_source) {
+            refresh_pack(task_id);
             return result;
         }
         std::string error;
         {
             std::lock_guard lock(*bindings_.state_mutex);
             if (bindings_.document->width() != source.width || bindings_.document->height() != source.height)
-                return {false, "{\"ok\":false,\"error\":\"source_size_mismatch\",\"message\":\"The first pack canvas must match Source dimensions when Source seeding is enabled. Ask the user or set seed_from_source=false if a different layout is intentional.\"}"};
+                return {false, "{\"ok\":false,\"error\":\"source_size_mismatch\",\"pack_created\":true,\"message\":\"The pack was created, but automatic Source seeding could not run because the first canvas dimensions do not match Source. Do not call create again. Continue with the existing pack, or explicitly repair/replace it if the size choice was intentional.\"}"};
             if (!seed_document(*bindings_.document, source, error))
-                return {false, "{\"ok\":false,\"error\":\"source_seed_failed\",\"message\":" + q(error) + "}"};
+                return {false, "{\"ok\":false,\"error\":\"source_seed_failed\",\"pack_created\":true,\"message\":" + q(error + " The pack already exists; do not call create again to recover.") + "}"};
         }
         add_member(result.text, ",\"primary_seeded_from\":\"source\"");
-        if (task_id_value) refresh_pack(static_cast<std::uint64_t>(*task_id_value));
+        refresh_pack(task_id);
         return result;
     }
 
     if (tool == "pixelforge_pack") {
         const auto task_id_value = args.get_i64("task_id");
         if (!task_id_value || *task_id_value < 0)
-            return {false, "{\"ok\":false,\"error\":\"task_id_required\"}"};
+            return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
         const auto task_id = static_cast<std::uint64_t>(*task_id_value);
         const std::string action = args.get("action");
 
@@ -521,8 +637,9 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             if (!args.get("dest").empty()) dests.push_back(args.get("dest"));
             for (const auto& d : split_keep_empty_ws(args.get("dests"), '|'))
                 if (!d.empty() && std::find(dests.begin(), dests.end(), d) == dests.end()) dests.push_back(d);
-            if (dests.empty()) return {false, "{\"ok\":false,\"error\":\"dest_required\"}"};
+            if (dests.empty()) return {false, "{\"ok\":false,\"error\":\"dest_required\",\"message\":\"Provide dest or a | separated dests list using exact canvas names returned by pixelforge_pack list.\"}"};
             std::size_t changed_total = 0;
+            std::vector<std::string> completed;
             for (const auto& dest : dests) {
                 std::string request = "{\"action\":" + q(action) + ",\"task_id\":" + std::to_string(task_id) +
                     ",\"source\":" + q(args.get("source")) + ",\"dest\":" + q(dest);
@@ -533,13 +650,20 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                 }
                 request += "}";
                 auto one = base_call(tool, request);
-                if (!one.success)
+                if (!one.success) {
+                    add_pack_failure_recovery(one, action);
                     return {false, "{\"ok\":false,\"error\":\"multi_dest_failed\",\"dest\":" + q(dest) +
-                                   ",\"message\":" + q(one.text) + "}"};
+                                   ",\"completed_dests\":" + q(join_pipe(completed)) +
+                                   ",\"partial_success\":" + std::string(completed.empty() ? "false" : "true") +
+                                   ",\"message\":" + q(one.text) +
+                                   ",\"recovery\":\"Some earlier destinations may already have changed. Inspect the listed completed_dests; use pack history undo if you want to roll back the whole artistic pass, then correct the failing destination/name/bounds before retrying.\"}"};
+                }
+                completed.push_back(dest);
                 FlatJsonObject one_fields; std::string ignored;
                 if (parse_flat_json_object(one.text, one_fields, ignored))
                     changed_total += static_cast<std::size_t>(std::max<std::int64_t>(0, one_fields.get_i64("changed_pixels").value_or(0)));
             }
+            note_pack_for(bindings_.task, task_id);
             refresh_pack(task_id);
             return {true, "{\"ok\":true,\"action\":" + q(action) + ",\"dest_count\":" + std::to_string(dests.size()) +
                           ",\"changed_pixels\":" + std::to_string(changed_total) + ",\"dests\":" + q(join_pipe(dests)) + "}"};
@@ -566,7 +690,11 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         }
 
         auto result = base_call(tool, forwarded);
-        if (!result.success) return result;
+        if (!result.success) {
+            add_pack_failure_recovery(result, action);
+            return result;
+        }
+        if (action == "list") note_pack_for(bindings_.task, task_id);
 
         if (timeline) {
             add_member(result.text, ",\"requested_mode\":\"timeline\",\"temporal_review\":true,\"message\":\"Ordered frames are shown left-to-right for model-visible motion review.\"");
@@ -585,8 +713,10 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             add_member(result.text, ",\"requested_scale\":" + std::to_string(requested_scale) +
                                     ",\"actual_gif_scale\":8,\"warning\":\"GIF preview scale is capped at 8x; use strip/timeline up to 16x for model inspection.\"");
 
-        if (action == "program" || action == "edit" || action == "clone" || action == "copy" || action == "history")
+        if (action == "program" || action == "edit" || action == "clone" || action == "copy" || action == "history") {
+            note_pack_for(bindings_.task, task_id);
             refresh_pack(task_id);
+        }
         return result;
     }
 
@@ -612,11 +742,26 @@ std::string pixelforge_dynamic_tools_json() {
 )JSON");
 
     replace_once(tools,
+        "Create and work on an arbitrary set of sprite canvases inside one task.",
+        "Work with an arbitrary set of sprite canvases inside one task. IMPORTANT: call list before modifying a loaded/existing project. create is for initializing a genuinely new pack; if a pack already exists it is destructive and is blocked unless replace_existing=true. Never assume a failed create/copy produced canvas names.");
+    replace_once(tools,
         "\"mode\":{\"type\":\"string\",\"enum\":[\"canvas\",\"sheet\",\"strip\",\"animation\"]}",
-        "\"mode\":{\"type\":\"string\",\"enum\":[\"canvas\",\"sheet\",\"strip\",\"timeline\",\"animation\"]}");
+        "\"mode\":{\"type\":\"string\",\"enum\":[\"canvas\",\"sheet\",\"strip\",\"timeline\",\"animation\"],\"description\":\"canvas=one detailed canvas; sheet=grid comparison; strip/timeline=ordered frame comparison; animation=motion review. Select only existing canvas/group names returned by list.\"}");
+    replace_once(tools,
+        "\"canvases\":{\"type\":\"string\"}",
+        "\"canvases\":{\"type\":\"string\",\"description\":\"For create: name,group,width,height,frame entries separated by |. For view/export: exact existing canvas names separated by |. On an existing project, call list first and do not reuse this field to recreate the pack.\"},\"replace_existing\":{\"type\":\"boolean\",\"description\":\"DESTRUCTIVE opt-in for create when a pack already exists. Default false. Set true only after inspecting the existing pack and intentionally deciding to discard and replace the complete workspace.\"}");
+    replace_once(tools,
+        "\"canvas\":{\"type\":\"string\"}",
+        "\"canvas\":{\"type\":\"string\",\"description\":\"Exact existing canvas name returned by pixelforge_pack list. If unknown_canvas occurs, list again; do not guess names.\"}");
+    replace_once(tools,
+        "\"group\":{\"type\":\"string\"}",
+        "\"group\":{\"type\":\"string\",\"description\":\"Exact existing group name from pixelforge_pack list. Animation groups are canvases sharing this group with non-negative frame numbers.\"}");
+    replace_once(tools,
+        "\"source\":{\"type\":\"string\"}",
+        "\"source\":{\"type\":\"string\",\"description\":\"Exact source canvas name returned by list for clone/copy.\"}");
     replace_once(tools,
         "\"dest\":{\"type\":\"string\"}",
-        "\"dest\":{\"type\":\"string\"},\"dests\":{\"type\":\"string\",\"description\":\"Optional | separated destination canvases for clone/copy so one call can distribute a base frame or region to many canvases.\"}");
+        "\"dest\":{\"type\":\"string\",\"description\":\"Exact destination canvas name returned by list.\"},\"dests\":{\"type\":\"string\",\"description\":\"Optional | separated exact destination canvas names for clone/copy so one call can distribute a base frame or region to many existing canvases. Multi-destination calls may partially succeed before one destination fails; inspect completed_dests in the error.\"}");
     return tools;
 }
 
