@@ -28,6 +28,20 @@ if(WIN32)
         "bytes.push_back(0x09); // GIF disposal=2 (restore background) + transparency"
         PIXELFORGE_MULTI_CANVAS_TEXT
         "${PIXELFORGE_MULTI_CANVAS_TEXT}")
+
+    # LIST is observational. The legacy fallback silently materialized a one-canvas
+    # pack when LIST was called before CREATE, which could then confuse lifecycle
+    # protection. Make the generated production/test source return a clear read-only
+    # error instead; a genuinely new multi-canvas task must explicitly CREATE once.
+    string(REPLACE
+[=[    auto workspace_it = g_pack_workspaces.find(bindings_.task);]=]
+[=[    auto workspace_it = g_pack_workspaces.find(bindings_.task);
+    if (workspace_it == g_pack_workspaces.end() && action == "LIST") {
+        return {false, "{\"ok\":false,\"error\":\"pack_not_created\",\"message\":\"No multi-canvas pack exists yet. LIST is read-only and does not create one. For a genuinely new multi-canvas task, call CREATE once; for a loaded project, refresh task state because its restored pack should already exist.\"}"};
+    }]=]
+        PIXELFORGE_MULTI_CANVAS_TEXT
+        "${PIXELFORGE_MULTI_CANVAS_TEXT}")
+
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
     set(PIXELFORGE_MULTI_CANVAS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/MultiCanvasTool.cpp")
     file(WRITE "${PIXELFORGE_MULTI_CANVAS_SOURCE}" "${PIXELFORGE_MULTI_CANVAS_TEXT}")
