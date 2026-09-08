@@ -7,6 +7,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -84,6 +85,8 @@ std::vector<std::pair<RECT, int>> g_frame_hits;
 RECT g_play_rect{};
 RECT g_prev_group_rect{};
 RECT g_next_group_rect{};
+RECT g_fps_down_rect{};
+RECT g_fps_up_rect{};
 
 std::wstring utf8_to_wide_ui(std::string_view text) {
     if (text.empty()) return {};
@@ -379,16 +382,22 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     g_prev_group_rect = {18, 48, 84, 78};
     g_play_rect = {92, 48, 184, 78};
     g_next_group_rect = {192, 48, 258, 78};
+    g_fps_down_rect = {270, 48, 304, 78};
+    g_fps_up_rect = {382, 48, 416, 78};
     fill_rect_ui(dc, g_prev_group_rect, RGB(37, 45, 49));
     fill_rect_ui(dc, g_play_rect, RGB(37, 45, 49));
     fill_rect_ui(dc, g_next_group_rect, RGB(37, 45, 49));
+    fill_rect_ui(dc, g_fps_down_rect, RGB(37, 45, 49));
+    fill_rect_ui(dc, g_fps_up_rect, RGB(37, 45, 49));
     text_ui(dc, 35, 55, L"Prev");
     text_ui(dc, 110, 55, state.playing ? L"Pause" : L"Play");
     text_ui(dc, 210, 55, L"Next");
-    std::wstring timing = std::to_wstring(state.fps) + L" FPS   frame " +
-                          std::to_wstring(frames[static_cast<std::size_t>(frame_index)].frame);
+    text_ui(dc, 281, 55, L"-");
+    text_ui(dc, 312, 55, std::to_wstring(state.fps) + L" FPS", RGB(190, 204, 208));
+    text_ui(dc, 393, 55, L"+");
+    std::wstring timing = L"frame " + std::to_wstring(frames[static_cast<std::size_t>(frame_index)].frame);
     if (state.animation_refresh_pending) timing += L"   waiting for canvas drawing";
-    text_ui(dc, 276, 55, timing, RGB(170, 180, 184));
+    text_ui(dc, 430, 55, timing, RGB(170, 180, 184));
 
     const auto current = state.animation_snapshots.find(frames[static_cast<std::size_t>(frame_index)].name);
     if (current != state.animation_snapshots.end() && current->second.valid()) {
@@ -516,7 +525,7 @@ LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
         case WM_CREATE:
-            SetTimer(hwnd, PACK_TIMER, 30, nullptr);
+            SetTimer(hwnd, PACK_TIMER, 8, nullptr);
             return 0;
         case WM_TIMER:
             if (wparam == PACK_TIMER) {
@@ -542,7 +551,7 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                     if (g_ui.tab == TAB_ANIMATION && g_ui.playing) {
                         const auto frames = animation_frames(g_ui, g_ui.selected_group);
                         if (!frames.empty()) {
-                            const ULONGLONG interval = static_cast<ULONGLONG>(1000 / std::max(1, g_ui.fps));
+                            const ULONGLONG interval = std::max<ULONGLONG>(1, 1000ull / static_cast<ULONGLONG>(std::max(1, g_ui.fps)));
                             if (now - g_ui.last_frame_tick >= interval) {
                                 g_ui.animation_frame = (g_ui.animation_frame + 1) % static_cast<int>(frames.size());
                                 g_ui.last_frame_tick = now;
@@ -580,6 +589,12 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 const auto groups = animation_groups(g_ui);
                 if (PtInRect(&g_play_rect, p)) {
                     g_ui.playing = !g_ui.playing;
+                    g_ui.last_frame_tick = GetTickCount64();
+                } else if (PtInRect(&g_fps_down_rect, p)) {
+                    g_ui.fps = std::max(1, g_ui.fps - 1);
+                    g_ui.last_frame_tick = GetTickCount64();
+                } else if (PtInRect(&g_fps_up_rect, p)) {
+                    if (g_ui.fps < INT_MAX) ++g_ui.fps;
                     g_ui.last_frame_tick = GetTickCount64();
                 } else if (!groups.empty() && (PtInRect(&g_prev_group_rect, p) || PtInRect(&g_next_group_rect, p))) {
                     auto it = std::find(groups.begin(), groups.end(), g_ui.selected_group);
