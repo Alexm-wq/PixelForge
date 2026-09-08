@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include <cwchar>
+#include <initializer_list>
 
 namespace {
 
