@@ -86,13 +86,11 @@ int main() {
         width, height, blank);
     CHECK(result.ok && result.commands == 4 && result.patch_operations > 0);
     auto pixels = apply_patch(blank, width, result.patch);
-    CHECK(pixels[0] == 0xFFFFFFFFu);                         // diagonal outside outline
-    CHECK(pixels[1 * width + 1] == 0xFF8090A0u);            // lit NW edge
-    CHECK(pixels[6 * width + 6] == 0xFF203040u);            // SE shadow
-    CHECK(pixels[3 * width + 3] == 0xFF405060u);            // middle band
+    CHECK(pixels[0] == 0xFFFFFFFFu);
+    CHECK(pixels[1 * width + 1] == 0xFF8090A0u);
+    CHECK(pixels[6 * width + 6] == 0xFF203040u);
+    CHECK(pixels[3 * width + 3] == 0xFF405060u);
 
-    // Texture passes are deterministic. DITHER only replaces its source color,
-    // so cluster colors survive when dithering follows CLUSTERS.
     const std::string textured =
         "MASKPOLY tissue 1 1 6 1 6 6 1 6\n"
         "FILLMASK tissue #FF223344\n"
@@ -105,8 +103,6 @@ int main() {
     CHECK(count_color(pixels, 0xFF556677u) + count_color(pixels, 0xFF778899u) > 0);
     CHECK(count_color(pixels, 0xFF334455u) > 0);
 
-    // Exact source colors can be matched against pixels that existed before the
-    // program call, not only colors written earlier in the same program.
     const std::vector<std::uint32_t> black(width * height, 0xFF000000u);
     result = compile_pixel_program(
         "MASKRECT all 0 0 8 8;DITHER all #FF000000 #FFFFFFFF 0.5 BAYER 0",
@@ -135,6 +131,25 @@ int main() {
 
     result = compile_pixel_program("MASKRECT m 0 0 8 8;CLUSTERS m #FFFFFFFF 1.5 1 3 1", width, height, blank);
     CHECK(!result.ok && result.error.find("density") != std::string::npos);
+
+    // Whole-animation passes must not fail because one frame uses more than the
+    // old arbitrary 64-mask compiler ceiling. Keep all 160 masks live at once and
+    // then consume the last one.
+    std::string many_masks;
+    for (int i = 0; i < 160; ++i) {
+        many_masks += "MASKRECT mask_" + std::to_string(i) + " 0 0 8 8\n";
+    }
+    many_masks += "FILLMASK mask_159 #FFABCDEF\n";
+    result = compile_pixel_program(many_masks, width, height, blank);
+    CHECK(result.ok);
+    pixels = apply_patch(blank, width, result.patch);
+    CHECK(count_color(pixels, 0xFFABCDEFu) == static_cast<std::size_t>(width * height));
+
+    // Cluster size is an artistic parameter, not a hand-picked compiler ceiling.
+    result = compile_pixel_program(
+        "MASKRECT huge_cluster 0 0 8 8;CLUSTERS huge_cluster #FFFFFFFF 1 1 1024 7",
+        width, height, blank);
+    CHECK(result.ok);
 
     std::cout << "PixelProgram high-level raster operations passed.\n";
     return 0;
