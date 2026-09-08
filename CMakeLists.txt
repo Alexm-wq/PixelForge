@@ -26,6 +26,7 @@ if(WIN32)
         src/win32/LocalAgentToolSessionWorkspace.cpp
         src/win32/MultiCanvasTool.cpp
         src/win32/PackWorkspaceUi.cpp
+        src/win32/ProjectLoader.cpp
         src/win32/PixelProgram.cpp
         src/win32/SessionRecorder.cpp
         src/win32/RecordMcpServerRestricted.cpp
