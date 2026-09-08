@@ -27,10 +27,7 @@ ImageData two_color_image(std::uint32_t left_argb, std::uint32_t right_argb) {
         out.bgra[static_cast<std::size_t>(i) * 4u + 2] = static_cast<std::uint8_t>((argb >> 16) & 0xffu);
         out.bgra[static_cast<std::size_t>(i) * 4u + 3] = static_cast<std::uint8_t>((argb >> 24) & 0xffu);
     };
-    write(0, left_argb);
-    write(1, left_argb);
-    write(2, left_argb);
-    write(3, right_argb);
+    write(0, left_argb); write(1, left_argb); write(2, left_argb); write(3, right_argb);
     return out;
 }
 
@@ -100,7 +97,12 @@ int main() {
         auto source_view = h.tools.call("pixelforge_reference",
             "{\"action\":\"view\",\"task_id\":" + std::to_string(id) +
             ",\"reference\":\"source\"}");
-        CHECK(source_view.success && !source_view.image_base64.empty());
+        CHECK(source_view.success);
+        CHECK(source_view.text.find("\"reference\":\"source\"") != std::string::npos);
+
+        auto render = h.tools.call("pixelforge_view",
+            "{\"action\":\"render\",\"task_id\":" + std::to_string(id) + ",\"scale\":4}");
+        CHECK(render.success && !render.image_base64.empty());
 
         auto palette = h.tools.call("pixelforge_reference",
             "{\"action\":\"palette\",\"task_id\":" + std::to_string(id) +
@@ -132,6 +134,7 @@ int main() {
         CHECK(!h.task.awaiting_user_input());
     }
 
+    // Clearing Source after a completed session must not touch destroyed task state.
     agent_interaction_set_source_for_testing({}, {});
     {
         Harness h;
