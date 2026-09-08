@@ -35,6 +35,14 @@ int main() {
     const auto id = task.begin("Build a three-frame walk cycle");
     const auto id_text = std::to_string(id);
 
+    // LIST must never create a hidden fallback pack. A new pack requires an
+    // explicit CREATE, while loaded projects already have their restored pack.
+    auto before_create = tools.call("pixelforge_pack",
+        "{\"action\":\"list\",\"task_id\":" + id_text + "}");
+    CHECK(!before_create.success);
+    CHECK(before_create.text.find("\"error\":\"pack_not_created\"") != std::string::npos);
+    CHECK(before_create.text.find("LIST is read-only") != std::string::npos);
+
     auto created = tools.call("pixelforge_pack",
         "{\"action\":\"create\",\"task_id\":" + id_text +
         ",\"canvases\":\"walk_00,walk,8,8,0|walk_01,walk,8,8,1|walk_02,walk,8,8,2\"}");
