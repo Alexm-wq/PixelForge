@@ -32,10 +32,9 @@ struct LocalToolResult {
     std::string image_mime;
 };
 
-// Host-only project reconstruction payload. This is deliberately not part of
-// the agent tool schema: opening a project is a user/UI operation, not something
-// Astra should be able to invoke. Patches are the already-decoded native canvas
-// pixels encoded in PixelForge's compact exact-pixel grammar.
+// Host-only project reconstruction payload. Opening a project is a user/UI
+// operation, not an agent tool. The patches are exact native-resolution pixels
+// already decoded from the saved PNGs.
 struct LocalPackRestoreCanvas {
     std::string name;
     std::vector<std::string> patches;
@@ -52,12 +51,12 @@ public:
     void stop();
     LocalToolResult call(std::string_view tool, std::string_view arguments_json);
 
-    // Trusted UI-only restore path. It bypasses the agent-facing workspace
-    // wrapper so loading N saved canvases does not autosave/re-export/re-publish
-    // the complete pack after every restored patch. The finished pack is returned
-    // as one list snapshot; ProjectLoader publishes it once after reconstruction.
+    // Trusted UI-only restore path. It bypasses the normal agent-facing wrapper
+    // so loading N saved canvases does not autosave/re-export/re-publish the
+    // entire pack N times. The finished restored workspace is published once.
     LocalToolResult restore_project_pack(std::string_view create_arguments_json,
-                                         const std::vector<LocalPackRestoreCanvas>& canvases);
+                                         const std::vector<LocalPackRestoreCanvas>& canvases,
+                                         std::wstring project_directory);
 
 private:
     LocalToolResult base_call(std::string_view tool, std::string_view arguments_json);
