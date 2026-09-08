@@ -109,23 +109,40 @@ int main() {
     auto inspected = tools.call("pixelforge_pack",
         "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":0,\"y\":0,\"width\":8,\"height\":8}");
     CHECK(inspected.success && inspected.text.find("\"canvas\":\"walk_01\"") != std::string::npos);
+    CHECK(inspected.text.find("\"clipped\":false") != std::string::npos);
 
-    auto bad_inspect = tools.call("pixelforge_pack",
-        "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":7,\"y\":7,\"width\":8,\"height\":8}");
-    CHECK(!bad_inspect.success);
-    CHECK(bad_inspect.text.find("\"error\":\"inspect_region_invalid\"") != std::string::npos);
-    CHECK(bad_inspect.text.find("\"reason\":\"out_of_bounds\"") != std::string::npos);
-    CHECK(bad_inspect.text.find("\"canvas_width\":8") != std::string::npos);
-    CHECK(bad_inspect.text.find("\"requested_x\":7") != std::string::npos);
-    CHECK(bad_inspect.text.find("\"max_area\":4096") != std::string::npos);
+    // Oversized/out-of-bounds inspection is best-effort: clip and succeed instead
+    // of consuming the model's consecutive-failure budget.
+    auto clipped_inspect = tools.call("pixelforge_pack",
+        "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":7,\"y\":7,\"width\":800,\"height\":800}");
+    CHECK(clipped_inspect.success);
+    CHECK(clipped_inspect.text.find("\"clipped\":true") != std::string::npos);
+    CHECK(clipped_inspect.text.find("\"x\":7") != std::string::npos);
+    CHECK(clipped_inspect.text.find("\"y\":7") != std::string::npos);
+    CHECK(clipped_inspect.text.find("\"width\":1") != std::string::npos);
+    CHECK(clipped_inspect.text.find("\"height\":1") != std::string::npos);
+    CHECK(clipped_inspect.text.find("max_area") == std::string::npos);
+
+    // COPY uses the same best-effort clipping semantics.
+    auto clipped_copy = tools.call("pixelforge_pack",
+        "{\"action\":\"copy\",\"task_id\":" + id_text +
+        ",\"source\":\"walk_00\",\"dest\":\"walk_01\",\"sx\":0,\"sy\":0,\"width\":80,\"height\":80,\"dx\":0,\"dy\":0}");
+    CHECK(clipped_copy.success);
+    CHECK(clipped_copy.text.find("\"clipped\":true") != std::string::npos);
+    CHECK(clipped_copy.text.find("\"width\":8") != std::string::npos);
+    CHECK(clipped_copy.text.find("\"height\":8") != std::string::npos);
 
     auto undone = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"undo\"}");
     CHECK(undone.success);
+    // Undo the clipped copy first, then the original program pass.
+    auto undone_program = tools.call("pixelforge_pack",
+        "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"undo\"}");
+    CHECK(undone_program.success);
     CHECK(document.pixel(1, 1) == 0x00000000u);
-    auto redone = tools.call("pixelforge_pack",
+    auto redone_program = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"redo\"}");
-    CHECK(redone.success);
+    CHECK(redone_program.success);
     CHECK(document.pixel(1, 1) == 0xFFFF0000u);
 
     const auto autosave_root = output_dir.parent_path() / "projects" / ("task_" + id_text);
