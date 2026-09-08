@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <utility>
 
 namespace pixelforge {
@@ -14,15 +16,16 @@ bool PixelDocument::can_resize(int width, int height, std::string* reason) const
         return false;
     }
     if (width > limits_.max_width || height > limits_.max_height) {
-        if (reason) {
-            *reason = "Canvas exceeds PixelForge hard limit of " +
-                std::to_string(limits_.max_width) + "x" + std::to_string(limits_.max_height) + ".";
-        }
+        if (reason) *reason = "Canvas dimensions exceed the explicitly configured host limits.";
         return false;
     }
     const auto pixels = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
     if (pixels > limits_.max_pixels) {
-        if (reason) *reason = "Canvas exceeds PixelForge maximum pixel count.";
+        if (reason) *reason = "Canvas pixel count exceeds the explicitly configured host limit.";
+        return false;
+    }
+    if (pixels > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t))) {
+        if (reason) *reason = "Canvas is too large to represent in this process address space.";
         return false;
     }
     return true;
@@ -30,9 +33,20 @@ bool PixelDocument::can_resize(int width, int height, std::string* reason) const
 
 bool PixelDocument::resize(int width, int height, std::string* reason) {
     if (!can_resize(width, height, reason)) return false;
+    const auto count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    std::vector<std::uint32_t> replacement;
+    try {
+        replacement.assign(count, 0x00000000u);
+    } catch (const std::bad_alloc&) {
+        if (reason) *reason = "Not enough memory to allocate the requested canvas.";
+        return false;
+    } catch (const std::length_error&) {
+        if (reason) *reason = "Requested canvas exceeds the vector representation supported by this runtime.";
+        return false;
+    }
     width_ = width;
     height_ = height;
-    pixels_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_), 0x00000000u);
+    pixels_ = std::move(replacement);
     ++revision_;
     clear_history();
     return true;
