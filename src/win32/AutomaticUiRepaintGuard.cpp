@@ -14,7 +14,7 @@ HHOOK g_attach_hook = nullptr;
 
 bool is_automatic_window(HWND hwnd) {
     wchar_t class_name[96]{};
-    if (!GetClassNameW(hwnd, class_name, static_cast<int>(std::size(class_name)))) return false;
+    if (!GetClassNameW(hwnd, class_name, 96)) return false;
     return std::wcscmp(class_name, L"PixelForgeAutomaticWindow") == 0;
 }
 
