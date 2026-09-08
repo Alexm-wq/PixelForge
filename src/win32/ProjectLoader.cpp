@@ -179,6 +179,47 @@ std::vector<std::string> encode_patch_chunks(const ImageData& image) {
     return chunks;
 }
 
+bool copy_project_tree(const std::filesystem::path& source,
+                       const std::filesystem::path& destination,
+                       std::wstring& error) {
+    std::error_code ec;
+    if (std::filesystem::exists(destination, ec)) {
+        ec.clear();
+        if (std::filesystem::equivalent(source, destination, ec) && !ec) return true;
+        ec.clear();
+        std::filesystem::remove_all(destination, ec);
+        if (ec) {
+            error = L"Could not clear the PixelForge working project directory.";
+            return false;
+        }
+    }
+    std::filesystem::create_directories(destination, ec);
+    if (ec) {
+        error = L"Could not create the PixelForge working project directory.";
+        return false;
+    }
+
+    for (std::filesystem::recursive_directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto relative = std::filesystem::relative(it->path(), source, ec);
+        if (ec) break;
+        const auto target = destination / relative;
+        if (it->is_directory(ec)) {
+            ec.clear();
+            std::filesystem::create_directories(target, ec);
+        } else if (it->is_regular_file(ec)) {
+            ec.clear();
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (!ec) std::filesystem::copy_file(it->path(), target, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+        if (ec) break;
+    }
+    if (ec) {
+        error = L"Could not copy the saved project into PixelForge's working directory.";
+        return false;
+    }
+    return true;
+}
+
 bool parse_manifest(const std::filesystem::path& manifest,
                     std::uint64_t& task_id,
                     std::vector<SavedCanvas>& canvases,
@@ -315,47 +356,49 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
     std::vector<SavedCanvas> canvases;
     if (!parse_manifest(manifest, restored_task_id, canvases, error)) return false;
 
+    const auto active_directory = std::filesystem::path(repo_root) / L"projects" /
+                                  (L"task_" + std::to_wstring(restored_task_id));
+    if (!copy_project_tree(manifest.parent_path(), active_directory, error)) return false;
+
     {
         std::lock_guard lock(state_mutex);
-        if (task.state() == TaskState::Accepted) task.abort("Existing task replaced by a project opened by the user.", nullptr);
+        if (task.state() == TaskState::Accepted)
+            task.abort("Existing task replaced by a project opened by the user.", nullptr);
         task.set_next_task_id_for_restore(restored_task_id);
         const auto actual = task.begin(loaded_project_prompt(canvases));
         if (actual != restored_task_id) {
             error = L"Could not restore the project's workspace id.";
             return false;
         }
+
+        // Project loading is a cold restore, not an artistic edit. Clear/resize
+        // the live primary document immediately; saved pixels are restored below
+        // without feeding the normal slow drawing presentation loop.
+        std::string resize_error;
+        if (!primary.resize(canvases.front().width, canvases.front().height, &resize_error)) {
+            error = L"Could not prepare the primary canvas for project restore: " + utf8_to_wide_project(resize_error);
+            return false;
+        }
     }
+
+    std::vector<LocalPackRestoreCanvas> restore_canvases;
+    restore_canvases.reserve(canvases.size());
+    for (const auto& canvas : canvases)
+        restore_canvases.push_back({canvas.name, encode_patch_chunks(canvas.image)});
 
     const std::string create_args = "{\"action\":\"create\",\"task_id\":" + std::to_string(restored_task_id) +
-        ",\"canvases\":" + q(canvas_specs(canvases)) +
-        ",\"seed_from_source\":false,\"replace_existing\":true}";
-    auto created = tools.call("pixelforge_pack", create_args);
-    if (!created.success) {
-        error = L"Could not reconstruct the project's canvas pack: " + utf8_to_wide_project(created.text);
+        ",\"canvases\":" + q(canvas_specs(canvases)) + ",\"seed_from_source\":false}";
+    auto restored = tools.restore_project_pack(create_args, restore_canvases, active_directory.wstring());
+    if (!restored.success) {
+        error = L"Could not reconstruct the project's canvas pack: " + utf8_to_wide_project(restored.text);
         return false;
-    }
-
-    for (const auto& canvas : canvases) {
-        const auto chunks = encode_patch_chunks(canvas.image);
-        for (const auto& patch : chunks) {
-            const std::string edit_args = "{\"action\":\"edit\",\"task_id\":" + std::to_string(restored_task_id) +
-                ",\"canvas\":" + q(canvas.name) + ",\"patch\":" + q(patch) + "}";
-            auto edited = tools.call("pixelforge_pack", edit_args);
-            if (!edited.success) {
-                error = L"Could not restore canvas '" + utf8_to_wide_project(canvas.name) + L"': " + utf8_to_wide_project(edited.text);
-                return false;
-            }
-        }
     }
 
     summary.task_id = restored_task_id;
     summary.canvas_count = canvases.size();
     summary.manifest_path = manifest.wstring();
     summary.source_directory = manifest.parent_path().wstring();
-    summary.active_directory = (std::filesystem::path(repo_root) / L"projects" /
-                                (L"task_" + std::to_wstring(restored_task_id))).wstring();
-
-    (void)primary;
+    summary.active_directory = active_directory.wstring();
     return true;
 }
 
