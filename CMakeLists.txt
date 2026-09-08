@@ -22,7 +22,8 @@ if(WIN32)
         src/win32/PipeBridge.cpp
         src/win32/CodexAppClientDynamic.cpp
         src/win32/CodexSessionTrace.cpp
-        src/win32/LocalAgentToolSession.cpp
+        src/win32/AgentInteractionUi.cpp
+        src/win32/LocalAgentToolSessionEnhanced.cpp
         src/win32/MultiCanvasTool.cpp
         src/win32/PixelProgram.cpp
         src/win32/SessionRecorder.cpp
@@ -35,9 +36,6 @@ if(WIN32)
         mfplat mfreadwrite mfuuid
     )
     target_compile_definitions(PixelForge PRIVATE UNICODE _UNICODE NOMINMAX)
-    # The automatic host reads config/agent_system_prompt.md directly from the
-    # repository at generation time, so copying it beside the executable is
-    # redundant and can fail on Windows if a stale destination is locked.
     add_custom_command(TARGET PixelForge POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/codex.cmd"
@@ -51,6 +49,11 @@ if(BUILD_TESTING)
     add_test(NAME pixelforge_core_tests COMMAND pixelforge_core_tests)
     set_tests_properties(pixelforge_core_tests PROPERTIES TIMEOUT 60)
 
+    add_executable(pixelforge_interaction_core_tests tests/test_interaction_core.cpp)
+    target_link_libraries(pixelforge_interaction_core_tests PRIVATE pixelforge_core)
+    add_test(NAME pixelforge_interaction_core_tests COMMAND pixelforge_interaction_core_tests)
+    set_tests_properties(pixelforge_interaction_core_tests PROPERTIES TIMEOUT 60)
+
     add_executable(pixelforge_pixel_program_tests
         tests/test_pixel_program.cpp
         src/win32/PixelProgram.cpp)
@@ -59,28 +62,40 @@ if(BUILD_TESTING)
     set_tests_properties(pixelforge_pixel_program_tests PROPERTIES TIMEOUT 60)
 
     if(WIN32)
-        add_executable(pixelforge_automatic_tests tests/test_automatic.cpp
-            src/win32/LocalAgentToolSession.cpp src/win32/MultiCanvasTool.cpp src/win32/PixelProgram.cpp
+        set(PIXELFORGE_AUTOMATIC_TOOL_SOURCES
+            src/win32/AgentInteractionUi.cpp
+            src/win32/LocalAgentToolSessionEnhanced.cpp
+            src/win32/MultiCanvasTool.cpp
+            src/win32/PixelProgram.cpp
             src/win32/AgentMcpServerFramed.cpp
-            src/win32/ReferenceResponseLimiter.cpp src/win32/ImageIO.cpp
-            src/win32/SessionRecorder.cpp src/win32/CodexSessionTrace.cpp)
+            src/win32/ReferenceResponseLimiter.cpp
+            src/win32/ImageIO.cpp
+            src/win32/SessionRecorder.cpp
+            src/win32/CodexSessionTrace.cpp)
+
+        add_executable(pixelforge_automatic_tests tests/test_automatic.cpp ${PIXELFORGE_AUTOMATIC_TOOL_SOURCES})
         target_include_directories(pixelforge_automatic_tests PRIVATE src/win32)
         target_compile_definitions(pixelforge_automatic_tests PRIVATE UNICODE _UNICODE NOMINMAX)
         target_link_libraries(pixelforge_automatic_tests PRIVATE pixelforge_core
-            user32 gdi32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
+            user32 gdi32 comdlg32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
         add_test(NAME pixelforge_automatic_tests COMMAND pixelforge_automatic_tests)
         set_tests_properties(pixelforge_automatic_tests PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 
-        add_executable(pixelforge_multicanvas_tests tests/test_multicanvas.cpp
-            src/win32/LocalAgentToolSession.cpp src/win32/MultiCanvasTool.cpp src/win32/PixelProgram.cpp
-            src/win32/AgentMcpServerFramed.cpp src/win32/ReferenceResponseLimiter.cpp
-            src/win32/ImageIO.cpp src/win32/SessionRecorder.cpp src/win32/CodexSessionTrace.cpp)
+        add_executable(pixelforge_multicanvas_tests tests/test_multicanvas.cpp ${PIXELFORGE_AUTOMATIC_TOOL_SOURCES})
         target_include_directories(pixelforge_multicanvas_tests PRIVATE src/win32)
         target_compile_definitions(pixelforge_multicanvas_tests PRIVATE UNICODE _UNICODE NOMINMAX)
         target_link_libraries(pixelforge_multicanvas_tests PRIVATE pixelforge_core
-            user32 gdi32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
+            user32 gdi32 comdlg32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
         add_test(NAME pixelforge_multicanvas_tests COMMAND pixelforge_multicanvas_tests)
         set_tests_properties(pixelforge_multicanvas_tests PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+
+        add_executable(pixelforge_reference_dialog_tests tests/test_reference_dialog.cpp ${PIXELFORGE_AUTOMATIC_TOOL_SOURCES})
+        target_include_directories(pixelforge_reference_dialog_tests PRIVATE src/win32)
+        target_compile_definitions(pixelforge_reference_dialog_tests PRIVATE UNICODE _UNICODE NOMINMAX)
+        target_link_libraries(pixelforge_reference_dialog_tests PRIVATE pixelforge_core
+            user32 gdi32 comdlg32 ole32 windowscodecs mfplat mfreadwrite mfuuid)
+        add_test(NAME pixelforge_reference_dialog_tests COMMAND pixelforge_reference_dialog_tests)
+        set_tests_properties(pixelforge_reference_dialog_tests PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 
         find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
         add_test(NAME pixelforge_mcp_tests COMMAND "${POWERSHELL_EXECUTABLE}"
