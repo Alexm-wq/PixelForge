@@ -1,3 +1,4 @@
+#include "AgentInteractionUi.hpp"
 #include "AgentMcpServer.hpp"
 #include "AgentTask.hpp"
 #include "CanvasPlayback.hpp"
@@ -34,6 +35,7 @@ constexpr int ID_STYLE_REF = 1009;
 constexpr int ID_SAVE = 1010;
 constexpr int ID_UNDO = 1011;
 constexpr int ID_REDO = 1012;
+constexpr int ID_SOURCE_REF = 1013;
 constexpr UINT WM_AGENT_UPDATED = WM_APP + 1;
 constexpr UINT_PTR DISPLAY_ANIMATION_TIMER = 78;
 constexpr UINT DISPLAY_ANIMATION_INTERVAL_MS = 16;
@@ -382,6 +384,34 @@ void load_reference(HWND hwnd, bool style) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
+void load_source_reference(HWND hwnd) {
+    const auto path = choose_open_image(hwnd);
+    if (path.empty()) return;
+
+    ImageData data;
+    std::wstring error;
+    if (!pixelforge::win32::load_image_wic(path, data, error)) {
+        show_error(hwnd, error);
+        return;
+    }
+
+    ReferenceSlot slot;
+    slot.path = wide_to_utf8(path);
+    slot.width = data.width;
+    slot.height = data.height;
+    slot.present = true;
+
+    // Keep the Source state used by Astra and the task snapshot synchronized.
+    // agent_interaction_set_source stores its own copy so this local image may
+    // go out of scope after the chooser returns.
+    pixelforge::win32::agent_interaction_set_source(data, path);
+    {
+        std::lock_guard lock(g_state_mutex);
+        g_app.task.set_source_reference(std::move(slot));
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 void save_current_png(HWND hwnd) {
     const auto path = choose_save_png(hwnd);
     if (path.empty()) return;
@@ -427,9 +457,10 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             button(L"Finish", ID_FINISH, 12, 232, 96);
             button(L"Undo", ID_UNDO, 116, 232, 96);
             button(L"Redo", ID_REDO, 220, 232, 96);
-            button(L"Content ref", ID_CONTENT_REF, 12, 440, 96);
-            button(L"Style ref", ID_STYLE_REF, 116, 440, 96);
-            button(L"Save PNG", ID_SAVE, 220, 440, 96);
+            button(L"Source ref", ID_SOURCE_REF, 12, 440, 72);
+            button(L"Content ref", ID_CONTENT_REF, 90, 440, 72);
+            button(L"Style ref", ID_STYLE_REF, 168, 440, 72);
+            button(L"Save PNG", ID_SAVE, 246, 440, 72);
             SetTimer(hwnd, DISPLAY_ANIMATION_TIMER, DISPLAY_ANIMATION_INTERVAL_MS, nullptr);
             return 0;
         }
@@ -468,6 +499,8 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 }
                 if (!error.empty()) show_error(hwnd, utf8_to_wide(error));
                 InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (id == ID_SOURCE_REF) {
+                load_source_reference(hwnd);
             } else if (id == ID_CONTENT_REF) {
                 load_reference(hwnd, false);
             } else if (id == ID_STYLE_REF) {
