@@ -22,9 +22,7 @@ constexpr int ID_DIALOG_SUGGESTION_BASE = 4210;
 std::mutex g_source_mutex;
 ImageData g_source_image;
 std::wstring g_source_path;
-AgentTaskController* g_bound_task = nullptr;
-std::mutex* g_bound_state_mutex = nullptr;
-HWND g_bound_owner = nullptr;
+std::atomic<HWND> g_bound_owner{nullptr};
 std::atomic<DWORD> g_ui_thread_id{0};
 std::atomic<HWND> g_source_window{nullptr};
 std::atomic<HWND> g_source_status{nullptr};
@@ -52,8 +50,7 @@ std::wstring file_name_only(const std::wstring& path) {
     return p == std::wstring::npos ? path : path.substr(p + 1);
 }
 
-void update_bound_task_source_locked() {
-    if (!g_bound_task || !g_bound_state_mutex) return;
+ReferenceSlot source_slot_locked() {
     ReferenceSlot slot;
     if (g_source_image.valid()) {
         slot.path = wide_to_utf8_local(g_source_path);
@@ -61,18 +58,19 @@ void update_bound_task_source_locked() {
         slot.height = g_source_image.height;
         slot.present = true;
     }
-    std::lock_guard state_lock(*g_bound_state_mutex);
-    g_bound_task->set_source_reference(std::move(slot));
+    return slot;
 }
 
 void update_source_status() {
-    HWND status = g_source_status.load();
+    const HWND status = g_source_status.load();
     if (!status) return;
     std::wstring text = L"No editable Source loaded.";
     {
         std::lock_guard lock(g_source_mutex);
         if (g_source_image.valid()) {
-            text = L"Source: " + file_name_only(g_source_path) + L"  (" + std::to_wstring(g_source_image.width) + L"x" + std::to_wstring(g_source_image.height) + L")";
+            text = L"Source: " + file_name_only(g_source_path) + L"  (" +
+                   std::to_wstring(g_source_image.width) + L"x" +
+                   std::to_wstring(g_source_image.height) + L")";
         }
     }
     SetWindowTextW(status, text.c_str());
@@ -99,7 +97,6 @@ void choose_source(HWND owner) {
         std::lock_guard lock(g_source_mutex);
         g_source_image = std::move(image);
         g_source_path = path;
-        update_bound_task_source_locked();
     }
     update_source_status();
 }
@@ -109,7 +106,6 @@ void clear_source() {
         std::lock_guard lock(g_source_mutex);
         g_source_image = {};
         g_source_path.clear();
-        update_bound_task_source_locked();
     }
     update_source_status();
 }
@@ -165,7 +161,8 @@ LRESULT CALLBACK question_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
             if (!state || !state->request) return -1;
             HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
             auto make_static = [&](const std::wstring& text, int x, int y, int w, int h) {
-                HWND c = CreateWindowW(L"STATIC", text.c_str(), WS_CHILD | WS_VISIBLE, x, y, w, h, hwnd, nullptr, nullptr, nullptr);
+                HWND c = CreateWindowW(L"STATIC", text.c_str(), WS_CHILD | WS_VISIBLE,
+                                       x, y, w, h, hwnd, nullptr, nullptr, nullptr);
                 if (c) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             };
             make_static(L"Astra paused because:", 18, 14, 500, 18);
@@ -173,21 +170,30 @@ LRESULT CALLBACK question_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
             make_static(L"Question:", 18, 94, 500, 18);
             make_static(utf8_to_wide_local(state->request->question), 18, 114, 500, 54);
             make_static(L"Your answer:", 18, 174, 500, 18);
-            state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                          18, 194, 500, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_EDIT)), nullptr, nullptr);
+            state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                18, 194, 500, 28, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_EDIT)), nullptr, nullptr);
             if (state->edit) SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
             state->suggestions = split_suggestions(state->request->suggestions);
             int y = 232;
             for (std::size_t i = 0; i < state->suggestions.size(); ++i) {
-                HWND b = CreateWindowW(L"BUTTON", utf8_to_wide_local(state->suggestions[i]).c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                       18, y, 500, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_SUGGESTION_BASE + i)), nullptr, nullptr);
+                HWND b = CreateWindowW(L"BUTTON", utf8_to_wide_local(state->suggestions[i]).c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                    18, y, 500, 28, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_SUGGESTION_BASE + i)), nullptr, nullptr);
                 if (b) SendMessageW(b, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
                 y += 34;
             }
-            HWND submit = CreateWindowW(L"BUTTON", L"Send answer", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                        18, 344, 328, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_SUBMIT)), nullptr, nullptr);
-            HWND cancel = CreateWindowW(L"BUTTON", L"Dismiss", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                        356, 344, 162, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_CANCEL)), nullptr, nullptr);
+            HWND submit = CreateWindowW(L"BUTTON", L"Send answer",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                18, 344, 328, 30, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_SUBMIT)), nullptr, nullptr);
+            HWND cancel = CreateWindowW(L"BUTTON", L"Dismiss",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                356, 344, 162, 30, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_CANCEL)), nullptr, nullptr);
             if (submit) SendMessageW(submit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             if (cancel) SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             if (state->edit) SetFocus(state->edit);
@@ -207,7 +213,8 @@ LRESULT CALLBACK question_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
                 if (state->edit && len > 0) GetWindowTextW(state->edit, text.data(), len + 1);
                 text.resize(static_cast<std::size_t>(len));
                 if (text.find_first_not_of(L" \t\r\n") == std::wstring::npos) {
-                    MessageBoxW(hwnd, L"Enter an answer or choose one of Astra's suggestions.", L"Answer required", MB_OK | MB_ICONINFORMATION);
+                    MessageBoxW(hwnd, L"Enter an answer or choose one of Astra's suggestions.",
+                                L"Answer required", MB_OK | MB_ICONINFORMATION);
                     return 0;
                 }
                 finish_question(hwnd, state, wide_to_utf8_local(text), false);
@@ -217,7 +224,8 @@ LRESULT CALLBACK question_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
             break;
         }
         case WM_CLOSE:
-            if (state && state->request) finish_question(hwnd, state, {}, true); else DestroyWindow(hwnd);
+            if (state && state->request) finish_question(hwnd, state, {}, true);
+            else DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
             delete state;
@@ -227,16 +235,20 @@ LRESULT CALLBACK question_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-LRESULT CALLBACK source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+LRESULT CALLBACK source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM) {
     switch (msg) {
         case WM_CREATE: {
             HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            HWND label = CreateWindowW(L"STATIC", L"Editable Source reference", WS_CHILD | WS_VISIBLE, 12, 10, 260, 18, hwnd, nullptr, nullptr, nullptr);
-            HWND status = CreateWindowW(L"STATIC", L"No editable Source loaded.", WS_CHILD | WS_VISIBLE, 12, 32, 360, 36, hwnd, nullptr, nullptr, nullptr);
-            HWND load = CreateWindowW(L"BUTTON", L"Load Source...", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 12, 74, 180, 28, hwnd,
-                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SOURCE_LOAD)), nullptr, nullptr);
-            HWND clear = CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 202, 74, 90, 28, hwnd,
-                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SOURCE_CLEAR)), nullptr, nullptr);
+            HWND label = CreateWindowW(L"STATIC", L"Editable Source reference",
+                WS_CHILD | WS_VISIBLE, 12, 10, 260, 18, hwnd, nullptr, nullptr, nullptr);
+            HWND status = CreateWindowW(L"STATIC", L"No editable Source loaded.",
+                WS_CHILD | WS_VISIBLE, 12, 32, 360, 36, hwnd, nullptr, nullptr, nullptr);
+            HWND load = CreateWindowW(L"BUTTON", L"Load Source...",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP, 12, 74, 180, 28, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SOURCE_LOAD)), nullptr, nullptr);
+            HWND clear = CreateWindowW(L"BUTTON", L"Clear",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP, 202, 74, 90, 28, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SOURCE_CLEAR)), nullptr, nullptr);
             for (HWND c : {label, status, load, clear}) if (c) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             g_source_status = status;
             update_source_status();
@@ -249,15 +261,17 @@ LRESULT CALLBACK source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
         case WM_DESTROY: g_source_window = nullptr; g_source_status = nullptr; return 0;
     }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
+    return DefWindowProcW(hwnd, msg, wparam, 0);
 }
 
 void center_near_owner(HWND window) {
-    HWND owner = g_bound_owner;
+    const HWND owner = g_bound_owner.load();
     if (!window || !owner) return;
     RECT wr{}, orc{};
     if (!GetWindowRect(window, &wr) || !GetWindowRect(owner, &orc)) return;
-    SetWindowPos(window, HWND_TOP, orc.right - (wr.right - wr.left) - 24, orc.top + 64, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+    SetWindowPos(window, HWND_TOP,
+                 orc.right - (wr.right - wr.left) - 24, orc.top + 64,
+                 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
 }
 
 void ui_thread_main() {
@@ -265,82 +279,143 @@ void ui_thread_main() {
     MSG prime{};
     PeekMessageW(&prime, nullptr, 0, 0, PM_NOREMOVE);
     HINSTANCE instance = GetModuleHandleW(nullptr);
+
     WNDCLASSW source_class{};
-    source_class.lpfnWndProc = source_wndproc; source_class.hInstance = instance; source_class.lpszClassName = L"PixelForgeSourceReferenceWindow";
-    source_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); source_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    source_class.lpfnWndProc = source_wndproc;
+    source_class.hInstance = instance;
+    source_class.lpszClassName = L"PixelForgeSourceReferenceWindow";
+    source_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    source_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&source_class);
+
     WNDCLASSW question_class{};
-    question_class.lpfnWndProc = question_wndproc; question_class.hInstance = instance; question_class.lpszClassName = L"PixelForgeAgentQuestionWindow";
-    question_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); question_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    question_class.lpfnWndProc = question_wndproc;
+    question_class.hInstance = instance;
+    question_class.lpszClassName = L"PixelForgeAgentQuestionWindow";
+    question_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    question_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&question_class);
-    HWND source = CreateWindowExW(WS_EX_TOOLWINDOW, source_class.lpszClassName, L"PixelForge Source", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 400, 150, nullptr, nullptr, instance, nullptr);
+
+    HWND source = CreateWindowExW(WS_EX_TOOLWINDOW,
+        source_class.lpszClassName, L"PixelForge Source",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 150,
+        nullptr, nullptr, instance, nullptr);
     g_source_window = source;
     if (source) { ShowWindow(source, SW_SHOWNA); UpdateWindow(source); }
+
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_AGENT_QUESTION) {
             auto* request = reinterpret_cast<QuestionRequest*>(msg.lParam);
             if (!request) continue;
-            auto* state = new QuestionWindowState; state->request = request;
-            HWND question = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, question_class.lpszClassName, L"Astra needs your input",
-                                             WS_CAPTION | WS_SYSMENU | WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 554, 430,
-                                             g_bound_owner, nullptr, instance, state);
-            if (!question) { delete state; request->cancelled = true; SetEvent(request->done); continue; }
-            ShowWindow(question, SW_SHOW); UpdateWindow(question); SetForegroundWindow(question);
+            auto* state = new QuestionWindowState;
+            state->request = request;
+            HWND question = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                question_class.lpszClassName, L"Astra needs your input",
+                WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                CW_USEDEFAULT, CW_USEDEFAULT, 554, 430,
+                g_bound_owner.load(), nullptr, instance, state);
+            if (!question) {
+                delete state;
+                request->cancelled = true;
+                SetEvent(request->done);
+                continue;
+            }
+            ShowWindow(question, SW_SHOW);
+            UpdateWindow(question);
+            SetForegroundWindow(question);
             continue;
         }
-        TranslateMessage(&msg); DispatchMessageW(&msg);
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 }
 
-struct UiBootstrap { UiBootstrap() { std::thread(ui_thread_main).detach(); } };
+struct UiBootstrap {
+    UiBootstrap() { std::thread(ui_thread_main).detach(); }
+};
 UiBootstrap g_bootstrap;
 
 } // namespace
 
 void agent_interaction_bind_task(AgentTaskController* task, std::mutex* state_mutex, HWND owner) {
-    {
-        std::lock_guard lock(g_source_mutex);
-        g_bound_task = task; g_bound_state_mutex = state_mutex; g_bound_owner = owner;
-        update_bound_task_source_locked();
+    g_bound_owner = owner;
+    if (task && state_mutex) {
+        ReferenceSlot slot;
+        {
+            std::lock_guard lock(g_source_mutex);
+            slot = source_slot_locked();
+        }
+        std::lock_guard state_lock(*state_mutex);
+        task->set_source_reference(std::move(slot));
     }
-    HWND source = g_source_window.load();
-    if (source) { center_near_owner(source); ShowWindow(source, SW_SHOWNA); }
+    const HWND source = g_source_window.load();
+    if (source) {
+        center_near_owner(source);
+        ShowWindow(source, SW_SHOWNA);
+    }
 }
 
 bool agent_interaction_source_snapshot(ImageData& image, std::wstring& path) {
     std::lock_guard lock(g_source_mutex);
     if (!g_source_image.valid()) return false;
-    image = g_source_image; path = g_source_path; return true;
+    image = g_source_image;
+    path = g_source_path;
+    return true;
 }
 
 void agent_interaction_set_source_for_testing(ImageData image, std::wstring path) {
     {
         std::lock_guard lock(g_source_mutex);
-        g_source_image = std::move(image); g_source_path = std::move(path); update_bound_task_source_locked();
+        g_source_image = std::move(image);
+        g_source_path = std::move(path);
     }
     update_source_status();
 }
 
-bool agent_interaction_ask_user(std::string reason, std::string question, std::string suggestions,
-                                std::string& answer, bool& cancelled, std::wstring& error) {
+bool agent_interaction_ask_user(std::string reason,
+                                std::string question,
+                                std::string suggestions,
+                                std::string& answer,
+                                bool& cancelled,
+                                std::wstring& error) {
     wchar_t test_answer[4096]{};
-    const DWORD test_len = GetEnvironmentVariableW(L"PIXELFORGE_DIALOG_TEST_ANSWER", test_answer, static_cast<DWORD>(std::size(test_answer)));
+    const DWORD test_len = GetEnvironmentVariableW(
+        L"PIXELFORGE_DIALOG_TEST_ANSWER", test_answer,
+        static_cast<DWORD>(std::size(test_answer)));
     if (test_len > 0 && test_len < std::size(test_answer)) {
-        answer = wide_to_utf8_local(std::wstring_view(test_answer, test_len)); cancelled = false; return true;
+        answer = wide_to_utf8_local(std::wstring_view(test_answer, test_len));
+        cancelled = false;
+        return true;
     }
+
     const DWORD thread_id = g_ui_thread_id.load();
-    if (!thread_id) { error = L"PixelForge interaction UI is not ready."; return false; }
-    QuestionRequest request;
-    request.reason = std::move(reason); request.question = std::move(question); request.suggestions = std::move(suggestions);
-    request.done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!request.done) { error = L"Could not create the agent-question synchronization event."; return false; }
-    if (!PostThreadMessageW(thread_id, WM_AGENT_QUESTION, 0, reinterpret_cast<LPARAM>(&request))) {
-        CloseHandle(request.done); error = L"Could not open the Astra question popup."; return false;
+    if (!thread_id) {
+        error = L"PixelForge interaction UI is not ready.";
+        return false;
     }
-    WaitForSingleObject(request.done, INFINITE); CloseHandle(request.done);
-    answer = std::move(request.answer); cancelled = request.cancelled; return true;
+
+    QuestionRequest request;
+    request.reason = std::move(reason);
+    request.question = std::move(question);
+    request.suggestions = std::move(suggestions);
+    request.done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!request.done) {
+        error = L"Could not create the agent-question synchronization event.";
+        return false;
+    }
+    if (!PostThreadMessageW(thread_id, WM_AGENT_QUESTION, 0,
+                            reinterpret_cast<LPARAM>(&request))) {
+        CloseHandle(request.done);
+        error = L"Could not open the Astra question popup.";
+        return false;
+    }
+    WaitForSingleObject(request.done, INFINITE);
+    CloseHandle(request.done);
+    answer = std::move(request.answer);
+    cancelled = request.cancelled;
+    return true;
 }
 
 } // namespace pixelforge::win32
