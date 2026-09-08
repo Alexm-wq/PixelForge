@@ -23,8 +23,9 @@ if(WIN32)
         src/win32/CodexAppClientDynamic.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/AgentInteractionUi.cpp
-        src/win32/LocalAgentToolSessionEnhanced.cpp
+        src/win32/LocalAgentToolSessionWorkspace.cpp
         src/win32/MultiCanvasTool.cpp
+        src/win32/PackWorkspaceUi.cpp
         src/win32/PixelProgram.cpp
         src/win32/SessionRecorder.cpp
         src/win32/RecordMcpServerRestricted.cpp
@@ -64,8 +65,9 @@ if(BUILD_TESTING)
     if(WIN32)
         set(PIXELFORGE_AUTOMATIC_TOOL_SOURCES
             src/win32/AgentInteractionUi.cpp
-            src/win32/LocalAgentToolSessionEnhanced.cpp
+            src/win32/LocalAgentToolSessionWorkspace.cpp
             src/win32/MultiCanvasTool.cpp
+            src/win32/PackWorkspaceUi.cpp
             src/win32/PixelProgram.cpp
             src/win32/AgentMcpServerFramed.cpp
             src/win32/ReferenceResponseLimiter.cpp

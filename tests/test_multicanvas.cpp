@@ -54,9 +54,15 @@ int main() {
     CHECK(sheet.success && !sheet.image_base64.empty() && sheet.image_mime == "image/png");
     CHECK(sheet.text.find("\"canvas_count\":3") != std::string::npos);
 
+    auto timeline = tools.call("pixelforge_pack",
+        "{\"action\":\"view\",\"task_id\":" + id_text + ",\"mode\":\"timeline\",\"canvases\":\"walk_00|walk_01|walk_02\",\"scale\":4}");
+    CHECK(timeline.success && !timeline.image_base64.empty() && timeline.image_mime == "image/png");
+    CHECK(timeline.text.find("\"temporal_review\":true") != std::string::npos);
+
     auto animation = tools.call("pixelforge_pack",
         "{\"action\":\"view\",\"task_id\":" + id_text + ",\"mode\":\"animation\",\"group\":\"walk\",\"scale\":2,\"fps\":8}");
-    CHECK(animation.success && !animation.image_base64.empty() && animation.image_mime == "image/gif");
+    CHECK(animation.success && !animation.image_base64.empty() && animation.image_mime == "image/png");
+    CHECK(animation.text.find("\"agent_observation\":\"ordered_frame_strip\"") != std::string::npos);
 
     auto inspected = tools.call("pixelforge_pack",
         "{\"action\":\"inspect\",\"task_id\":" + id_text + ",\"canvas\":\"walk_01\",\"x\":0,\"y\":0,\"width\":8,\"height\":8}");
@@ -71,6 +77,11 @@ int main() {
     CHECK(redone.success);
     CHECK(document.pixel(1, 1) == 0xFFFF0000u);
 
+    const auto autosave_root = output_dir.parent_path() / "projects" / ("task_" + id_text);
+    CHECK(std::filesystem::exists(autosave_root / "project.json"));
+    CHECK(std::filesystem::exists(autosave_root / "canvases" / "walk" / "walk_00.png"));
+    CHECK(std::filesystem::exists(autosave_root / "previews" / "walk_strip.png"));
+
     std::error_code ec;
     std::filesystem::remove_all(output_dir / "frames", ec);
     const auto export_path = (output_dir / "frames").generic_string();
@@ -80,6 +91,10 @@ int main() {
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_00.png"));
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_01.png"));
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_02.png"));
+
+    const auto catalog = pixelforge_dynamic_tools_json();
+    CHECK(catalog.find("timeline") != std::string::npos);
+    CHECK(catalog.find("dests") != std::string::npos);
 
     tools.stop();
     DestroyWindow(hwnd);
