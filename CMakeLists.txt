@@ -25,7 +25,7 @@ if(WIN32)
         src/win32/AgentInteractionUi.cpp
         src/win32/LocalAgentToolSessionWorkspace.cpp
         src/win32/MultiCanvasTool.cpp
-        src/win32/PackWorkspaceUi.cpp
+        src/win32/PackWorkspaceUiSafe.cpp
         src/win32/ProjectLoader.cpp
         src/win32/PixelProgram.cpp
         src/win32/SessionRecorder.cpp
@@ -68,7 +68,7 @@ if(BUILD_TESTING)
             src/win32/AgentInteractionUi.cpp
             src/win32/LocalAgentToolSessionWorkspace.cpp
             src/win32/MultiCanvasTool.cpp
-            src/win32/PackWorkspaceUi.cpp
+            src/win32/PackWorkspaceUiSafe.cpp
             src/win32/PixelProgram.cpp
             src/win32/AgentMcpServerFramed.cpp
             src/win32/ReferenceResponseLimiter.cpp
