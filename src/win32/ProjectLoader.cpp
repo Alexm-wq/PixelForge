@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -259,6 +260,26 @@ std::string canvas_specs(const std::vector<SavedCanvas>& canvases) {
     return specs;
 }
 
+std::string loaded_project_prompt(const std::vector<SavedCanvas>& canvases) {
+    std::map<std::string, std::size_t> animations;
+    for (const auto& canvas : canvases) {
+        if (canvas.frame >= 0 && !canvas.group.empty()) ++animations[canvas.group];
+    }
+
+    std::ostringstream out;
+    out << "Existing PixelForge project opened for inspection and repair.\n\n"
+        << "The project already contains " << canvases.size() << " canvases.";
+    if (!animations.empty()) {
+        out << " Existing animation groups:";
+        for (const auto& [group, count] : animations)
+            out << " " << group << "=" << count << " frames;";
+    }
+    out << "\nPreserve existing work by default. Inspect the existing pack and existing animation before deciding what to change. "
+           "Repair or refine existing canvases whenever practical. Do not call pixelforge_pack create merely to start over. "
+           "Replacing an existing pack is destructive and requires replace_existing=true; use that only when a full replacement is intentionally necessary.";
+    return out.str();
+}
+
 } // namespace
 
 bool choose_project_manifest(HWND owner, std::wstring& manifest_path, std::wstring& error) {
@@ -301,15 +322,18 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
         std::lock_guard lock(state_mutex);
         if (task.state() == TaskState::Accepted) task.abort("Existing task replaced by a project opened by the user.", nullptr);
         task.set_next_task_id_for_restore(restored_task_id);
-        const auto actual = task.begin("Existing PixelForge project opened for inspection and repair.");
+        const auto actual = task.begin(loaded_project_prompt(canvases));
         if (actual != restored_task_id) {
             error = L"Could not restore the project's workspace id.";
             return false;
         }
     }
 
+    // Project restoration is the one legitimate destructive pack construction path.
+    // The normal agent-facing create path is protected once project.json exists.
     const std::string create_args = "{\"action\":\"create\",\"task_id\":" + std::to_string(restored_task_id) +
-        ",\"canvases\":" + q(canvas_specs(canvases)) + ",\"seed_from_source\":false}";
+        ",\"canvases\":" + q(canvas_specs(canvases)) +
+        ",\"seed_from_source\":false,\"replace_existing\":true}";
     auto created = tools.call("pixelforge_pack", create_args);
     if (!created.success) {
         error = L"Could not reconstruct the project's canvas pack: " + utf8_to_wide_project(created.text);
