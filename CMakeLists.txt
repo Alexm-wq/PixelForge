@@ -129,6 +129,14 @@ if(WIN32)
         "Optional compatibility flag. Astra is already permitted to replace an existing pack without this flag."
         PIXELFORGE_WORKSPACE_TEXT
         "${PIXELFORGE_WORKSPACE_TEXT}")
+    string(REPLACE
+[=[    } else if (has("\"error\":\"primary_canvas_size_mismatch\"")) {]=]
+[=[    } else if (has("\"error\":\"inspect_region_invalid\"")) {
+        add_member(result.text,
+            ",\"recovery\":\"Use the returned reason, canvas_width/canvas_height, requested rectangle, and max_area to correct INSPECT directly. Do not repeat the same rectangle and do not call LIST unless the canvas name is stale.\"");
+    } else if (has("\"error\":\"primary_canvas_size_mismatch\"")) {]=]
+        PIXELFORGE_WORKSPACE_TEXT
+        "${PIXELFORGE_WORKSPACE_TEXT}")
     set(PIXELFORGE_WORKSPACE_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/LocalAgentToolSessionWorkspace.cpp")
     file(WRITE "${PIXELFORGE_WORKSPACE_SOURCE}" "${PIXELFORGE_WORKSPACE_TEXT}")
 
