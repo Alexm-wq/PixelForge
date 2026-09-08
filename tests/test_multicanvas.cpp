@@ -4,9 +4,11 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 using namespace pixelforge;
 using namespace pixelforge::win32;
@@ -91,6 +93,27 @@ int main() {
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_00.png"));
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_01.png"));
     CHECK(std::filesystem::exists(output_dir / "frames" / "walk_02.png"));
+
+    const auto gif_path = output_dir / "walk.gif";
+    std::filesystem::remove(gif_path, ec);
+    auto gif_exported = tools.call("pixelforge_pack",
+        "{\"action\":\"export\",\"task_id\":" + id_text +
+        ",\"scope\":\"animation\",\"group\":\"walk\",\"path\":\"" + gif_path.generic_string() +
+        "\",\"scale\":2,\"fps\":8}");
+    CHECK(gif_exported.success);
+    CHECK(std::filesystem::exists(gif_path));
+    std::ifstream gif_file(gif_path, std::ios::binary);
+    CHECK(gif_file.good());
+    std::vector<unsigned char> gif_bytes((std::istreambuf_iterator<char>(gif_file)), std::istreambuf_iterator<char>());
+    CHECK(gif_bytes.size() > 20);
+    std::size_t gce_count = 0;
+    for (std::size_t i = 0; i + 4 < gif_bytes.size(); ++i) {
+        if (gif_bytes[i] == 0x21 && gif_bytes[i + 1] == 0xF9 && gif_bytes[i + 2] == 0x04) {
+            ++gce_count;
+            CHECK(gif_bytes[i + 3] == 0x09); // disposal=2 + transparent-index flag
+        }
+    }
+    CHECK(gce_count == 3);
 
     const auto catalog = pixelforge_dynamic_tools_json();
     CHECK(catalog.find("timeline") != std::string::npos);
