@@ -11,8 +11,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace pixelforge::win32 {
 
@@ -31,10 +31,6 @@ struct LocalToolResult {
     std::string image_mime;
 };
 
-// In-process adapter used by Codex App Server dynamicTools. Artwork calls are
-// routed through the existing PixelForge MCP implementation over anonymous pipes,
-// preserving one code path for task/edit/view/palette/history/io semantics while
-// eliminating external MCP subprocesses and named-pipe startup from Generate.
 class LocalAgentToolSession {
 public:
     LocalAgentToolSession() = default;
@@ -47,6 +43,7 @@ public:
     LocalToolResult call(std::string_view tool, std::string_view arguments_json);
 
 private:
+    LocalToolResult base_call(std::string_view tool, std::string_view arguments_json);
     LocalToolResult call_art_tool(std::string_view tool, std::string_view arguments_json);
     LocalToolResult call_record_tool(std::string_view arguments_json);
     LocalToolResult call_pack_tool(std::string_view arguments_json);
@@ -72,7 +69,6 @@ private:
     bool has_observed_revision_ = false;
 };
 
-// JSON array suitable for thread/start.dynamicTools.
 std::string pixelforge_dynamic_tools_json();
 
 } // namespace pixelforge::win32
