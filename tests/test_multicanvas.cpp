@@ -63,12 +63,26 @@ int main() {
     CHECK(list_replaced.text.find("\"canvas_count\":2") != std::string::npos);
     CHECK(list_replaced.text.find("replacement_00") != std::string::npos);
 
-    // Restore the fixture pack and continue normal tool coverage.
-    auto recreated = tools.call("pixelforge_pack",
-        "{\"action\":\"create\",\"task_id\":" + id_text +
-        ",\"canvases\":\"walk_00,walk,8,8,0|walk_01,walk,8,8,1|walk_02,walk,8,8,2\"}");
-    CHECK(recreated.success);
+    // One model/tool interaction can now rebuild the whole animation, inspect it,
+    // author every frame, inspect again, and return the final temporal review.
+    auto compound = tools.call("pixelforge_pass",
+        "{\"task_id\":" + id_text +
+        ",\"create_canvases\":\"walk_00,walk,8,8,0|walk_01,walk,8,8,1|walk_02,walk,8,8,2\""
+        ",\"inspect_before\":\"walk_00,0,0,8,8|walk_01,0,0,8,8\""
+        ",\"program\":\"CANVAS walk_00\\nP 0 0 #FF101010;CANVAS walk_01\\nP 0 0 #FF202020;CANVAS walk_02\\nP 0 0 #FF303030\""
+        ",\"inspect_after\":\"walk_00,0,0,8,8|walk_01,0,0,8,8\""
+        ",\"render_mode\":\"animation\",\"render_group\":\"walk\",\"scale\":2,\"fps\":8}");
+    CHECK(compound.success);
+    CHECK(compound.text.find("\"compound_pass\":true") != std::string::npos);
+    CHECK(compound.text.find("\"pack_created\":true") != std::string::npos);
+    CHECK(compound.text.find("\"program_applied\":true") != std::string::npos);
+    CHECK(compound.text.find("\"touched_canvases\":3") != std::string::npos);
+    CHECK(compound.text.find("\"inspect_before_count\":2") != std::string::npos);
+    CHECK(compound.text.find("\"inspect_after_count\":2") != std::string::npos);
+    CHECK(compound.text.find("\"render_mode\":\"animation\"") != std::string::npos);
+    CHECK(!compound.image_base64.empty() && compound.image_mime == "image/png");
     CHECK(document.width() == 8 && document.height() == 8);
+    CHECK(document.pixel(0, 0) == 0xFF101010u);
 
     auto task_info = tools.call("pixelforge_task", "{\"action\":\"get\"}");
     CHECK(task_info.success);
@@ -135,11 +149,13 @@ int main() {
     auto undone = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"undo\"}");
     CHECK(undone.success);
-    // Undo the clipped copy first, then the original program pass.
+    // Undo the clipped copy first, then the later broad program pass. The compound
+    // initial pass remains underneath it as the earlier animation construction.
     auto undone_program = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"undo\"}");
     CHECK(undone_program.success);
     CHECK(document.pixel(1, 1) == 0x00000000u);
+    CHECK(document.pixel(0, 0) == 0xFF101010u);
     auto redone_program = tools.call("pixelforge_pack",
         "{\"action\":\"history\",\"task_id\":" + id_text + ",\"direction\":\"redo\"}");
     CHECK(redone_program.success);
@@ -184,6 +200,9 @@ int main() {
     const auto catalog = pixelforge_dynamic_tools_json();
     CHECK(catalog.find("timeline") != std::string::npos);
     CHECK(catalog.find("dests") != std::string::npos);
+    CHECK(catalog.find("pixelforge_pass") != std::string::npos);
+    CHECK(catalog.find("create_canvases") != std::string::npos);
+    CHECK(catalog.find("inspect_before") != std::string::npos);
     CHECK(catalog.find("Astra may use it on an existing project") != std::string::npos);
     CHECK(catalog.find("permitted to replace an existing pack") != std::string::npos);
 
