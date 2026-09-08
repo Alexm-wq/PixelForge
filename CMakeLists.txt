@@ -57,6 +57,7 @@ if(WIN32)
         src/win32/AgentInteractionUi.cpp
         src/win32/AutomaticUiRepaintGuard.cpp
         src/win32/LocalAgentToolSessionWorkspace.cpp
+        src/win32/ProjectRestoreSession.cpp
         ${PIXELFORGE_MULTI_CANVAS_SOURCE}
         src/win32/PackWorkspaceUiTabs.cpp
         src/win32/ProjectLoader.cpp
