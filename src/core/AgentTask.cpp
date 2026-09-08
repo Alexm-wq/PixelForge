@@ -120,6 +120,29 @@ bool AgentTaskController::user_answer_input(std::string answer, std::string* err
     return true;
 }
 
+bool AgentTaskController::revision_candidate_allowed(const std::vector<std::uint32_t>& candidate, std::string* error) const {
+    if (!revision_guard_active_ || revision_baseline_.empty()) return true;
+    if (candidate.size() != revision_baseline_.size()) {
+        if (error) *error = "Revision guard rejected a canvas-size change. Continue editing the existing artwork at its current size.";
+        return false;
+    }
+    std::size_t changed = 0, baseline_opaque = 0, erased_opaque = 0;
+    for (std::size_t i = 0; i < candidate.size(); ++i) {
+        const auto before = revision_baseline_[i], after = candidate[i];
+        if (before != after) ++changed;
+        if (alpha_nonzero(before)) { ++baseline_opaque; if (!alpha_nonzero(after)) ++erased_opaque; }
+    }
+    const double changed_fraction = candidate.empty() ? 0.0 : static_cast<double>(changed) / static_cast<double>(candidate.size());
+    const double erased_fraction = baseline_opaque == 0 ? 0.0 : static_cast<double>(erased_opaque) / static_cast<double>(baseline_opaque);
+    if (changed_fraction > 0.72 || erased_fraction > 0.45) {
+        if (error) *error = "Revision guard rejected a destructive rewrite of the reviewed artwork (" +
+            std::to_string(static_cast<int>(changed_fraction * 100.0)) + "% of canvas changed, " +
+            std::to_string(static_cast<int>(erased_fraction * 100.0)) + "% of existing painted pixels erased). Preserve the current image and apply the requested changes incrementally.";
+        return false;
+    }
+    return true;
+}
+
 void AgentTaskController::set_next_task_id_for_restore(std::uint64_t task_id) {
     if (task_id > 0) next_id_ = task_id;
 }
