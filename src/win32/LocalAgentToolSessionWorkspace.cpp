@@ -338,6 +338,49 @@ void replace_once(std::string& text, std::string_view from, std::string_view to)
     if (pos != std::string::npos) text.replace(pos, from.size(), to);
 }
 
+struct PackInspectRequest {
+    std::string canvas;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+bool parse_pack_inspections(std::string_view text, std::vector<PackInspectRequest>& out, std::string& error) {
+    out.clear();
+    if (text.empty()) return true;
+    for (const auto& row : split_keep_empty_ws(text, '|')) {
+        if (row.empty()) continue;
+        const auto fields = split_keep_empty_ws(row, ',');
+        if (fields.size() != 5 || fields[0].empty()) {
+            error = "Inspection entries must be canvas,x,y,width,height separated by |.";
+            return false;
+        }
+        PackInspectRequest request;
+        request.canvas = fields[0];
+        try {
+            request.x = std::stoi(fields[1]);
+            request.y = std::stoi(fields[2]);
+            request.width = std::stoi(fields[3]);
+            request.height = std::stoi(fields[4]);
+        } catch (...) {
+            error = "Inspection x,y,width,height values must be integers.";
+            return false;
+        }
+        out.push_back(std::move(request));
+    }
+    return true;
+}
+
+std::string join_json_results(const std::vector<std::string>& results) {
+    std::string out;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        if (i) out += "\n---\n";
+        out += results[i];
+    }
+    return out;
+}
+
 } // namespace
 
 LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_view arguments_json) {
@@ -427,6 +470,169 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         }
         pack_workspace_ui_publish(bindings_.hwnd, task_id, revision, project.wstring(), canvases);
     };
+
+    if (tool == "pixelforge_pass") {
+        const auto task_id_value = args.get_i64("task_id");
+        if (!task_id_value || *task_id_value < 0)
+            return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
+        const auto task_id = static_cast<std::uint64_t>(*task_id_value);
+        {
+            std::lock_guard lock(*bindings_.state_mutex);
+            if (bindings_.task->snapshot().id != task_id)
+                return {false, "{\"ok\":false,\"error\":\"stale_task\",\"message\":\"The task id changed. Refresh pixelforge_task get.\"}"};
+        }
+
+        const std::string create_canvases = args.get("create_canvases");
+        const std::string program = args.get("program");
+        const std::string inspect_before_text = args.get("inspect_before");
+        const std::string inspect_after_text = args.get("inspect_after");
+        const std::string render_mode = args.get("render_mode");
+        if (create_canvases.empty() && program.empty() && inspect_before_text.empty() && inspect_after_text.empty() && render_mode.empty())
+            return {false, "{\"ok\":false,\"error\":\"empty_pass\",\"message\":\"A pass needs create_canvases, program, inspection, or render work.\"}"};
+
+        std::vector<PackInspectRequest> inspect_before, inspect_after;
+        std::string inspect_parse_error;
+        if (!parse_pack_inspections(inspect_before_text, inspect_before, inspect_parse_error) ||
+            !parse_pack_inspections(inspect_after_text, inspect_after, inspect_parse_error))
+            return {false, "{\"ok\":false,\"error\":\"invalid_inspection_spec\",\"message\":" + q(inspect_parse_error) + "}"};
+
+        bool created = false;
+        bool mutated = false;
+        bool source_seeded = false;
+        std::string source_seed_warning;
+        std::string create_result_text;
+        std::string program_result_text;
+        std::vector<std::string> before_results, after_results;
+
+        if (!create_canvases.empty()) {
+            std::string request = "{\"action\":\"create\",\"task_id\":" + std::to_string(task_id) +
+                                  ",\"canvases\":" + q(create_canvases) + "}";
+            auto create_result = base_call("pixelforge_pack", request);
+            if (!create_result.success) {
+                add_pack_failure_recovery(create_result, "create");
+                return create_result;
+            }
+            create_result_text = create_result.text;
+            created = true;
+            mutated = true;
+            note_pack_for(bindings_.task, task_id);
+
+            ImageData source; std::wstring source_path;
+            if (!flag_false(args, "seed_from_source") && agent_interaction_source_snapshot(source, source_path)) {
+                std::string seed_error;
+                std::lock_guard lock(*bindings_.state_mutex);
+                if (bindings_.document->width() == source.width && bindings_.document->height() == source.height) {
+                    if (seed_document(*bindings_.document, source, seed_error)) source_seeded = true;
+                    else source_seed_warning = seed_error;
+                } else {
+                    source_seed_warning = "Source seeding skipped because the first canvas size differs from Source.";
+                }
+            }
+        }
+
+        auto run_inspections = [&](const std::vector<PackInspectRequest>& requests,
+                                   std::vector<std::string>& results) -> LocalToolResult {
+            for (const auto& request : requests) {
+                const std::string json = "{\"action\":\"inspect\",\"task_id\":" + std::to_string(task_id) +
+                    ",\"canvas\":" + q(request.canvas) +
+                    ",\"x\":" + std::to_string(request.x) + ",\"y\":" + std::to_string(request.y) +
+                    ",\"width\":" + std::to_string(request.width) + ",\"height\":" + std::to_string(request.height) + "}";
+                auto one = base_call("pixelforge_pack", json);
+                if (!one.success) {
+                    add_pack_failure_recovery(one, "inspect");
+                    return one;
+                }
+                results.push_back(one.text);
+            }
+            return {true, "{\"ok\":true}"};
+        };
+
+        if (!inspect_before.empty()) {
+            auto inspected = run_inspections(inspect_before, before_results);
+            if (!inspected.success) {
+                if (mutated) refresh_pack(task_id);
+                return inspected;
+            }
+        }
+
+        std::int64_t changed_pixels = 0;
+        std::int64_t touched_canvases = 0;
+        std::int64_t revision = 0;
+        if (!program.empty()) {
+            const std::string request = "{\"action\":\"program\",\"task_id\":" + std::to_string(task_id) +
+                                        ",\"program\":" + q(program) + "}";
+            auto program_result = base_call("pixelforge_pack", request);
+            if (!program_result.success) {
+                add_pack_failure_recovery(program_result, "program");
+                if (mutated) refresh_pack(task_id);
+                add_member(program_result.text,
+                    ",\"compound_pass\":true,\"pack_created\":" + std::string(created ? "true" : "false") +
+                    ",\"partial_success\":" + std::string(created ? "true" : "false"));
+                return program_result;
+            }
+            program_result_text = program_result.text;
+            mutated = true;
+            note_pack_for(bindings_.task, task_id);
+            FlatJsonObject program_fields; std::string ignored;
+            if (parse_flat_json_object(program_result.text, program_fields, ignored)) {
+                changed_pixels = std::max<std::int64_t>(0, program_fields.get_i64("changed_pixels").value_or(0));
+                touched_canvases = std::max<std::int64_t>(0, program_fields.get_i64("touched_canvases").value_or(0));
+                revision = std::max<std::int64_t>(0, program_fields.get_i64("revision").value_or(0));
+            }
+        }
+
+        if (!inspect_after.empty()) {
+            auto inspected = run_inspections(inspect_after, after_results);
+            if (!inspected.success) {
+                if (mutated) refresh_pack(task_id);
+                return inspected;
+            }
+        }
+
+        LocalToolResult visual;
+        bool render_ok = render_mode.empty();
+        std::string effective_render_mode = render_mode;
+        if (!render_mode.empty()) {
+            std::string mode = render_mode;
+            if (mode == "timeline" || mode == "animation") mode = "strip";
+            std::string request = "{\"action\":\"view\",\"task_id\":" + std::to_string(task_id) +
+                                  ",\"mode\":" + q(mode);
+            if (!args.get("render_canvas").empty()) request += ",\"canvas\":" + q(args.get("render_canvas"));
+            if (!args.get("render_canvases").empty()) request += ",\"canvases\":" + q(args.get("render_canvases"));
+            if (!args.get("render_group").empty()) request += ",\"group\":" + q(args.get("render_group"));
+            request += ",\"scale\":" + std::to_string(args.get_i64("scale").value_or(4));
+            if (args.contains("columns")) request += ",\"columns\":" + std::to_string(args.get_i64("columns").value_or(0));
+            if (args.contains("fps")) request += ",\"fps\":" + std::to_string(args.get_i64("fps").value_or(8));
+            request += "}";
+            visual = base_call("pixelforge_pack", request);
+            render_ok = visual.success;
+        }
+
+        if (mutated) refresh_pack(task_id);
+
+        std::string text = "{\"ok\":true,\"compound_pass\":true,\"task_id\":" + std::to_string(task_id) +
+                           ",\"pack_created\":" + std::string(created ? "true" : "false") +
+                           ",\"source_seeded\":" + std::string(source_seeded ? "true" : "false") +
+                           ",\"program_applied\":" + std::string(program.empty() ? "false" : "true") +
+                           ",\"changed_pixels\":" + std::to_string(changed_pixels) +
+                           ",\"touched_canvases\":" + std::to_string(touched_canvases) +
+                           ",\"revision\":" + std::to_string(revision) +
+                           ",\"inspect_before_count\":" + std::to_string(before_results.size()) +
+                           ",\"inspect_after_count\":" + std::to_string(after_results.size()) +
+                           ",\"render_ok\":" + std::string(render_ok ? "true" : "false");
+        if (!source_seed_warning.empty()) text += ",\"source_seed_warning\":" + q(source_seed_warning);
+        if (!before_results.empty()) text += ",\"inspect_before_results\":" + q(join_json_results(before_results));
+        if (!after_results.empty()) text += ",\"inspect_after_results\":" + q(join_json_results(after_results));
+        if (!effective_render_mode.empty()) text += ",\"render_mode\":" + q(effective_render_mode);
+        if (!visual.text.empty()) text += ",\"render_result\":" + q(visual.text);
+        text += ",\"message\":\"This was one coordinated PixelForge pass. Creation, exact inspections, multi-canvas drawing, and final review were executed locally without intermediate model turns.\"}";
+        LocalToolResult result{true, std::move(text)};
+        if (render_ok && !visual.image_base64.empty()) {
+            result.image_base64 = std::move(visual.image_base64);
+            result.image_mime = std::move(visual.image_mime);
+        }
+        return result;
+    }
 
     if (tool == "pixelforge_dialog") {
         const auto task_id = args.get_i64("task_id");
@@ -738,7 +944,8 @@ std::string pixelforge_dynamic_tools_json() {
     if (end == std::string::npos) return tools;
     tools.insert(end, R"JSON(,
 {"type":"function","name":"pixelforge_reference","description":"Inspect or mechanically reuse a supplied reference without shell/Python. source is the editable image; content is a visual target; style is style guidance. view returns the actual reference image, palette computes colors locally, and seed copies exact pixels into an accepted same-size canvas.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["view","palette","seed"]},"task_id":{"type":"integer"},"reference":{"type":"string","enum":["source","content","style"]},"max_colors":{"type":"integer","minimum":1,"maximum":256}},"required":["action","task_id","reference"]}},
-{"type":"function","name":"pixelforge_dialog","description":"Ask the user a concrete question in PixelForge and receive the answer in this same turn. YOU decide whether a pause is warranted. Use it only for a material ambiguity, impossible/unsupported instruction, or consequential choice; explain exactly what is blocked and provide up to three alternatives separated by |. Do not ask about routine artistic choices you can decide yourself.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"reason":{"type":"string"},"question":{"type":"string"},"suggestions":{"type":"string"}},"required":["task_id","reason","question"]}}
+{"type":"function","name":"pixelforge_dialog","description":"Ask the user a concrete question in PixelForge and receive the answer in this same turn. YOU decide whether a pause is warranted. Use it only for a material ambiguity, impossible/unsupported instruction, or consequential choice; explain exactly what is blocked and provide up to three alternatives separated by |. Do not ask about routine artistic choices you can decide yourself.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"reason":{"type":"string"},"question":{"type":"string"},"suggestions":{"type":"string"}},"required":["task_id","reason","question"]}},
+{"type":"function","name":"pixelforge_pass","description":"Execute one coordinated multi-canvas artistic pass without intermediate model turns. This is the preferred high-level tool for whole animations/scenes: optionally create or replace the entire pack, inspect exact regions before the pass, run one PixelProgram spanning many/all canvases with CANVAS directives, inspect exact regions afterward, and return one final visual review. Use it for the initial whole-animation construction pass and for broad refinement passes when the next drawing work is already planned. If an inspection result must determine what to draw, a later model turn is still necessary; otherwise bundle the inspection with the pass instead of serializing tool calls.","inputSchema":{"type":"object","properties":{"task_id":{"type":"integer"},"create_canvases":{"type":"string","description":"Optional full pack specification: name,group,width,height,frame entries separated by |. When present, initializes/replaces the pack before the same pass program runs."},"seed_from_source":{"type":"boolean","description":"When create_canvases is present and Source matches the first canvas, seed it before the program. Default true."},"inspect_before":{"type":"string","description":"Optional exact inspections executed before drawing, as canvas,x,y,width,height entries separated by |. Oversized/out-of-bounds regions are best-effort clipped by PixelForge."},"program":{"type":"string","description":"PixelProgram for this artistic pass. Use CANVAS name directives to author many or all animation frames in one call."},"inspect_after":{"type":"string","description":"Optional exact inspections executed after drawing, as canvas,x,y,width,height entries separated by |."},"render_mode":{"type":"string","enum":["canvas","sheet","strip","timeline","animation"],"description":"Optional final model-visible review returned by the same call. timeline/animation return an ordered frame strip for temporal inspection."},"render_canvas":{"type":"string"},"render_canvases":{"type":"string","description":"Optional | separated exact canvases for the final review."},"render_group":{"type":"string","description":"Optional group for the final review, e.g. the whole animation group."},"scale":{"type":"integer"},"columns":{"type":"integer"},"fps":{"type":"integer"}},"required":["task_id"]}}
 )JSON");
 
     replace_once(tools,
