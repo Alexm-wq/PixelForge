@@ -1,7 +1,16 @@
+#include "AgentTask.hpp"
+#include "ImageIO.hpp"
+
 #include <windows.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cwchar>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <string>
+#include <string_view>
 
 namespace {
 
@@ -20,6 +29,7 @@ HHOOK g_attach_hook = nullptr;
 HWND g_review_window = nullptr;
 HWND g_revision_level = nullptr;
 WNDPROC g_review_original_proc = nullptr;
+std::wstring g_last_persisted_project;
 
 bool window_has_class(HWND hwnd, const wchar_t* wanted) {
     wchar_t class_name[96]{};
@@ -33,6 +43,286 @@ bool is_automatic_window(HWND hwnd) {
 
 bool is_review_window(HWND hwnd) {
     return window_has_class(hwnd, L"PixelForgeUserReviewWindow");
+}
+
+std::wstring environment_value(std::wstring_view name) {
+    const std::wstring key(name);
+    const DWORD needed = GetEnvironmentVariableW(key.c_str(), nullptr, 0);
+    if (!needed) return {};
+    std::wstring out(static_cast<std::size_t>(needed), L'\0');
+    const DWORD written = GetEnvironmentVariableW(key.c_str(), out.data(), needed);
+    if (!written || written >= out.size()) return {};
+    out.resize(written);
+    return out;
+}
+
+std::filesystem::path find_repo_root_from(std::filesystem::path current) {
+    for (int depth = 0; depth < 12 && !current.empty(); ++depth) {
+        std::error_code ec;
+        const bool has_cmake = std::filesystem::exists(current / L"CMakeLists.txt", ec);
+        ec.clear();
+        const bool has_source = std::filesystem::exists(current / L"src" / L"win32" / L"main_auto.cpp", ec);
+        if (has_cmake && has_source) return current;
+        const auto parent = current.parent_path();
+        if (parent == current) break;
+        current = parent;
+    }
+    return {};
+}
+
+std::filesystem::path resolve_repo_root() {
+    if (const auto configured = environment_value(L"PIXELFORGE_REPO_ROOT"); !configured.empty()) {
+        if (auto root = find_repo_root_from(configured); !root.empty()) return root;
+    }
+
+    std::wstring executable(32768, L'\0');
+    const DWORD count = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (count && count < executable.size()) {
+        executable.resize(count);
+        if (auto root = find_repo_root_from(std::filesystem::path(executable).parent_path()); !root.empty())
+            return root;
+    }
+
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec) return find_repo_root_from(cwd);
+    return {};
+}
+
+std::string trim_ascii(std::string text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c) != 0; });
+    if (first == text.end()) return {};
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) { return std::isspace(c) != 0; }).base();
+    return std::string(first, last);
+}
+
+std::string json_quote(std::string_view text) {
+    std::string out = "\"";
+    static constexpr char hex[] = "0123456789abcdef";
+    for (const unsigned char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out += "\\u00";
+                    out.push_back(hex[(c >> 4) & 0x0f]);
+                    out.push_back(hex[c & 0x0f]);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string project_name_from(const pixelforge::AgentTaskSnapshot& snapshot) {
+    constexpr std::string_view marker = "PROJECT_NAME:";
+    std::size_t start = 0;
+    while (start <= snapshot.review_summary.size()) {
+        const auto end = snapshot.review_summary.find('\n', start);
+        std::string line = trim_ascii(snapshot.review_summary.substr(
+            start, end == std::string::npos ? std::string::npos : end - start));
+        if (line.rfind(marker, 0) == 0) {
+            std::string name = trim_ascii(line.substr(marker.size()));
+            if (!name.empty()) return name;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+
+    // A name is optional for compatibility. If an older agent did not provide
+    // PROJECT_NAME, derive a readable fallback from the first prompt line.
+    std::string fallback = snapshot.prompt.substr(0, snapshot.prompt.find('\n'));
+    fallback = trim_ascii(std::move(fallback));
+    if (fallback.size() > 80) fallback.resize(80);
+    if (!fallback.empty()) return fallback;
+    return "PixelForge task " + std::to_string(snapshot.id);
+}
+
+bool replace_or_insert_project_name(std::string& manifest, std::string_view project_name) {
+    const std::string key = "\"project_name\"";
+    const auto key_pos = manifest.find(key);
+    const std::string encoded = json_quote(project_name);
+    if (key_pos == std::string::npos) {
+        const auto object = manifest.find('{');
+        if (object == std::string::npos) return false;
+        manifest.insert(object + 1, "\n  \"project_name\": " + encoded + ",");
+        return true;
+    }
+
+    auto colon = manifest.find(':', key_pos + key.size());
+    if (colon == std::string::npos) return false;
+    auto value = manifest.find_first_not_of(" \t\r\n", colon + 1);
+    if (value == std::string::npos || manifest[value] != '"') return false;
+    std::size_t end = value + 1;
+    bool escaped = false;
+    for (; end < manifest.size(); ++end) {
+        const char c = manifest[end];
+        if (escaped) { escaped = false; continue; }
+        if (c == '\\') { escaped = true; continue; }
+        if (c == '"') { ++end; break; }
+    }
+    if (end > manifest.size()) return false;
+    manifest.replace(value, end - value, encoded);
+    return true;
+}
+
+bool write_text_atomic(const std::filesystem::path& path, const std::string& text, std::wstring& error) {
+    auto temporary = path;
+    temporary += L".tmp";
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            error = L"Could not create temporary project manifest: " + temporary.wstring();
+            return false;
+        }
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.flush();
+        if (!out) {
+            error = L"Could not write project manifest: " + temporary.wstring();
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD code = GetLastError();
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        error = L"Could not finalize project.json (Windows error " + std::to_wstring(code) + L").";
+        return false;
+    }
+    return true;
+}
+
+std::size_t manifest_canvas_count(std::string_view manifest) {
+    constexpr std::string_view needle = "\"file\":";
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while ((pos = manifest.find(needle, pos)) != std::string_view::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+std::size_t persisted_canvas_file_count(const std::filesystem::path& canvas_root) {
+    std::error_code ec;
+    if (!std::filesystem::exists(canvas_root, ec) || ec) return 0;
+    std::size_t count = 0;
+    for (std::filesystem::recursive_directory_iterator it(canvas_root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_regular_file(ec) && !ec) ++count;
+    }
+    return ec ? 0 : count;
+}
+
+bool persist_reviewed_project(std::wstring& saved_directory, std::wstring& error) {
+    saved_directory.clear();
+    error.clear();
+
+    auto* task = pixelforge::AgentTaskController::active_instance_for_ui();
+    if (!task) {
+        error = L"PixelForge could not locate the active task for project persistence.";
+        return false;
+    }
+    const auto snapshot = task->snapshot();
+    if (snapshot.state != pixelforge::TaskState::Finished || !snapshot.awaiting_user_review) {
+        error = L"The current artwork is not awaiting review, so there is nothing to persist for acceptance.";
+        return false;
+    }
+    auto* document = task->document_for_ui();
+    if (!document || document->width() <= 0 || document->height() <= 0) {
+        error = L"The current task has no valid canvas to persist.";
+        return false;
+    }
+
+    const auto repo_root = resolve_repo_root();
+    if (repo_root.empty()) {
+        error = L"PixelForge could not resolve the repository root for project persistence. Set PIXELFORGE_REPO_ROOT if needed.";
+        return false;
+    }
+    const auto project = repo_root / L"projects" / (L"task_" + std::to_wstring(snapshot.id));
+    const auto manifest_path = project / L"project.json";
+    const auto canvases = project / L"canvases";
+    const std::string project_name = project_name_from(snapshot);
+
+    std::error_code ec;
+    if (std::filesystem::exists(manifest_path, ec) && !ec) {
+        std::ifstream in(manifest_path, std::ios::binary);
+        if (!in) {
+            error = L"Could not reopen the existing project manifest for final persistence.";
+            return false;
+        }
+        std::string manifest((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!in.good() && !in.eof()) {
+            error = L"Could not read the existing project manifest.";
+            return false;
+        }
+        const std::size_t expected = manifest_canvas_count(manifest);
+        const std::size_t present = persisted_canvas_file_count(canvases);
+        if (expected == 0 || present < expected) {
+            error = L"The existing pack autosave is incomplete (project.json references " +
+                    std::to_wstring(expected) + L" canvases but only " + std::to_wstring(present) +
+                    L" persisted canvas files are present). Acceptance was blocked to avoid losing the pack.";
+            return false;
+        }
+        if (!replace_or_insert_project_name(manifest, project_name)) {
+            error = L"The existing project.json is malformed and could not be finalized.";
+            return false;
+        }
+        if (!write_text_atomic(manifest_path, manifest, error)) return false;
+        saved_directory = project.wstring();
+        return true;
+    }
+    if (ec) {
+        error = L"Could not inspect the project directory before acceptance.";
+        return false;
+    }
+
+    // If pack export started but failed before project.json was written, do not
+    // silently collapse that partial pack into a one-canvas project.
+    const std::size_t orphaned_files = persisted_canvas_file_count(canvases);
+    if (orphaned_files > 0) {
+        error = L"PixelForge found canvas files for this task but no project.json. This looks like an incomplete pack autosave; acceptance was blocked instead of discarding the missing pack metadata.";
+        return false;
+    }
+
+    std::filesystem::create_directories(canvases / L"ungrouped", ec);
+    if (!ec) std::filesystem::create_directories(project / L"previews", ec);
+    if (!ec) std::filesystem::create_directories(project / L"exports", ec);
+    if (ec) {
+        error = L"Could not create the PixelForge project directory: " + project.wstring();
+        return false;
+    }
+
+    const auto canvas_file = canvases / L"ungrouped" / L"canvas.png";
+    std::wstring png_error;
+    if (!pixelforge::win32::save_png_wic(canvas_file.wstring(), document->width(), document->height(),
+                                         document->pixels(), png_error)) {
+        error = L"Could not persist the accepted canvas: " + png_error;
+        return false;
+    }
+
+    std::string manifest;
+    manifest += "{\n";
+    manifest += "  \"version\": 1,\n";
+    manifest += "  \"project_name\": " + json_quote(project_name) + ",\n";
+    manifest += "  \"task_id\": " + std::to_string(snapshot.id) + ",\n";
+    manifest += "  \"pack_revision\": " + std::to_string(document->revision()) + ",\n";
+    manifest += "  \"canvases\": [\n";
+    manifest += "    {\"name\":\"canvas\",\"group\":\"\",\"frame\":-1,\"width\":" +
+                std::to_string(document->width()) + ",\"height\":" + std::to_string(document->height()) +
+                ",\"file\":\"canvases/ungrouped/canvas.png\"}\n";
+    manifest += "  ]\n}\n";
+    if (!write_text_atomic(manifest_path, manifest, error)) return false;
+
+    saved_directory = project.wstring();
+    return true;
 }
 
 RECT live_canvas_region(HWND hwnd) {
@@ -121,6 +411,18 @@ void attach_repaint_guard(HWND hwnd) {
 LRESULT CALLBACK review_intelligence_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     const auto original = g_review_original_proc;
     if (!original) return DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    // Acceptance is a persistence boundary. Serialize/validate the complete
+    // project first; only forward the click to main_auto.cpp when that succeeds.
+    if (msg == WM_COMMAND && LOWORD(wparam) == ID_REVIEW_ACCEPT) {
+        std::wstring persistence_error;
+        std::wstring saved;
+        if (!persist_reviewed_project(saved, persistence_error)) {
+            MessageBoxW(hwnd, persistence_error.c_str(), L"Could not save PixelForge project", MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        g_last_persisted_project = std::move(saved);
+    }
 
     // The normal revision path reads the owner's LEVEL combo immediately after
     // the review window accepts the change request. Mirror the popup's selection
