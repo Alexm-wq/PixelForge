@@ -19,6 +19,7 @@ std::string g_rx_buffer;
 bool g_session_started = false;
 std::uint64_t g_asset_index = 0;
 std::unordered_map<std::string, std::string> g_tool_calls;
+std::unordered_map<std::string, std::string> g_asset_by_hash;
 
 std::filesystem::path find_repo_root() {
     std::vector<wchar_t> buffer(32768, L'\0');
@@ -119,8 +120,6 @@ bool decode_json_string(std::string_view json, std::size_t& p, std::string& out,
                 case 'r': out.push_back('\r'); break;
                 case 't': out.push_back('\t'); break;
                 case 'u':
-                    // App Server diagnostics are UTF-8 already; preserve escaped
-                    // unicode visibly rather than attempting surrogate handling here.
                     out += "\\u";
                     for (int i = 0; i < 4 && p < json.size(); ++i) out.push_back(json[p++]);
                     break;
@@ -242,6 +241,17 @@ std::string extension_for_mime(std::string_view mime) {
     return ".bin";
 }
 
+std::string asset_hash_key(std::string_view mime, const std::vector<std::uint8_t>& bytes) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (const auto b : bytes) {
+        hash ^= b;
+        hash *= 1099511628211ull;
+    }
+    char hex[32]{};
+    std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+    return std::string(mime) + ':' + std::to_string(bytes.size()) + ':' + hex;
+}
+
 std::string materialize_data_images(std::string line) {
     std::size_t search_from = 0;
     for (;;) {
@@ -261,17 +271,25 @@ std::string materialize_data_images(std::string line) {
             continue;
         }
 
-        std::error_code ec;
-        const auto directory = assets_path();
-        std::filesystem::create_directories(directory, ec);
-        const auto index = ++g_asset_index;
-        char number[16]{};
-        std::snprintf(number, sizeof(number), "%04llu", static_cast<unsigned long long>(index));
-        const std::string filename = std::string(number) + extension_for_mime(mime);
-        const auto file_path = directory / std::filesystem::path(filename);
-        std::ofstream asset(file_path, std::ios::binary | std::ios::trunc);
-        if (asset && !bytes.empty())
-            asset.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        const std::string key = asset_hash_key(mime, bytes);
+        std::string filename;
+        const auto existing = g_asset_by_hash.find(key);
+        if (existing != g_asset_by_hash.end()) {
+            filename = existing->second;
+        } else {
+            std::error_code ec;
+            const auto directory = assets_path();
+            std::filesystem::create_directories(directory, ec);
+            const auto index = ++g_asset_index;
+            char number[16]{};
+            std::snprintf(number, sizeof(number), "%04llu", static_cast<unsigned long long>(index));
+            filename = std::string(number) + extension_for_mime(mime);
+            const auto file_path = directory / std::filesystem::path(filename);
+            std::ofstream asset(file_path, std::ios::binary | std::ios::trunc);
+            if (asset && !bytes.empty())
+                asset.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            g_asset_by_hash.emplace(key, filename);
+        }
 
         const std::string replacement = "trace-asset:" + filename + ";mime=" + mime +
             ";bytes=" + std::to_string(bytes.size()) + ";base64_chars=" + std::to_string(encoded.size());
@@ -403,6 +421,7 @@ void reset_locked() {
                            "The raw JSONL remains authoritative when exact protocol details are needed.\n";
     }
     g_tool_calls.clear();
+    g_asset_by_hash.clear();
     g_asset_index = 0;
     g_session_started = true;
 }
