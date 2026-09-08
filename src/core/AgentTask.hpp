@@ -8,14 +8,7 @@
 
 namespace pixelforge {
 
-enum class TaskState {
-    Idle,
-    AwaitingAgentDecision,
-    Accepted,
-    Rejected,
-    Aborted,
-    Finished
-};
+enum class TaskState { Idle, AwaitingAgentDecision, Accepted, Rejected, Aborted, Finished };
 
 struct ReferenceSlot {
     std::string path;
@@ -31,7 +24,13 @@ struct AgentTaskSnapshot {
     std::string status_message;
     std::string review_summary;
     bool awaiting_user_review = false;
+    bool awaiting_user_input = false;
+    std::string user_input_reason;
+    std::string user_input_question;
+    std::string user_input_suggestions;
     bool revision_guard_active = false;
+    bool continuation_pending = false;
+    ReferenceSlot source_reference;
     ReferenceSlot content_reference;
     ReferenceSlot style_reference;
     int canvas_width = 0;
@@ -43,24 +42,23 @@ struct AgentTaskSnapshot {
 class AgentTaskController {
 public:
     explicit AgentTaskController(PixelDocument& document);
-
     std::uint64_t begin(std::string prompt);
     bool accept(int width, int height, std::string* error = nullptr);
     bool reject(std::string reason, std::string* error = nullptr);
     bool abort(std::string reason, std::string* error = nullptr);
-
-    // Agent-side finish is a submission for user review. Only user_accept_review
-    // makes the submitted artwork final from PixelForge's point of view.
     bool finish(std::string summary, std::string* error = nullptr);
     bool user_accept_review(std::string* error = nullptr);
     bool user_request_changes(std::string feedback, std::string* error = nullptr);
-
+    bool request_user_input(std::string reason, std::string question, std::string suggestions,
+                            std::string* error = nullptr);
+    bool user_answer_input(std::string answer, std::string* error = nullptr);
+    void set_source_reference(ReferenceSlot reference);
     void set_content_reference(ReferenceSlot reference);
     void set_style_reference(ReferenceSlot reference);
-
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] TaskState state() const noexcept { return state_; }
     [[nodiscard]] bool awaiting_user_review() const noexcept { return awaiting_user_review_; }
+    [[nodiscard]] bool awaiting_user_input() const noexcept { return awaiting_user_input_; }
     [[nodiscard]] bool revision_guard_active() const noexcept { return revision_guard_active_; }
     [[nodiscard]] bool revision_candidate_allowed(const std::vector<std::uint32_t>& candidate,
                                                   std::string* error = nullptr) const;
@@ -68,20 +66,24 @@ public:
         return state_ == TaskState::Rejected || state_ == TaskState::Aborted ||
                (state_ == TaskState::Finished && !awaiting_user_review_);
     }
-
 private:
     void clear_revision_guard();
-
+    void clear_user_input();
     PixelDocument* document_ = nullptr;
     std::uint64_t next_id_ = 1;
     std::uint64_t id_ = 0;
     TaskState state_ = TaskState::Idle;
     bool preserve_canvas_on_accept_ = false;
     bool awaiting_user_review_ = false;
+    bool awaiting_user_input_ = false;
     bool revision_guard_active_ = false;
     std::string prompt_;
     std::string status_message_;
     std::string review_summary_;
+    std::string user_input_reason_;
+    std::string user_input_question_;
+    std::string user_input_suggestions_;
+    ReferenceSlot source_reference_;
     ReferenceSlot content_reference_;
     ReferenceSlot style_reference_;
     std::vector<std::uint32_t> revision_baseline_;
