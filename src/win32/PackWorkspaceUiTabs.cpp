@@ -26,12 +26,17 @@ constexpr UINT WM_PACK_REFRESH = WM_APP + 120;
 constexpr int TAB_CANVAS = 0;
 constexpr int TAB_CANVASES = 1;
 constexpr int TAB_ANIMATION = 2;
+constexpr int TAB_ANIMATIONS = 3;
 constexpr int TAB_HEIGHT = 44;
 constexpr int WORKSPACE_LEFT = 348;
 constexpr int WORKSPACE_RIGHT = 338;
 constexpr int WORKSPACE_TOP = 8;
 constexpr int WORKSPACE_BOTTOM = 8;
 constexpr std::uint64_t PACK_PRESENTATION_TASK = 1;
+
+constexpr int ANIMATIONS_LIVE = 0;
+constexpr int ANIMATIONS_STRIP = 1;
+constexpr int ANIMATIONS_SHEET = 2;
 
 struct PixelSnapshot {
     int width = 0;
@@ -49,6 +54,32 @@ struct CanvasPresentation {
     CanvasPlayback playback;
 };
 
+struct GroupPlayback {
+    int fps = 10;
+    bool playing = true;
+    bool loop = true;
+    int frame_index = 0;
+    ULONGLONG last_tick = 0;
+};
+
+struct AnimationGroupHit {
+    std::string group;
+    RECT card{};
+    RECT preview{};
+    RECT play{};
+    RECT loop{};
+    RECT fps_down{};
+    RECT fps_up{};
+    RECT open{};
+};
+
+struct AnimationFrameHit {
+    std::string group;
+    std::string canvas;
+    int frame_index = 0;
+    RECT rect{};
+};
+
 struct UiState {
     std::uint64_t task_id = 0;
     std::uint64_t revision = 0;
@@ -56,9 +87,9 @@ struct UiState {
     std::vector<PackUiCanvasInfo> canvases;
     std::unordered_map<std::string, CanvasPresentation> presentations;
 
-    // Animation deliberately lags behind authoritative pack state. It is only
-    // replaced after every concurrent canvas presentation has finished revealing
-    // the latest pack update, so the player never mixes half-updated frames.
+    // Animation views deliberately lag behind authoritative pack state. They are
+    // replaced only after every concurrent canvas presentation has finished its
+    // reveal, so no player ever mixes old and half-updated frames.
     std::vector<PackUiCanvasInfo> animation_canvases;
     std::unordered_map<std::string, PixelSnapshot> animation_snapshots;
     std::uint64_t animation_revision = 0;
@@ -67,10 +98,20 @@ struct UiState {
     std::string selected_canvas;
     std::string selected_group;
     int tab = TAB_CANVAS;
+
+    // Single-animation workspace state.
     int fps = 10;
     bool playing = true;
     int animation_frame = 0;
     ULONGLONG last_frame_tick = 0;
+
+    // All-animations workspace state. This is entirely frontend-local and never
+    // enters Astra's context or project data.
+    int animations_mode = ANIMATIONS_LIVE;
+    bool animations_global_playing = true;
+    int animations_scroll_y = 0;
+    std::unordered_map<std::string, GroupPlayback> group_playback;
+
     int scroll_y = 0;
 };
 
@@ -80,13 +121,21 @@ HWND g_owner = nullptr;
 HWND g_tabs_window = nullptr;
 HWND g_content_window = nullptr;
 HHOOK g_attach_hook = nullptr;
+
 std::vector<std::pair<RECT, std::string>> g_canvas_hits;
 std::vector<std::pair<RECT, int>> g_frame_hits;
+std::vector<AnimationGroupHit> g_animation_group_hits;
+std::vector<AnimationFrameHit> g_animation_frame_hits;
+
 RECT g_play_rect{};
 RECT g_prev_group_rect{};
 RECT g_next_group_rect{};
 RECT g_fps_down_rect{};
 RECT g_fps_up_rect{};
+RECT g_animations_live_rect{};
+RECT g_animations_strip_rect{};
+RECT g_animations_sheet_rect{};
+RECT g_animations_global_play_rect{};
 
 std::wstring utf8_to_wide_ui(std::string_view text) {
     if (text.empty()) return {};
@@ -107,6 +156,13 @@ void text_ui(HDC dc, int x, int y, const std::wstring& text, COLORREF color = RG
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, color);
     TextOutW(dc, x, y, text.c_str(), static_cast<int>(text.size()));
+}
+
+void button_ui(HDC dc, const RECT& rect, const std::wstring& text, bool active = false) {
+    fill_rect_ui(dc, rect, active ? RGB(45, 91, 94) : RGB(37, 45, 49));
+    FrameRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    text_ui(dc, static_cast<int>(rect.left) + 9, static_cast<int>(rect.top) + 7, text,
+            active ? RGB(230, 248, 247) : RGB(205, 216, 220));
 }
 
 std::filesystem::path canvas_path(std::wstring_view project_directory, const PackUiCanvasInfo& canvas) {
@@ -208,6 +264,28 @@ std::vector<PackUiCanvasInfo> animation_frames(const UiState& state, std::string
     return frames;
 }
 
+void synchronize_group_playback_locked() {
+    const auto groups = animation_groups(g_ui);
+    std::unordered_set<std::string> live;
+    live.reserve(groups.size());
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& group : groups) {
+        live.insert(group);
+        auto [it, inserted] = g_ui.group_playback.try_emplace(group);
+        if (inserted) {
+            it->second.fps = std::max(1, g_ui.fps);
+            it->second.last_tick = now;
+        }
+        const auto frames = animation_frames(g_ui, group);
+        if (frames.empty()) it->second.frame_index = 0;
+        else it->second.frame_index = std::clamp(it->second.frame_index, 0, static_cast<int>(frames.size()) - 1);
+    }
+    for (auto it = g_ui.group_playback.begin(); it != g_ui.group_playback.end();) {
+        if (live.find(it->first) == live.end()) it = g_ui.group_playback.erase(it);
+        else ++it;
+    }
+}
+
 bool any_canvas_animating_locked() {
     for (const auto& [name, presentation] : g_ui.presentations) {
         (void)name;
@@ -245,7 +323,17 @@ void commit_animation_snapshot_locked() {
     g_ui.animation_revision = g_ui.revision;
     g_ui.animation_refresh_pending = false;
     normalize_animation_selection_locked();
+    synchronize_group_playback_locked();
     g_ui.last_frame_tick = GetTickCount64();
+}
+
+bool selected_secondary_canvas_locked() {
+    return g_ui.tab == TAB_CANVAS && !g_ui.selected_canvas.empty() &&
+           !g_ui.canvases.empty() && g_ui.selected_canvas != g_ui.canvases.front().name;
+}
+
+bool content_page_visible_locked() {
+    return g_ui.tab != TAB_CANVAS || selected_secondary_canvas_locked();
 }
 
 void layout_workspace_locked() {
@@ -262,7 +350,7 @@ void layout_workspace_locked() {
 
 void apply_page_visibility_locked() {
     if (g_content_window)
-        ShowWindow(g_content_window, g_ui.tab == TAB_CANVAS ? SW_HIDE : SW_SHOW);
+        ShowWindow(g_content_window, content_page_visible_locked() ? SW_SHOW : SW_HIDE);
     if (g_tabs_window) BringWindowToTop(g_tabs_window);
 }
 
@@ -278,28 +366,50 @@ RECT parent_canvas_region(HWND owner) {
 
 void draw_tabs(HDC dc, const RECT& client, const UiState& state) {
     fill_rect_ui(dc, client, RGB(14, 18, 20));
-    const RECT canvas_tab{8, 4, 112, 40};
-    const RECT canvases_tab{118, 4, 242, 40};
-    const RECT animation_tab{248, 4, 382, 40};
+    const RECT canvas_tab{8, 4, 104, 40};
+    const RECT canvases_tab{110, 4, 222, 40};
+    const RECT animation_tab{228, 4, 344, 40};
+    const RECT animations_tab{350, 4, 480, 40};
     auto tab = [&](RECT r, const wchar_t* title, bool selected) {
         fill_rect_ui(dc, r, selected ? RGB(45, 91, 94) : RGB(31, 38, 42));
         FrameRect(dc, &r, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
-        text_ui(dc, static_cast<int>(r.left) + 12, static_cast<int>(r.top) + 8, title,
+        text_ui(dc, static_cast<int>(r.left) + 10, static_cast<int>(r.top) + 8, title,
                 selected ? RGB(230, 248, 247) : RGB(178, 188, 192));
     };
     tab(canvas_tab, L"Canvas", state.tab == TAB_CANVAS);
     tab(canvases_tab, L"Canvases", state.tab == TAB_CANVASES);
     tab(animation_tab, L"Animation", state.tab == TAB_ANIMATION);
+    tab(animations_tab, L"Animations", state.tab == TAB_ANIMATIONS);
 
     std::wstring status = state.canvases.empty() ? L"Primary canvas" : std::to_wstring(state.canvases.size()) + L" canvases";
     const auto groups = animation_groups(state);
     if (!groups.empty()) status += L"   " + std::to_wstring(groups.size()) + L" animations";
     if (state.animation_refresh_pending) status += L"   drawing...";
-    const int sx = std::min(410, std::max(392, static_cast<int>(client.right) - 250));
-    text_ui(dc, sx, 14, status, RGB(145, 155, 160));
+    const int sx = std::max(490, static_cast<int>(client.right) - 250);
+    if (sx < client.right - 12) text_ui(dc, sx, 14, status, RGB(145, 155, 160));
 }
 
-void draw_canvases(HDC dc, const RECT& client, UiState& state) {
+void draw_selected_canvas(HDC dc, const RECT& client, UiState& state) {
+    if (state.selected_canvas.empty()) return;
+    const auto canvas_it = std::find_if(state.canvases.begin(), state.canvases.end(), [&](const auto& canvas) {
+        return canvas.name == state.selected_canvas;
+    });
+    if (canvas_it == state.canvases.end()) return;
+    const auto presentation_it = state.presentations.find(state.selected_canvas);
+    if (presentation_it == state.presentations.end() || !presentation_it->second.authoritative.valid()) return;
+    const auto& presentation = presentation_it->second;
+    const auto& pixels = presentation.playback.pixels_or(
+        presentation.authoritative.pixels,
+        presentation.authoritative.width,
+        presentation.authoritative.height);
+    text_ui(dc, 18, 18, L"Canvas: " + utf8_to_wide_ui(state.selected_canvas), RGB(111, 220, 215));
+    RECT area{18, 48, client.right - 18, client.bottom - 34};
+    draw_pixels_fit(dc, area, presentation.authoritative.width, presentation.authoritative.height, pixels);
+    if (presentation.playback.animating())
+        text_ui(dc, 18, static_cast<int>(client.bottom) - 26, L"drawing...", RGB(111, 220, 215));
+}
+
+void draw_canvas_grid(HDC dc, const RECT& client, UiState& state) {
     g_canvas_hits.clear();
     if (state.canvases.empty()) {
         text_ui(dc, 18, 24, L"No additional canvases yet.", RGB(111, 220, 215));
@@ -384,17 +494,12 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     g_next_group_rect = {192, 48, 258, 78};
     g_fps_down_rect = {270, 48, 304, 78};
     g_fps_up_rect = {382, 48, 416, 78};
-    fill_rect_ui(dc, g_prev_group_rect, RGB(37, 45, 49));
-    fill_rect_ui(dc, g_play_rect, RGB(37, 45, 49));
-    fill_rect_ui(dc, g_next_group_rect, RGB(37, 45, 49));
-    fill_rect_ui(dc, g_fps_down_rect, RGB(37, 45, 49));
-    fill_rect_ui(dc, g_fps_up_rect, RGB(37, 45, 49));
-    text_ui(dc, 35, 55, L"Prev");
-    text_ui(dc, 110, 55, state.playing ? L"Pause" : L"Play");
-    text_ui(dc, 210, 55, L"Next");
-    text_ui(dc, 281, 55, L"-");
+    button_ui(dc, g_prev_group_rect, L"Prev");
+    button_ui(dc, g_play_rect, state.playing ? L"Pause" : L"Play", state.playing);
+    button_ui(dc, g_next_group_rect, L"Next");
+    button_ui(dc, g_fps_down_rect, L"-");
+    button_ui(dc, g_fps_up_rect, L"+");
     text_ui(dc, 312, 55, std::to_wstring(state.fps) + L" FPS", RGB(190, 204, 208));
-    text_ui(dc, 393, 55, L"+");
     std::wstring timing = L"frame " + std::to_wstring(frames[static_cast<std::size_t>(frame_index)].frame);
     if (state.animation_refresh_pending) timing += L"   waiting for canvas drawing";
     text_ui(dc, 430, 55, timing, RGB(170, 180, 184));
@@ -421,6 +526,139 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
                 std::to_wstring(frames[i].frame), RGB(190, 200, 204));
         g_frame_hits.emplace_back(card, static_cast<int>(i));
         x += thumb_w;
+    }
+}
+
+int animations_card_height(const UiState& state, int client_width, std::size_t frame_count) {
+    if (state.animations_mode == ANIMATIONS_LIVE) return 238;
+    if (state.animations_mode == ANIMATIONS_STRIP) return 170;
+    const int thumb_cell = 76;
+    const int columns = std::max(1, (std::max(180, client_width) - 38) / thumb_cell);
+    const int rows = std::max(1, static_cast<int>((frame_count + static_cast<std::size_t>(columns) - 1) / static_cast<std::size_t>(columns)));
+    return 70 + rows * 76;
+}
+
+void draw_animations_workspace(HDC dc, const RECT& client, UiState& state) {
+    g_animation_group_hits.clear();
+    g_animation_frame_hits.clear();
+    const auto groups = animation_groups(state);
+
+    text_ui(dc, 18, 16, L"Animations Workspace", RGB(111, 220, 215));
+    g_animations_live_rect = {178, 8, 236, 38};
+    g_animations_strip_rect = {242, 8, 306, 38};
+    g_animations_sheet_rect = {312, 8, 376, 38};
+    g_animations_global_play_rect = {388, 8, 488, 38};
+    button_ui(dc, g_animations_live_rect, L"Live", state.animations_mode == ANIMATIONS_LIVE);
+    button_ui(dc, g_animations_strip_rect, L"Strip", state.animations_mode == ANIMATIONS_STRIP);
+    button_ui(dc, g_animations_sheet_rect, L"Sheet", state.animations_mode == ANIMATIONS_SHEET);
+    button_ui(dc, g_animations_global_play_rect,
+              state.animations_global_playing ? L"Pause all" : L"Play all",
+              state.animations_global_playing);
+
+    if (state.animation_refresh_pending)
+        text_ui(dc, 504, 16, L"waiting for canvas drawing", RGB(170, 180, 184));
+
+    if (groups.empty()) {
+        text_ui(dc, 18, 66, L"No animation groups in this project yet.", RGB(190, 204, 208));
+        text_ui(dc, 18, 92, L"Grouped frame canvases will appear here automatically.", RGB(145, 152, 156));
+        return;
+    }
+
+    synchronize_group_playback_locked();
+    int y = 54 - state.animations_scroll_y;
+    const int width = std::max(220, static_cast<int>(client.right) - 36);
+
+    for (const auto& group : groups) {
+        const auto frames = animation_frames(state, group);
+        if (frames.empty()) continue;
+        auto& playback = state.group_playback[group];
+        playback.frame_index = std::clamp(playback.frame_index, 0, static_cast<int>(frames.size()) - 1);
+
+        const int card_h = animations_card_height(state, width, frames.size());
+        RECT card{18, static_cast<LONG>(y), client.right - 18, static_cast<LONG>(y + card_h - 8)};
+        AnimationGroupHit hit;
+        hit.group = group;
+        hit.card = card;
+
+        if (card.bottom >= 42 && card.top <= client.bottom - 24) {
+            fill_rect_ui(dc, card, group == state.selected_group ? RGB(28, 48, 51) : RGB(24, 29, 33));
+            FrameRect(dc, &card, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+            text_ui(dc, static_cast<int>(card.left) + 12, static_cast<int>(card.top) + 10,
+                    utf8_to_wide_ui(group), RGB(111, 220, 215));
+            text_ui(dc, static_cast<int>(card.left) + 150, static_cast<int>(card.top) + 10,
+                    std::to_wstring(frames.size()) + L" frames", RGB(145, 155, 160));
+
+            const int right = static_cast<int>(card.right);
+            hit.play = {right - 330, card.top + 6, right - 260, card.top + 36};
+            hit.loop = {right - 254, card.top + 6, right - 190, card.top + 36};
+            hit.fps_down = {right - 184, card.top + 6, right - 150, card.top + 36};
+            hit.fps_up = {right - 78, card.top + 6, right - 44, card.top + 36};
+            hit.open = {right - 138, card.top + 6, right - 84, card.top + 36};
+            button_ui(dc, hit.play, playback.playing ? L"Pause" : L"Play", playback.playing);
+            button_ui(dc, hit.loop, playback.loop ? L"Loop" : L"Once", playback.loop);
+            button_ui(dc, hit.fps_down, L"-");
+            button_ui(dc, hit.fps_up, L"+");
+            text_ui(dc, right - 146, static_cast<int>(card.top) + 13,
+                    std::to_wstring(playback.fps) + L"fps", RGB(190, 204, 208));
+            button_ui(dc, hit.open, L"Open");
+
+            if (state.animations_mode == ANIMATIONS_LIVE) {
+                hit.preview = {card.left + 12, card.top + 46, card.right - 12, card.bottom - 12};
+                const auto& frame = frames[static_cast<std::size_t>(playback.frame_index)];
+                const auto snapshot = state.animation_snapshots.find(frame.name);
+                if (snapshot != state.animation_snapshots.end() && snapshot->second.valid())
+                    draw_pixels_fit(dc, hit.preview, snapshot->second.width, snapshot->second.height, snapshot->second.pixels);
+                text_ui(dc, static_cast<int>(hit.preview.left) + 8, static_cast<int>(hit.preview.top) + 6,
+                        L"frame " + std::to_wstring(frame.frame), RGB(170, 180, 184));
+            } else if (state.animations_mode == ANIMATIONS_STRIP) {
+                hit.preview = {card.left + 12, card.top + 46, card.right - 12, card.bottom - 12};
+                const int thumb_w = 72;
+                int x = static_cast<int>(hit.preview.left);
+                std::size_t shown = 0;
+                for (std::size_t i = 0; i < frames.size(); ++i) {
+                    if (x + thumb_w > hit.preview.right) break;
+                    RECT frame_rect{static_cast<LONG>(x), hit.preview.top,
+                                    static_cast<LONG>(x + thumb_w - 6), hit.preview.bottom};
+                    fill_rect_ui(dc, frame_rect, static_cast<int>(i) == playback.frame_index ? RGB(35, 63, 66) : RGB(19, 24, 27));
+                    const auto snapshot = state.animation_snapshots.find(frames[i].name);
+                    if (snapshot != state.animation_snapshots.end() && snapshot->second.valid()) {
+                        RECT area{frame_rect.left + 3, frame_rect.top + 3, frame_rect.right - 3, frame_rect.bottom - 20};
+                        draw_pixels_fit(dc, area, snapshot->second.width, snapshot->second.height, snapshot->second.pixels);
+                    }
+                    text_ui(dc, static_cast<int>(frame_rect.left) + 4, static_cast<int>(frame_rect.bottom) - 17,
+                            std::to_wstring(frames[i].frame), RGB(180, 192, 196));
+                    g_animation_frame_hits.push_back({group, frames[i].name, static_cast<int>(i), frame_rect});
+                    x += thumb_w;
+                    ++shown;
+                }
+                if (shown < frames.size())
+                    text_ui(dc, static_cast<int>(hit.preview.right) - 116, static_cast<int>(hit.preview.bottom) - 17,
+                            std::to_wstring(shown) + L"/" + std::to_wstring(frames.size()), RGB(145, 155, 160));
+            } else {
+                hit.preview = {card.left + 12, card.top + 46, card.right - 12, card.bottom - 12};
+                const int cell = 76;
+                const int columns = std::max(1, static_cast<int>(hit.preview.right - hit.preview.left) / cell);
+                for (std::size_t i = 0; i < frames.size(); ++i) {
+                    const int col = static_cast<int>(i) % columns;
+                    const int row = static_cast<int>(i) / columns;
+                    RECT frame_rect{hit.preview.left + col * cell,
+                                    hit.preview.top + row * cell,
+                                    hit.preview.left + col * cell + cell - 6,
+                                    hit.preview.top + row * cell + cell - 6};
+                    fill_rect_ui(dc, frame_rect, static_cast<int>(i) == playback.frame_index ? RGB(35, 63, 66) : RGB(19, 24, 27));
+                    const auto snapshot = state.animation_snapshots.find(frames[i].name);
+                    if (snapshot != state.animation_snapshots.end() && snapshot->second.valid()) {
+                        RECT area{frame_rect.left + 3, frame_rect.top + 3, frame_rect.right - 3, frame_rect.bottom - 20};
+                        draw_pixels_fit(dc, area, snapshot->second.width, snapshot->second.height, snapshot->second.pixels);
+                    }
+                    text_ui(dc, static_cast<int>(frame_rect.left) + 4, static_cast<int>(frame_rect.bottom) - 17,
+                            std::to_wstring(frames[i].frame), RGB(180, 192, 196));
+                    g_animation_frame_hits.push_back({group, frames[i].name, static_cast<int>(i), frame_rect});
+                }
+            }
+            g_animation_group_hits.push_back(std::move(hit));
+        }
+        y += card_h;
     }
 }
 
@@ -460,8 +698,10 @@ void paint_content_buffered(HWND hwnd) {
     fill_rect_ui(target, client, RGB(14, 18, 20));
     {
         std::lock_guard lock(g_ui_mutex);
-        if (g_ui.tab == TAB_CANVASES) draw_canvases(target, client, g_ui);
+        if (g_ui.tab == TAB_CANVAS) draw_selected_canvas(target, client, g_ui);
+        else if (g_ui.tab == TAB_CANVASES) draw_canvas_grid(target, client, g_ui);
         else if (g_ui.tab == TAB_ANIMATION) draw_animation(target, client, g_ui);
+        else if (g_ui.tab == TAB_ANIMATIONS) draw_animations_workspace(target, client, g_ui);
         if (!g_ui.project_directory.empty())
             text_ui(target, 12, static_cast<int>(client.bottom) - 22,
                     L"Project: " + g_ui.project_directory, RGB(125, 135, 140));
@@ -473,31 +713,60 @@ void paint_content_buffered(HWND hwnd) {
     EndPaint(hwnd, &ps);
 }
 
+void open_canvas_from_workspace_locked(std::string canvas_name) {
+    g_ui.selected_canvas = std::move(canvas_name);
+    g_ui.tab = TAB_CANVAS;
+    apply_page_visibility_locked();
+}
+
+void open_animation_group_locked(const std::string& group, int frame_index) {
+    g_ui.selected_group = group;
+    const auto frames = animation_frames(g_ui, group);
+    g_ui.animation_frame = frames.empty() ? 0 : std::clamp(frame_index, 0, static_cast<int>(frames.size()) - 1);
+    auto playback = g_ui.group_playback.find(group);
+    if (playback != g_ui.group_playback.end()) {
+        g_ui.fps = std::max(1, playback->second.fps);
+        g_ui.playing = playback->second.playing;
+    }
+    g_ui.last_frame_tick = GetTickCount64();
+    g_ui.tab = TAB_ANIMATION;
+    apply_page_visibility_locked();
+}
+
 LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
         case WM_LBUTTONDOWN: {
-            const POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             HWND owner = nullptr;
-            bool show_canvas = false;
+            bool show_parent_canvas = false;
             {
                 std::lock_guard lock(g_ui_mutex);
-                const RECT canvas_tab{8, 4, 112, 40};
-                const RECT canvases_tab{118, 4, 242, 40};
-                const RECT animation_tab{248, 4, 382, 40};
+                const RECT canvas_tab{8, 4, 104, 40};
+                const RECT canvases_tab{110, 4, 222, 40};
+                const RECT animation_tab{228, 4, 344, 40};
+                const RECT animations_tab{350, 4, 480, 40};
                 if (PtInRect(&canvas_tab, p)) {
                     g_ui.tab = TAB_CANVAS;
-                    show_canvas = true;
+                    show_parent_canvas = !selected_secondary_canvas_locked();
                 } else if (PtInRect(&canvases_tab, p)) {
                     g_ui.tab = TAB_CANVASES;
                 } else if (PtInRect(&animation_tab, p)) {
                     g_ui.tab = TAB_ANIMATION;
                     g_ui.last_frame_tick = GetTickCount64();
+                } else if (PtInRect(&animations_tab, p)) {
+                    g_ui.tab = TAB_ANIMATIONS;
+                    synchronize_group_playback_locked();
+                    const ULONGLONG now = GetTickCount64();
+                    for (auto& [name, playback] : g_ui.group_playback) {
+                        (void)name;
+                        playback.last_tick = now;
+                    }
                 }
                 apply_page_visibility_locked();
-                if (g_content_window && g_ui.tab != TAB_CANVAS) InvalidateRect(g_content_window, nullptr, FALSE);
+                if (g_content_window && content_page_visible_locked()) InvalidateRect(g_content_window, nullptr, FALSE);
                 owner = g_owner;
             }
-            if (show_canvas && owner) {
+            if (show_parent_canvas && owner) {
                 const RECT region = parent_canvas_region(owner);
                 InvalidateRect(owner, &region, FALSE);
             }
@@ -508,7 +777,7 @@ LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             {
                 std::lock_guard lock(g_ui_mutex);
                 apply_page_visibility_locked();
-                if (g_content_window && g_ui.tab != TAB_CANVAS) InvalidateRect(g_content_window, nullptr, FALSE);
+                if (g_content_window && content_page_visible_locked()) InvalidateRect(g_content_window, nullptr, FALSE);
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -520,6 +789,38 @@ LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             return 1;
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+bool tick_group_playback_locked(ULONGLONG now) {
+    if (!g_ui.animations_global_playing) return false;
+    bool changed = false;
+    const auto groups = animation_groups(g_ui);
+    for (const auto& group : groups) {
+        auto it = g_ui.group_playback.find(group);
+        if (it == g_ui.group_playback.end() || !it->second.playing) continue;
+        auto& playback = it->second;
+        const auto frames = animation_frames(g_ui, group);
+        if (frames.empty()) continue;
+        const ULONGLONG interval = std::max<ULONGLONG>(1, 1000ull / static_cast<ULONGLONG>(std::max(1, playback.fps)));
+        if (!playback.last_tick) playback.last_tick = now;
+        if (now - playback.last_tick < interval) continue;
+        const ULONGLONG steps = std::max<ULONGLONG>(1, (now - playback.last_tick) / interval);
+        playback.last_tick += steps * interval;
+        const int count = static_cast<int>(frames.size());
+        if (playback.loop) {
+            playback.frame_index = (playback.frame_index + static_cast<int>(steps % static_cast<ULONGLONG>(count))) % count;
+        } else {
+            const long long next = static_cast<long long>(playback.frame_index) + static_cast<long long>(steps);
+            if (next >= count - 1) {
+                playback.frame_index = count - 1;
+                playback.playing = false;
+            } else {
+                playback.frame_index = static_cast<int>(next);
+            }
+        }
+        changed = true;
+    }
+    return changed;
 }
 
 LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -553,30 +854,96 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                         if (!frames.empty()) {
                             const ULONGLONG interval = std::max<ULONGLONG>(1, 1000ull / static_cast<ULONGLONG>(std::max(1, g_ui.fps)));
                             if (now - g_ui.last_frame_tick >= interval) {
-                                g_ui.animation_frame = (g_ui.animation_frame + 1) % static_cast<int>(frames.size());
-                                g_ui.last_frame_tick = now;
+                                const ULONGLONG steps = std::max<ULONGLONG>(1, (now - g_ui.last_frame_tick) / interval);
+                                g_ui.animation_frame = (g_ui.animation_frame + static_cast<int>(steps % frames.size())) % static_cast<int>(frames.size());
+                                g_ui.last_frame_tick += steps * interval;
                                 animation_advanced = true;
                             }
                         }
                     }
 
-                    if (g_ui.tab == TAB_CANVASES && reveal_changed) repaint_content = true;
+                    bool animations_advanced = false;
+                    if (g_ui.tab == TAB_ANIMATIONS)
+                        animations_advanced = tick_group_playback_locked(now);
+
+                    if ((g_ui.tab == TAB_CANVAS || g_ui.tab == TAB_CANVASES) && reveal_changed) repaint_content = true;
                     if (g_ui.tab == TAB_ANIMATION && (animation_committed || animation_advanced)) repaint_content = true;
+                    if (g_ui.tab == TAB_ANIMATIONS && (animation_committed || animations_advanced)) repaint_content = true;
                 }
                 if (repaint_content) InvalidateRect(hwnd, nullptr, FALSE);
                 if (repaint_tabs && g_tabs_window) InvalidateRect(g_tabs_window, nullptr, FALSE);
             }
             return 0;
+
         case WM_MOUSEWHEEL: {
             std::lock_guard lock(g_ui_mutex);
+            const int delta = GET_WHEEL_DELTA_WPARAM(wparam) / 2;
             if (g_ui.tab == TAB_CANVASES) {
-                g_ui.scroll_y = std::max(0, g_ui.scroll_y - GET_WHEEL_DELTA_WPARAM(wparam) / 2);
+                g_ui.scroll_y = std::max(0, g_ui.scroll_y - delta);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (g_ui.tab == TAB_ANIMATIONS) {
+                g_ui.animations_scroll_y = std::max(0, g_ui.animations_scroll_y - delta);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
         }
+
+        case WM_LBUTTONDBLCLK: {
+            POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            HWND owner = nullptr;
+            bool parent_canvas = false;
+            {
+                std::lock_guard lock(g_ui_mutex);
+                if (g_ui.tab == TAB_CANVASES) {
+                    for (const auto& hit : g_canvas_hits) {
+                        if (!PtInRect(&hit.first, p)) continue;
+                        open_canvas_from_workspace_locked(hit.second);
+                        parent_canvas = !g_ui.canvases.empty() && hit.second == g_ui.canvases.front().name;
+                        owner = g_owner;
+                        break;
+                    }
+                } else if (g_ui.tab == TAB_ANIMATION) {
+                    const auto frames = animation_frames(g_ui, g_ui.selected_group);
+                    for (const auto& hit : g_frame_hits) {
+                        if (!PtInRect(&hit.first, p)) continue;
+                        if (hit.second >= 0 && hit.second < static_cast<int>(frames.size())) {
+                            open_canvas_from_workspace_locked(frames[static_cast<std::size_t>(hit.second)].name);
+                            parent_canvas = !g_ui.canvases.empty() && g_ui.selected_canvas == g_ui.canvases.front().name;
+                            owner = g_owner;
+                        }
+                        break;
+                    }
+                } else if (g_ui.tab == TAB_ANIMATIONS) {
+                    bool opened_frame = false;
+                    for (const auto& hit : g_animation_frame_hits) {
+                        if (!PtInRect(&hit.rect, p)) continue;
+                        open_canvas_from_workspace_locked(hit.canvas);
+                        parent_canvas = !g_ui.canvases.empty() && hit.canvas == g_ui.canvases.front().name;
+                        owner = g_owner;
+                        opened_frame = true;
+                        break;
+                    }
+                    if (!opened_frame) {
+                        for (const auto& hit : g_animation_group_hits) {
+                            if (!PtInRect(&hit.preview, p) && !PtInRect(&hit.card, p)) continue;
+                            const auto gp = g_ui.group_playback.find(hit.group);
+                            open_animation_group_locked(hit.group, gp == g_ui.group_playback.end() ? 0 : gp->second.frame_index);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (g_tabs_window) InvalidateRect(g_tabs_window, nullptr, FALSE);
+            if (g_content_window && IsWindowVisible(g_content_window)) InvalidateRect(g_content_window, nullptr, FALSE);
+            if (parent_canvas && owner) {
+                const RECT region = parent_canvas_region(owner);
+                InvalidateRect(owner, &region, FALSE);
+            }
+            return 0;
+        }
+
         case WM_LBUTTONDOWN: {
-            const POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             std::lock_guard lock(g_ui_mutex);
             if (g_ui.tab == TAB_CANVASES) {
                 for (const auto& hit : g_canvas_hits) {
@@ -613,10 +980,72 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                         }
                     }
                 }
+            } else if (g_ui.tab == TAB_ANIMATIONS) {
+                if (PtInRect(&g_animations_live_rect, p)) {
+                    g_ui.animations_mode = ANIMATIONS_LIVE;
+                } else if (PtInRect(&g_animations_strip_rect, p)) {
+                    g_ui.animations_mode = ANIMATIONS_STRIP;
+                } else if (PtInRect(&g_animations_sheet_rect, p)) {
+                    g_ui.animations_mode = ANIMATIONS_SHEET;
+                } else if (PtInRect(&g_animations_global_play_rect, p)) {
+                    g_ui.animations_global_playing = !g_ui.animations_global_playing;
+                    const ULONGLONG now = GetTickCount64();
+                    for (auto& [name, playback] : g_ui.group_playback) {
+                        (void)name;
+                        playback.last_tick = now;
+                    }
+                } else {
+                    bool handled = false;
+                    for (const auto& hit : g_animation_frame_hits) {
+                        if (!PtInRect(&hit.rect, p)) continue;
+                        auto gp = g_ui.group_playback.find(hit.group);
+                        if (gp != g_ui.group_playback.end()) {
+                            gp->second.frame_index = hit.frame_index;
+                            gp->second.playing = false;
+                            gp->second.last_tick = GetTickCount64();
+                        }
+                        g_ui.selected_group = hit.group;
+                        g_ui.selected_canvas = hit.canvas;
+                        handled = true;
+                        break;
+                    }
+                    if (!handled) {
+                        for (const auto& hit : g_animation_group_hits) {
+                            if (PtInRect(&hit.play, p)) {
+                                auto& gp = g_ui.group_playback[hit.group];
+                                gp.playing = !gp.playing;
+                                gp.last_tick = GetTickCount64();
+                                handled = true;
+                            } else if (PtInRect(&hit.loop, p)) {
+                                g_ui.group_playback[hit.group].loop = !g_ui.group_playback[hit.group].loop;
+                                handled = true;
+                            } else if (PtInRect(&hit.fps_down, p)) {
+                                auto& gp = g_ui.group_playback[hit.group];
+                                gp.fps = std::max(1, gp.fps - 1);
+                                gp.last_tick = GetTickCount64();
+                                handled = true;
+                            } else if (PtInRect(&hit.fps_up, p)) {
+                                auto& gp = g_ui.group_playback[hit.group];
+                                if (gp.fps < INT_MAX) ++gp.fps;
+                                gp.last_tick = GetTickCount64();
+                                handled = true;
+                            } else if (PtInRect(&hit.open, p)) {
+                                const auto gp = g_ui.group_playback.find(hit.group);
+                                open_animation_group_locked(hit.group, gp == g_ui.group_playback.end() ? 0 : gp->second.frame_index);
+                                handled = true;
+                            } else if (PtInRect(&hit.preview, p) || PtInRect(&hit.card, p)) {
+                                g_ui.selected_group = hit.group;
+                            }
+                            if (handled) break;
+                        }
+                    }
+                }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_tabs_window) InvalidateRect(g_tabs_window, nullptr, FALSE);
             return 0;
         }
+
         case WM_PAINT:
             paint_content_buffered(hwnd);
             return 0;
@@ -640,15 +1069,16 @@ void register_workspace_classes() {
     WNDCLASSW tabs{};
     tabs.lpfnWndProc = tabs_wndproc;
     tabs.hInstance = instance;
-    tabs.lpszClassName = L"PixelForgeWorkspaceTabsV3";
+    tabs.lpszClassName = L"PixelForgeWorkspaceTabsV4";
     tabs.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     tabs.hbrBackground = nullptr;
     if (!RegisterClassW(&tabs) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
 
     WNDCLASSW content{};
+    content.style = CS_DBLCLKS;
     content.lpfnWndProc = content_wndproc;
     content.hInstance = instance;
-    content.lpszClassName = L"PixelForgeWorkspacePageV3";
+    content.lpszClassName = L"PixelForgeWorkspacePageV4";
     content.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     content.hbrBackground = nullptr;
     RegisterClassW(&content);
@@ -669,10 +1099,10 @@ void attach_workspace(HWND owner) {
 
     register_workspace_classes();
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    g_tabs_window = CreateWindowExW(0, L"PixelForgeWorkspaceTabsV3", L"",
+    g_tabs_window = CreateWindowExW(0, L"PixelForgeWorkspaceTabsV4", L"",
                                     WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                     0, 0, 10, TAB_HEIGHT, owner, nullptr, instance, nullptr);
-    g_content_window = CreateWindowExW(0, L"PixelForgeWorkspacePageV3", L"",
+    g_content_window = CreateWindowExW(0, L"PixelForgeWorkspacePageV4", L"",
                                        WS_CHILD | WS_CLIPSIBLINGS,
                                        0, 0, 10, 10, owner, nullptr, instance, nullptr);
     layout_workspace_locked();
@@ -728,7 +1158,7 @@ void pack_workspace_ui_publish(HWND owner,
                                std::vector<PackUiCanvasInfo> canvases) {
     // Pack autosave is complete before this function is called. Load immutable
     // frame snapshots on the worker thread once; paint/timer paths never touch
-    // disk, which removes the old animation flicker and repeated WIC decode cost.
+    // disk, which removes repeated WIC decode work from every workspace view.
     std::unordered_map<std::string, PixelSnapshot> loaded;
     loaded.reserve(canvases.size());
     for (const auto& canvas : canvases) {
@@ -751,6 +1181,8 @@ void pack_workspace_ui_publish(HWND owner,
             g_ui.animation_snapshots.clear();
             g_ui.animation_refresh_pending = false;
             g_ui.animation_revision = 0;
+            g_ui.group_playback.clear();
+            g_ui.animations_scroll_y = 0;
         }
 
         g_ui.task_id = task_id;
@@ -815,6 +1247,7 @@ void pack_workspace_ui_publish(HWND owner,
                 g_ui.selected_group = previous_group;
         }
         normalize_animation_selection_locked();
+        synchronize_group_playback_locked();
 
         tabs = g_tabs_window;
     }
