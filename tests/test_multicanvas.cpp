@@ -43,6 +43,35 @@ int main() {
     CHECK(task.state() == TaskState::Accepted);
     CHECK(document.width() == 8 && document.height() == 8);
 
+    // Once a pack exists, create is destructive and must be an explicit opt-in.
+    auto blocked_replace = tools.call("pixelforge_pack",
+        "{\"action\":\"create\",\"task_id\":" + id_text +
+        ",\"canvases\":\"replacement_00,newwalk,8,8,0|replacement_01,newwalk,8,8,1\"}");
+    CHECK(!blocked_replace.success);
+    CHECK(blocked_replace.text.find("\"error\":\"workspace_already_exists\"") != std::string::npos);
+    CHECK(blocked_replace.text.find("\"existing_pack_intact\":true") != std::string::npos);
+    CHECK(blocked_replace.text.find("\"replacement_applied\":false") != std::string::npos);
+    CHECK(blocked_replace.text.find("failed create") != std::string::npos);
+
+    auto list_after_block = tools.call("pixelforge_pack",
+        "{\"action\":\"list\",\"task_id\":" + id_text + "}");
+    CHECK(list_after_block.success);
+    CHECK(list_after_block.text.find("\"canvas_count\":3") != std::string::npos);
+    CHECK(list_after_block.text.find("walk_00") != std::string::npos);
+    CHECK(list_after_block.text.find("replacement_00") == std::string::npos);
+
+    auto task_info = tools.call("pixelforge_task", "{\"action\":\"get\"}");
+    CHECK(task_info.success);
+    CHECK(task_info.text.find("\"pack_exists\":true") != std::string::npos);
+    CHECK(task_info.text.find("\"pack_canvas_count\":3") != std::string::npos);
+    CHECK(task_info.text.find("\"animation_groups\":\"walk:3\"") != std::string::npos);
+    CHECK(task_info.text.find("\"pack_create_requires_replace_existing\":true") != std::string::npos);
+
+    auto unknown = tools.call("pixelforge_pack",
+        "{\"action\":\"view\",\"task_id\":" + id_text + ",\"mode\":\"canvas\",\"canvas\":\"does_not_exist\"}");
+    CHECK(!unknown.success);
+    CHECK(unknown.text.find("pixelforge_pack list") != std::string::npos);
+
     auto program = tools.call("pixelforge_pack",
         "{\"action\":\"program\",\"task_id\":" + id_text +
         ",\"program\":\"CANVAS walk_00\\nR 1 1 3 3 #FFFF0000;CANVAS walk_01\\nR 2 1 3 3 #FF00FF00;CANVAS walk_02\\nR 3 1 3 3 #FF0000FF\",\"render_scale\":2}");
@@ -118,6 +147,8 @@ int main() {
     const auto catalog = pixelforge_dynamic_tools_json();
     CHECK(catalog.find("timeline") != std::string::npos);
     CHECK(catalog.find("dests") != std::string::npos);
+    CHECK(catalog.find("replace_existing") != std::string::npos);
+    CHECK(catalog.find("DESTRUCTIVE opt-in") != std::string::npos);
 
     tools.stop();
     DestroyWindow(hwnd);
