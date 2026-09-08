@@ -1,15 +1,19 @@
 #include "PackWorkspaceUi.hpp"
 
+#include "CanvasPlayback.hpp"
 #include "ImageIO.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,12 +30,39 @@ constexpr int WORKSPACE_LEFT = 348;
 constexpr int WORKSPACE_RIGHT = 338;
 constexpr int WORKSPACE_TOP = 8;
 constexpr int WORKSPACE_BOTTOM = 8;
+constexpr std::uint64_t PACK_PRESENTATION_TASK = 1;
+
+struct PixelSnapshot {
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint32_t> pixels;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return width > 0 && height > 0 &&
+               pixels.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    }
+};
+
+struct CanvasPresentation {
+    PixelSnapshot authoritative;
+    CanvasPlayback playback;
+};
 
 struct UiState {
     std::uint64_t task_id = 0;
     std::uint64_t revision = 0;
     std::wstring project_directory;
     std::vector<PackUiCanvasInfo> canvases;
+    std::unordered_map<std::string, CanvasPresentation> presentations;
+
+    // Animation deliberately lags behind authoritative pack state. It is only
+    // replaced after every concurrent canvas presentation has finished revealing
+    // the latest pack update, so the player never mixes half-updated frames.
+    std::vector<PackUiCanvasInfo> animation_canvases;
+    std::unordered_map<std::string, PixelSnapshot> animation_snapshots;
+    std::uint64_t animation_revision = 0;
+    bool animation_refresh_pending = false;
+
     std::string selected_canvas;
     std::string selected_group;
     int tab = TAB_CANVAS;
@@ -75,59 +106,87 @@ void text_ui(HDC dc, int x, int y, const std::wstring& text, COLORREF color = RG
     TextOutW(dc, x, y, text.c_str(), static_cast<int>(text.size()));
 }
 
-std::filesystem::path canvas_path(const UiState& state, const PackUiCanvasInfo& canvas) {
+std::filesystem::path canvas_path(std::wstring_view project_directory, const PackUiCanvasInfo& canvas) {
     const std::wstring folder = canvas.group.empty() ? L"ungrouped" : utf8_to_wide_ui(canvas.group);
-    return std::filesystem::path(state.project_directory) / L"canvases" / folder /
+    return std::filesystem::path(project_directory) / L"canvases" / folder /
            (utf8_to_wide_ui(canvas.name) + L".png");
 }
 
-bool load_canvas_image(const UiState& state, const PackUiCanvasInfo& canvas, ImageData& image) {
-    if (state.project_directory.empty()) return false;
-    std::wstring error;
-    return load_image_wic(canvas_path(state, canvas).wstring(), image, error);
+PixelSnapshot argb_snapshot(const ImageData& image) {
+    PixelSnapshot out;
+    if (!image.valid()) return out;
+    out.width = image.width;
+    out.height = image.height;
+    const std::size_t count = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+    out.pixels.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t p = i * 4u;
+        out.pixels[i] = (static_cast<std::uint32_t>(image.bgra[p + 3]) << 24) |
+                        (static_cast<std::uint32_t>(image.bgra[p + 2]) << 16) |
+                        (static_cast<std::uint32_t>(image.bgra[p + 1]) << 8) |
+                        static_cast<std::uint32_t>(image.bgra[p + 0]);
+    }
+    return out;
 }
 
-void draw_image_fit(HDC dc, const RECT& area, const ImageData& image) {
-    if (!image.valid()) return;
+bool load_canvas_snapshot(std::wstring_view project_directory,
+                          const PackUiCanvasInfo& canvas,
+                          PixelSnapshot& snapshot) {
+    if (project_directory.empty()) return false;
+    ImageData image;
+    std::wstring error;
+    if (!load_image_wic(canvas_path(project_directory, canvas).wstring(), image, error)) return false;
+    snapshot = argb_snapshot(image);
+    return snapshot.valid();
+}
+
+void draw_pixels_fit(HDC dc,
+                     const RECT& area,
+                     int width,
+                     int height,
+                     const std::vector<std::uint32_t>& pixels) {
+    if (width <= 0 || height <= 0 ||
+        pixels.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) return;
+
     const int aw = std::max(1, static_cast<int>(area.right - area.left));
     const int ah = std::max(1, static_cast<int>(area.bottom - area.top));
-    const double fit = std::min(static_cast<double>(aw) / image.width, static_cast<double>(ah) / image.height);
+    const double fit = std::min(static_cast<double>(aw) / width, static_cast<double>(ah) / height);
     const int scale = fit >= 1.0 ? std::max(1, static_cast<int>(fit)) : 0;
-    const int dw = scale ? image.width * scale : std::max(1, static_cast<int>(image.width * fit));
-    const int dh = scale ? image.height * scale : std::max(1, static_cast<int>(image.height * fit));
+    const int dw = scale ? width * scale : std::max(1, static_cast<int>(width * fit));
+    const int dh = scale ? height * scale : std::max(1, static_cast<int>(height * fit));
     const int dx = static_cast<int>(area.left) + (aw - dw) / 2;
     const int dy = static_cast<int>(area.top) + (ah - dh) / 2;
 
-    std::vector<std::uint32_t> composited(static_cast<std::size_t>(image.width) * image.height);
-    for (int y = 0; y < image.height; ++y) {
-        for (int x = 0; x < image.width; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * image.width + x) * 4u;
-            const unsigned b = image.bgra[i + 0];
-            const unsigned g = image.bgra[i + 1];
-            const unsigned r = image.bgra[i + 2];
-            const unsigned a = image.bgra[i + 3];
-            const unsigned bg = ((x + y) & 1) ? 45 : 58;
-            auto blend = [&](unsigned c, unsigned base) { return (c * a + base * (255 - a) + 127) / 255; };
-            composited[static_cast<std::size_t>(y) * image.width + x] =
-                (blend(r, bg) << 16) | (blend(g, bg + 3) << 8) | blend(b, bg + 6);
+    std::vector<std::uint32_t> composited(pixels.size());
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
+            const std::uint32_t argb = pixels[i];
+            const unsigned a = (argb >> 24) & 0xffu;
+            const unsigned r = (argb >> 16) & 0xffu;
+            const unsigned g = (argb >> 8) & 0xffu;
+            const unsigned b = argb & 0xffu;
+            const unsigned bg = ((x + y) & 1) ? 45u : 58u;
+            auto blend = [&](unsigned c, unsigned base) { return (c * a + base * (255u - a) + 127u) / 255u; };
+            composited[i] = (blend(r, bg) << 16) | (blend(g, bg + 3) << 8) | blend(b, bg + 6);
         }
     }
 
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = image.width;
-    bmi.bmiHeader.biHeight = -image.height;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
     SetStretchBltMode(dc, COLORONCOLOR);
-    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, image.width, image.height,
+    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, width, height,
                   composited.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
 std::vector<std::string> animation_groups(const UiState& state) {
     std::vector<std::string> groups;
-    for (const auto& canvas : state.canvases) {
+    for (const auto& canvas : state.animation_canvases) {
         if (canvas.frame < 0 || canvas.group.empty()) continue;
         if (std::find(groups.begin(), groups.end(), canvas.group) == groups.end()) groups.push_back(canvas.group);
     }
@@ -137,13 +196,53 @@ std::vector<std::string> animation_groups(const UiState& state) {
 
 std::vector<PackUiCanvasInfo> animation_frames(const UiState& state, std::string_view group) {
     std::vector<PackUiCanvasInfo> frames;
-    for (const auto& canvas : state.canvases)
+    for (const auto& canvas : state.animation_canvases)
         if (canvas.frame >= 0 && canvas.group == group) frames.push_back(canvas);
     std::stable_sort(frames.begin(), frames.end(), [](const auto& a, const auto& b) {
         if (a.frame != b.frame) return a.frame < b.frame;
         return a.name < b.name;
     });
     return frames;
+}
+
+bool any_canvas_animating_locked() {
+    for (const auto& [name, presentation] : g_ui.presentations) {
+        (void)name;
+        if (presentation.playback.animating()) return true;
+    }
+    return false;
+}
+
+void normalize_animation_selection_locked() {
+    const auto groups = animation_groups(g_ui);
+    if (groups.empty()) {
+        g_ui.selected_group.clear();
+        g_ui.animation_frame = 0;
+        return;
+    }
+    if (std::find(groups.begin(), groups.end(), g_ui.selected_group) == groups.end()) {
+        g_ui.selected_group = groups.front();
+        g_ui.animation_frame = 0;
+    }
+    const auto frames = animation_frames(g_ui, g_ui.selected_group);
+    if (frames.empty()) g_ui.animation_frame = 0;
+    else g_ui.animation_frame = std::clamp(g_ui.animation_frame, 0, static_cast<int>(frames.size()) - 1);
+}
+
+void commit_animation_snapshot_locked() {
+    g_ui.animation_canvases.clear();
+    g_ui.animation_snapshots.clear();
+    for (const auto& canvas : g_ui.canvases) {
+        if (canvas.frame < 0 || canvas.group.empty()) continue;
+        const auto it = g_ui.presentations.find(canvas.name);
+        if (it == g_ui.presentations.end() || !it->second.authoritative.valid()) continue;
+        g_ui.animation_canvases.push_back(canvas);
+        g_ui.animation_snapshots.emplace(canvas.name, it->second.authoritative);
+    }
+    g_ui.animation_revision = g_ui.revision;
+    g_ui.animation_refresh_pending = false;
+    normalize_animation_selection_locked();
+    g_ui.last_frame_tick = GetTickCount64();
 }
 
 void layout_workspace_locked() {
@@ -164,6 +263,16 @@ void apply_page_visibility_locked() {
     if (g_tabs_window) BringWindowToTop(g_tabs_window);
 }
 
+RECT parent_canvas_region(HWND owner) {
+    RECT client{};
+    GetClientRect(owner, &client);
+    RECT region{WORKSPACE_LEFT, WORKSPACE_TOP + TAB_HEIGHT,
+                client.right - WORKSPACE_RIGHT, client.bottom - WORKSPACE_BOTTOM};
+    if (region.right < region.left) region.right = region.left;
+    if (region.bottom < region.top) region.bottom = region.top;
+    return region;
+}
+
 void draw_tabs(HDC dc, const RECT& client, const UiState& state) {
     fill_rect_ui(dc, client, RGB(14, 18, 20));
     const RECT canvas_tab{8, 4, 112, 40};
@@ -182,6 +291,7 @@ void draw_tabs(HDC dc, const RECT& client, const UiState& state) {
     std::wstring status = state.canvases.empty() ? L"Primary canvas" : std::to_wstring(state.canvases.size()) + L" canvases";
     const auto groups = animation_groups(state);
     if (!groups.empty()) status += L"   " + std::to_wstring(groups.size()) + L" animations";
+    if (state.animation_refresh_pending) status += L"   drawing...";
     const int sx = std::min(410, std::max(392, static_cast<int>(client.right) - 250));
     text_ui(dc, sx, 14, status, RGB(145, 155, 160));
 }
@@ -227,10 +337,24 @@ void draw_canvases(HDC dc, const RECT& client, UiState& state) {
             fill_rect_ui(dc, card, canvas.name == state.selected_canvas ? RGB(35, 63, 66) : RGB(24, 29, 33));
             FrameRect(dc, &card, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
             RECT image_area{card.left + 8, card.top + 8, card.right - 8, card.bottom - 34};
-            ImageData image;
-            if (load_canvas_image(state, canvas, image)) draw_image_fit(dc, image_area, image);
+            const auto it = state.presentations.find(canvas.name);
+            bool drawing = false;
+            if (it != state.presentations.end() && it->second.authoritative.valid()) {
+                const auto& presentation = it->second;
+                const auto& pixels = presentation.playback.pixels_or(
+                    presentation.authoritative.pixels,
+                    presentation.authoritative.width,
+                    presentation.authoritative.height);
+                draw_pixels_fit(dc, image_area,
+                                presentation.authoritative.width,
+                                presentation.authoritative.height,
+                                pixels);
+                drawing = presentation.playback.animating();
+            }
+            std::wstring label = utf8_to_wide_ui(canvas.name);
+            if (drawing) label += L"   drawing...";
             text_ui(dc, static_cast<int>(card.left) + 8, static_cast<int>(card.bottom) - 26,
-                    utf8_to_wide_ui(canvas.name), RGB(205, 216, 220));
+                    label, drawing ? RGB(111, 220, 215) : RGB(205, 216, 220));
             g_canvas_hits.emplace_back(card, canvas.name);
         }
         ++col;
@@ -242,23 +366,14 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     g_frame_hits.clear();
     const auto groups = animation_groups(state);
     if (groups.empty()) {
-        text_ui(dc, 18, 24, L"No animation groups yet.", RGB(111, 220, 215));
-        text_ui(dc, 18, 50, L"Frames with a group and non-negative frame number will play here automatically.", RGB(145, 152, 156));
+        text_ui(dc, 18, 24, L"No completed animation frames yet.", RGB(111, 220, 215));
+        text_ui(dc, 18, 50, L"Animation appears after its canvases finish drawing.", RGB(145, 152, 156));
         return;
     }
-    if (std::find(groups.begin(), groups.end(), state.selected_group) == groups.end()) {
-        state.selected_group = groups.front();
-        state.animation_frame = 0;
-    }
-    auto frames = animation_frames(state, state.selected_group);
-    if (frames.empty()) return;
-    if (state.animation_frame < 0 || state.animation_frame >= static_cast<int>(frames.size())) state.animation_frame = 0;
 
-    const ULONGLONG now = GetTickCount64();
-    if (state.playing && now - state.last_frame_tick >= static_cast<ULONGLONG>(1000 / std::max(1, state.fps))) {
-        state.animation_frame = (state.animation_frame + 1) % static_cast<int>(frames.size());
-        state.last_frame_tick = now;
-    }
+    const auto frames = animation_frames(state, state.selected_group);
+    if (frames.empty()) return;
+    const int frame_index = std::clamp(state.animation_frame, 0, static_cast<int>(frames.size()) - 1);
 
     text_ui(dc, 18, 18, L"Animation: " + utf8_to_wide_ui(state.selected_group), RGB(111, 220, 215));
     g_prev_group_rect = {18, 48, 84, 78};
@@ -270,14 +385,15 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     text_ui(dc, 35, 55, L"Prev");
     text_ui(dc, 110, 55, state.playing ? L"Pause" : L"Play");
     text_ui(dc, 210, 55, L"Next");
-    text_ui(dc, 276, 55,
-            std::to_wstring(state.fps) + L" FPS   frame " +
-            std::to_wstring(frames[static_cast<std::size_t>(state.animation_frame)].frame), RGB(170, 180, 184));
+    std::wstring timing = std::to_wstring(state.fps) + L" FPS   frame " +
+                          std::to_wstring(frames[static_cast<std::size_t>(frame_index)].frame);
+    if (state.animation_refresh_pending) timing += L"   waiting for canvas drawing";
+    text_ui(dc, 276, 55, timing, RGB(170, 180, 184));
 
-    ImageData image;
-    if (load_canvas_image(state, frames[static_cast<std::size_t>(state.animation_frame)], image)) {
+    const auto current = state.animation_snapshots.find(frames[static_cast<std::size_t>(frame_index)].name);
+    if (current != state.animation_snapshots.end() && current->second.valid()) {
         RECT area{18, 92, client.right - 18, client.bottom - 124};
-        draw_image_fit(dc, area, image);
+        draw_pixels_fit(dc, area, current->second.width, current->second.height, current->second.pixels);
     }
 
     const int thumb_w = 86;
@@ -286,11 +402,11 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     for (std::size_t i = 0; i < frames.size(); ++i) {
         if (x + thumb_w > static_cast<int>(client.right) - 12) break;
         RECT card{static_cast<LONG>(x), static_cast<LONG>(y), static_cast<LONG>(x + thumb_w - 8), client.bottom - 30};
-        fill_rect_ui(dc, card, static_cast<int>(i) == state.animation_frame ? RGB(35, 63, 66) : RGB(24, 29, 33));
-        ImageData thumb;
-        if (load_canvas_image(state, frames[i], thumb)) {
+        fill_rect_ui(dc, card, static_cast<int>(i) == frame_index ? RGB(35, 63, 66) : RGB(24, 29, 33));
+        const auto snapshot = state.animation_snapshots.find(frames[i].name);
+        if (snapshot != state.animation_snapshots.end() && snapshot->second.valid()) {
             RECT area{card.left + 4, card.top + 4, card.right - 4, card.bottom - 22};
-            draw_image_fit(dc, area, thumb);
+            draw_pixels_fit(dc, area, snapshot->second.width, snapshot->second.height, snapshot->second.pixels);
         }
         text_ui(dc, static_cast<int>(card.left) + 6, static_cast<int>(card.bottom) - 18,
                 std::to_wstring(frames[i].frame), RGB(190, 200, 204));
@@ -299,11 +415,61 @@ void draw_animation(HDC dc, const RECT& client, UiState& state) {
     }
 }
 
+void paint_tabs_buffered(HWND hwnd) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+    HDC memory = CreateCompatibleDC(dc);
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+    HGDIOBJ old = bitmap ? SelectObject(memory, bitmap) : nullptr;
+    HDC target = bitmap ? memory : dc;
+    {
+        std::lock_guard lock(g_ui_mutex);
+        draw_tabs(target, client, g_ui);
+    }
+    if (bitmap) BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+    if (old) SelectObject(memory, old);
+    if (bitmap) DeleteObject(bitmap);
+    if (memory) DeleteDC(memory);
+    EndPaint(hwnd, &ps);
+}
+
+void paint_content_buffered(HWND hwnd) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+    HDC memory = CreateCompatibleDC(dc);
+    HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+    HGDIOBJ old = bitmap ? SelectObject(memory, bitmap) : nullptr;
+    HDC target = bitmap ? memory : dc;
+    fill_rect_ui(target, client, RGB(14, 18, 20));
+    {
+        std::lock_guard lock(g_ui_mutex);
+        if (g_ui.tab == TAB_CANVASES) draw_canvases(target, client, g_ui);
+        else if (g_ui.tab == TAB_ANIMATION) draw_animation(target, client, g_ui);
+        if (!g_ui.project_directory.empty())
+            text_ui(target, 12, static_cast<int>(client.bottom) - 22,
+                    L"Project: " + g_ui.project_directory, RGB(125, 135, 140));
+    }
+    if (bitmap) BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+    if (old) SelectObject(memory, old);
+    if (bitmap) DeleteObject(bitmap);
+    if (memory) DeleteDC(memory);
+    EndPaint(hwnd, &ps);
+}
+
 LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
         case WM_LBUTTONDOWN: {
             const POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             HWND owner = nullptr;
+            bool show_canvas = false;
             {
                 std::lock_guard lock(g_ui_mutex);
                 const RECT canvas_tab{8, 4, 112, 40};
@@ -311,6 +477,7 @@ LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                 const RECT animation_tab{248, 4, 382, 40};
                 if (PtInRect(&canvas_tab, p)) {
                     g_ui.tab = TAB_CANVAS;
+                    show_canvas = true;
                 } else if (PtInRect(&canvases_tab, p)) {
                     g_ui.tab = TAB_CANVASES;
                 } else if (PtInRect(&animation_tab, p)) {
@@ -318,35 +485,28 @@ LRESULT CALLBACK tabs_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                     g_ui.last_frame_tick = GetTickCount64();
                 }
                 apply_page_visibility_locked();
-                if (g_content_window) InvalidateRect(g_content_window, nullptr, FALSE);
+                if (g_content_window && g_ui.tab != TAB_CANVAS) InvalidateRect(g_content_window, nullptr, FALSE);
                 owner = g_owner;
             }
-            if (owner) InvalidateRect(owner, nullptr, FALSE);
+            if (show_canvas && owner) {
+                const RECT region = parent_canvas_region(owner);
+                InvalidateRect(owner, &region, FALSE);
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         case WM_PACK_REFRESH: {
-            HWND owner = nullptr;
             {
                 std::lock_guard lock(g_ui_mutex);
                 apply_page_visibility_locked();
-                if (g_content_window) InvalidateRect(g_content_window, nullptr, FALSE);
-                owner = g_owner;
+                if (g_content_window && g_ui.tab != TAB_CANVAS) InvalidateRect(g_content_window, nullptr, FALSE);
             }
-            if (owner) InvalidateRect(owner, nullptr, FALSE);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
-        case WM_PAINT: {
-            PAINTSTRUCT ps{};
-            HDC dc = BeginPaint(hwnd, &ps);
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            std::lock_guard lock(g_ui_mutex);
-            draw_tabs(dc, client, g_ui);
-            EndPaint(hwnd, &ps);
+        case WM_PAINT:
+            paint_tabs_buffered(hwnd);
             return 0;
-        }
         case WM_ERASEBKGND:
             return 1;
     }
@@ -360,8 +520,42 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         case WM_TIMER:
             if (wparam == PACK_TIMER) {
-                std::lock_guard lock(g_ui_mutex);
-                if (g_ui.tab == TAB_ANIMATION && g_ui.playing) InvalidateRect(hwnd, nullptr, FALSE);
+                bool repaint_content = false;
+                bool repaint_tabs = false;
+                {
+                    std::lock_guard lock(g_ui_mutex);
+                    const ULONGLONG now = GetTickCount64();
+                    bool reveal_changed = false;
+                    for (auto& [name, presentation] : g_ui.presentations) {
+                        (void)name;
+                        reveal_changed = presentation.playback.tick(now) || reveal_changed;
+                    }
+
+                    bool animation_committed = false;
+                    if (g_ui.animation_refresh_pending && !any_canvas_animating_locked()) {
+                        commit_animation_snapshot_locked();
+                        animation_committed = true;
+                        repaint_tabs = true;
+                    }
+
+                    bool animation_advanced = false;
+                    if (g_ui.tab == TAB_ANIMATION && g_ui.playing) {
+                        const auto frames = animation_frames(g_ui, g_ui.selected_group);
+                        if (!frames.empty()) {
+                            const ULONGLONG interval = static_cast<ULONGLONG>(1000 / std::max(1, g_ui.fps));
+                            if (now - g_ui.last_frame_tick >= interval) {
+                                g_ui.animation_frame = (g_ui.animation_frame + 1) % static_cast<int>(frames.size());
+                                g_ui.last_frame_tick = now;
+                                animation_advanced = true;
+                            }
+                        }
+                    }
+
+                    if (g_ui.tab == TAB_CANVASES && reveal_changed) repaint_content = true;
+                    if (g_ui.tab == TAB_ANIMATION && (animation_committed || animation_advanced)) repaint_content = true;
+                }
+                if (repaint_content) InvalidateRect(hwnd, nullptr, FALSE);
+                if (repaint_tabs && g_tabs_window) InvalidateRect(g_tabs_window, nullptr, FALSE);
             }
             return 0;
         case WM_MOUSEWHEEL: {
@@ -406,24 +600,11 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
-            if (g_tabs_window) InvalidateRect(g_tabs_window, nullptr, FALSE);
             return 0;
         }
-        case WM_PAINT: {
-            PAINTSTRUCT ps{};
-            HDC dc = BeginPaint(hwnd, &ps);
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            fill_rect_ui(dc, client, RGB(14, 18, 20));
-            std::lock_guard lock(g_ui_mutex);
-            if (g_ui.tab == TAB_CANVASES) draw_canvases(dc, client, g_ui);
-            else if (g_ui.tab == TAB_ANIMATION) draw_animation(dc, client, g_ui);
-            if (!g_ui.project_directory.empty())
-                text_ui(dc, 12, static_cast<int>(client.bottom) - 22,
-                        L"Project: " + g_ui.project_directory, RGB(125, 135, 140));
-            EndPaint(hwnd, &ps);
+        case WM_PAINT:
+            paint_content_buffered(hwnd);
             return 0;
-        }
         case WM_ERASEBKGND:
             return 1;
         case WM_DESTROY:
@@ -435,7 +616,7 @@ LRESULT CALLBACK content_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
 bool is_main_pixelforge_window(HWND hwnd) {
     wchar_t name[96]{};
-    if (!GetClassNameW(hwnd, name, static_cast<int>(std::size(name)))) return false;
+    if (!GetClassNameW(hwnd, name, 96)) return false;
     return wcscmp(name, L"PixelForgeAutomaticWindow") == 0 || wcscmp(name, L"PixelForgeWindow") == 0;
 }
 
@@ -444,7 +625,7 @@ void register_workspace_classes() {
     WNDCLASSW tabs{};
     tabs.lpfnWndProc = tabs_wndproc;
     tabs.hInstance = instance;
-    tabs.lpszClassName = L"PixelForgeWorkspaceTabsV2";
+    tabs.lpszClassName = L"PixelForgeWorkspaceTabsV3";
     tabs.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     tabs.hbrBackground = nullptr;
     if (!RegisterClassW(&tabs) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
@@ -452,7 +633,7 @@ void register_workspace_classes() {
     WNDCLASSW content{};
     content.lpfnWndProc = content_wndproc;
     content.hInstance = instance;
-    content.lpszClassName = L"PixelForgeWorkspacePageV2";
+    content.lpszClassName = L"PixelForgeWorkspacePageV3";
     content.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     content.hbrBackground = nullptr;
     RegisterClassW(&content);
@@ -467,19 +648,16 @@ void attach_workspace(HWND owner) {
     }
     g_owner = owner;
 
-    // The primary canvas is painted by the legacy parent window. WS_CLIPCHILDREN
-    // makes the Canvases/Animation page a real exclusive page: the parent is
-    // physically prevented from painting through the visible child page.
     const LONG_PTR style = GetWindowLongPtrW(owner, GWL_STYLE);
     if ((style & WS_CLIPCHILDREN) == 0)
         SetWindowLongPtrW(owner, GWL_STYLE, style | WS_CLIPCHILDREN);
 
     register_workspace_classes();
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    g_tabs_window = CreateWindowExW(0, L"PixelForgeWorkspaceTabsV2", L"",
+    g_tabs_window = CreateWindowExW(0, L"PixelForgeWorkspaceTabsV3", L"",
                                     WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                     0, 0, 10, TAB_HEIGHT, owner, nullptr, instance, nullptr);
-    g_content_window = CreateWindowExW(0, L"PixelForgeWorkspacePageV2", L"",
+    g_content_window = CreateWindowExW(0, L"PixelForgeWorkspacePageV3", L"",
                                        WS_CHILD | WS_CLIPSIBLINGS,
                                        0, 0, 10, 10, owner, nullptr, instance, nullptr);
     layout_workspace_locked();
@@ -533,39 +711,101 @@ void pack_workspace_ui_publish(HWND owner,
                                std::uint64_t revision,
                                std::wstring project_directory,
                                std::vector<PackUiCanvasInfo> canvases) {
+    // Pack autosave is complete before this function is called. Load immutable
+    // frame snapshots on the worker thread once; paint/timer paths never touch
+    // disk, which removes the old animation flicker and repeated WIC decode cost.
+    std::unordered_map<std::string, PixelSnapshot> loaded;
+    loaded.reserve(canvases.size());
+    for (const auto& canvas : canvases) {
+        PixelSnapshot snapshot;
+        if (load_canvas_snapshot(project_directory, canvas, snapshot))
+            loaded.emplace(canvas.name, std::move(snapshot));
+    }
+
     HWND tabs = nullptr;
     {
         std::lock_guard lock(g_ui_mutex);
         if (owner && !g_owner && is_main_pixelforge_window(owner)) g_owner = owner;
 
-        const bool new_task = g_ui.task_id != 0 && task_id != g_ui.task_id;
-        const std::string previous_canvas = new_task ? std::string{} : g_ui.selected_canvas;
-        const std::string previous_group = new_task ? std::string{} : g_ui.selected_group;
+        const bool new_workspace = g_ui.project_directory != project_directory;
+        const std::string previous_canvas = new_workspace ? std::string{} : g_ui.selected_canvas;
+        const std::string previous_group = new_workspace ? std::string{} : g_ui.selected_group;
+        if (new_workspace) {
+            g_ui.presentations.clear();
+            g_ui.animation_canvases.clear();
+            g_ui.animation_snapshots.clear();
+            g_ui.animation_refresh_pending = false;
+            g_ui.animation_revision = 0;
+        }
+
         g_ui.task_id = task_id;
         g_ui.revision = revision;
         g_ui.project_directory = std::move(project_directory);
         g_ui.canvases = std::move(canvases);
 
-        if (!previous_canvas.empty()) {
-            const auto it = std::find_if(g_ui.canvases.begin(), g_ui.canvases.end(), [&](const auto& c) {
-                return c.name == previous_canvas;
-            });
-            g_ui.selected_canvas = it == g_ui.canvases.end() ? std::string{} : previous_canvas;
-        } else {
-            g_ui.selected_canvas.clear();
+        std::unordered_set<std::string> live_names;
+        live_names.reserve(g_ui.canvases.size());
+        bool queued_reveal = false;
+        for (const auto& canvas : g_ui.canvases) {
+            live_names.insert(canvas.name);
+            const auto source = loaded.find(canvas.name);
+            if (source == loaded.end() || !source->second.valid()) continue;
+
+            auto it = g_ui.presentations.find(canvas.name);
+            if (it == g_ui.presentations.end()) {
+                CanvasPresentation presentation;
+                presentation.authoritative = source->second;
+                presentation.playback.reset_to_authoritative(
+                    PACK_PRESENTATION_TASK,
+                    source->second.width,
+                    source->second.height,
+                    revision,
+                    source->second.pixels);
+                g_ui.presentations.emplace(canvas.name, std::move(presentation));
+                continue;
+            }
+
+            auto& presentation = it->second;
+            const bool changed = presentation.playback.observe_authoritative(
+                PACK_PRESENTATION_TASK,
+                true,
+                source->second.width,
+                source->second.height,
+                revision,
+                source->second.pixels);
+            presentation.authoritative = source->second;
+            queued_reveal = (changed && presentation.playback.animating()) || queued_reveal;
         }
 
-        const auto groups = animation_groups(g_ui);
-        if (!previous_group.empty() && std::find(groups.begin(), groups.end(), previous_group) != groups.end())
-            g_ui.selected_group = previous_group;
+        for (auto it = g_ui.presentations.begin(); it != g_ui.presentations.end();) {
+            if (live_names.find(it->first) == live_names.end()) it = g_ui.presentations.erase(it);
+            else ++it;
+        }
+
+        if (!previous_canvas.empty() && live_names.find(previous_canvas) != live_names.end())
+            g_ui.selected_canvas = previous_canvas;
         else
-            g_ui.selected_group = groups.empty() ? std::string{} : groups.front();
+            g_ui.selected_canvas.clear();
+
+        if (queued_reveal || any_canvas_animating_locked()) {
+            g_ui.animation_refresh_pending = true;
+        } else {
+            // Initial project load and metadata-only updates are already stable.
+            commit_animation_snapshot_locked();
+        }
+
+        if (!previous_group.empty()) {
+            const auto groups = animation_groups(g_ui);
+            if (std::find(groups.begin(), groups.end(), previous_group) != groups.end())
+                g_ui.selected_group = previous_group;
+        }
+        normalize_animation_selection_locked();
 
         tabs = g_tabs_window;
     }
 
     // Pack updates originate on Astra's worker thread. Never call synchronous
-    // HWND APIs there; schedule the page refresh on the owning UI thread.
+    // HWND APIs here; schedule the page refresh on the owning UI thread.
     if (tabs && IsWindow(tabs)) PostMessageW(tabs, WM_PACK_REFRESH, 0, 0);
 }
 
