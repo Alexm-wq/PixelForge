@@ -214,7 +214,7 @@ void draw_canvases_tab(HDC dc, const RECT& client, const UiState& state) {
         }
         const int x = 24 + col * cell_w;
         const int cy = y + row * cell_h;
-        RECT card{x, cy, std::min(client.right - 16, x + cell_w - 12), cy + cell_h - 12};
+        RECT card{x, cy, std::min<LONG>(client.right - 16, static_cast<LONG>(x + cell_w - 12)), cy + cell_h - 12};
         if (card.bottom >= 68 && card.top <= client.bottom - 42) {
             fill_rect_ui(dc, card, canvas.name == state.selected_canvas ? RGB(35, 63, 66) : RGB(24, 29, 33));
             FrameRect(dc, &card, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
