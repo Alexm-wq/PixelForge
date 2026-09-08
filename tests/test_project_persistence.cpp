@@ -50,6 +50,8 @@ int main() {
     // project.json remains alive while the replacement is attempted.
     CHECK(persist_reviewed_project(saved, error));
     CHECK(saved == project.wstring());
+    CHECK(pixelforge::win32::read_project_brief(project) == task.snapshot().review_summary);
+    CHECK(pixelforge::win32::compact_project_brief(std::string(9000, 'x')).size() == 4096);
     const auto accepted_manifest = read_fixture(manifest_path);
     CHECK(accepted_manifest.find("Accepted animation pack") != std::string::npos);
     CHECK(manifest_canvas_count(accepted_manifest) == 120);

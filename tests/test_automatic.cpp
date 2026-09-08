@@ -33,6 +33,7 @@ int mock_server() {
         std::string id; extract_member_raw(line, "id", id);
         if (method == "initialize") emit("{\"id\":" + id + ",\"result\":{}}");
         else if (method == "thread/start") {
+            CHECK(line.find("\"ephemeral\":true") != std::string::npos);
             CHECK(line.find("pixelforge_edit") != std::string::npos);
             CHECK(line.find("pixelforge_program") != std::string::npos);
             CHECK(line.find("MASKPOLY") != std::string::npos);

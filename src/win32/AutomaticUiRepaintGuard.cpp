@@ -1,6 +1,7 @@
 #include "AgentTask.hpp"
 #include "ImageIO.hpp"
 #include "ProjectFileIO.hpp"
+#include "ProjectBrief.hpp"
 
 #include <windows.h>
 
@@ -261,6 +262,7 @@ bool persist_reviewed_project(std::wstring& saved_directory, std::wstring& error
             return false;
         }
         if (!write_text_atomic(manifest_path, manifest, error)) return false;
+        if (!pixelforge::win32::save_project_brief(project, snapshot.review_summary, error)) return false;
         saved_directory = project.wstring();
         return true;
     }
@@ -305,6 +307,7 @@ bool persist_reviewed_project(std::wstring& saved_directory, std::wstring& error
                 ",\"file\":\"canvases/ungrouped/canvas.png\"}\n";
     manifest += "  ]\n}\n";
     if (!write_text_atomic(manifest_path, manifest, error)) return false;
+    if (!pixelforge::win32::save_project_brief(project, snapshot.review_summary, error)) return false;
 
     saved_directory = project.wstring();
     return true;

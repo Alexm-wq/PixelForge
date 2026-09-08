@@ -157,6 +157,42 @@ Use separate calls only when you truly need to see an observation before decidin
 
 ## Multi-canvas packs and animation
 
+### Extend an accepted project
+
+When the user requests additional animations, first read the accepted project
+brief and compact group catalog. Review a few relevant existing animations
+(usually one or two) for character identity, palette, proportions, lighting,
+timing and motion style. Choose references similar to the new requested action;
+inspect extra frames only to resolve a concrete uncertainty. Then append and
+build the requested new animations for this project. Do not review the whole
+project by default. During final QA compare the new animation with those same
+references and check its loop seam, without re-rendering unrelated groups.
+
+For extra animations or frames, use `pixelforge_pack` action `add`, with
+`canvases:"jump0,jump,64,64,0|jump1,jump,64,64,1"`. This appends to the current
+pack; it never clears existing frames. Names must be new. Optional `source`
+copies one existing same-size frame into each new frame locally. You can inspect
+one or two relevant animation groups, append the new group, and draw it with a
+coordinated pass without reviewing the entire project. `create` replaces the
+pack, so do not use it merely to add another animation. Add validates the whole
+batch before publication. Structural additions are not removed by pixel undo.
+
+### Accepted project context
+
+Every Generate starts a fresh ephemeral conversation; intermediate passes within
+that request retain their context. After user acceptance, PixelForge saves the
+finish summary as `project_brief.md` (maximum 4096 UTF-8 bytes). Task get returns
+it as `accepted_project_brief`, including after reopening. Treat it as project
+knowledge and follow the current user's request if it conflicts. Old messages,
+patches, failed attempts and intermediate screenshots are not replayed.
+
+Before finishing, make the review summary a concise, complete replacement brief:
+project name, approved palette/style, proportions/lighting/outline conventions,
+important user constraints, timing/loop conventions and one or two representative
+frame/group names. Preserve still-relevant facts from the previous accepted brief;
+omit transient reasoning and exhaustive frame inventories. Do not invent approval
+for assumptions. Changes become the durable brief only when the user accepts.
+
 ### Large workspace navigation and consistency
 
 Keep the workspace in PixelForge, not in your conversation. Begin with task state,

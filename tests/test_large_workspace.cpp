@@ -1,6 +1,7 @@
 #include "LocalAgentToolSession.hpp"
 #include "ProjectLoader.hpp"
 #include "MiniJson.hpp"
+#include "ProjectBrief.hpp"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +52,26 @@ int main() {
     CHECK(document.pixel(0,0) == 0x00123456 && document.pixel(1,1) == 0xffff0000);
     CHECK(!call("\"action\":\"history\",\"direction\":\"undo\"").success);
     edit = call("\"action\":\"edit\",\"canvas\":\"a\",\"patch\":\"P,4,4,#FFFFFFFF\"");
+    CHECK(edit.success && fields(edit).get_i64("saved_canvases") == 1);
+    const auto before_add = document.pixels();
+    const auto before_add_revision = document.revision();
+    auto added = call("\"action\":\"add\",\"canvases\":\"jump0,jump,8,8,0|jump1,jump,8,8,1\",\"source\":\"a\"");
+    CHECK(added.success && fields(added).get_i64("added_canvases") == 2 && fields(added).get_i64("saved_canvases") == 2);
+    CHECK(document.pixels() == before_add && document.revision() == before_add_revision);
+    ImageData seeded;
+    CHECK(load_image_wic((project / "canvases" / "jump" / "jump0.png").wstring(), seeded, error));
+    CHECK(seeded.bgra[0] == 0x56 && seeded.bgra[1] == 0x34 && seeded.bgra[2] == 0x12 && seeded.bgra[3] == 0);
+    CHECK(!call("\"action\":\"add\",\"canvases\":\"newframe,jump,8,8,2|a,jump,8,8,3\"").success);
+    CHECK(fields(call("\"action\":\"list\"")).get_i64("canvas_count") == 4);
+    CHECK(save_project_brief(project, "Palette: FF123456. Reuse a and jump0; keep lighting from upper left.", error));
+    CHECK(load_project_into_workspace(manifest.wstring(), root.wstring(), tools, task, document, mutex, summary, error));
+    id = summary.task_id;
+    CHECK(fields(call("\"action\":\"list\"")).get_i64("canvas_count") == 4);
+    auto context = tools.call("pixelforge_task", "{\"action\":\"get\"}");
+    CHECK(fields(context).get("accepted_project_brief").find("upper left") != std::string::npos);
+    tools.stop();
+    CHECK(tools.start(bindings, {&recorder, &task, &mutex, hwnd, (root / "recordings").wstring()}, error));
+    edit = call("\"action\":\"edit\",\"canvas\":\"a\",\"patch\":\"P,5,5,#FFFFFFFF\"");
     CHECK(edit.success && fields(edit).get_i64("saved_canvases") == 1);
 
     // 200 animations, 8 frames each. Measure native tool work, not model usage.

@@ -1044,6 +1044,40 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
     auto& workspace = workspace_it->second;
     workspace.task_id = task_id;
 
+    if (action == "ADD") {
+        if (snapshot.state != TaskState::Accepted)
+            return {false, "{\"ok\":false,\"error\":\"invalid_state\"}"};
+        std::vector<CanvasSpec> specs; std::string error;
+        if (!parse_specs(args.get("canvases"), specs, error))
+            return {false, "{\"ok\":false,\"error\":\"invalid_canvases\",\"message\":" + quote_json(error) + "}"};
+        std::lock_guard state_lock(*bindings_.state_mutex);
+        const auto source_name = args.get("source");
+        const auto* source = source_name.empty() ? nullptr : find_canvas(workspace, source_name);
+        if (!source_name.empty() && !source) return {false, "{\"ok\":false,\"error\":\"unknown_canvas\"}"};
+        std::vector<PackCanvas> added;
+        for (const auto& spec : specs) {
+            if (find_canvas(workspace, spec.name))
+                return {false, "{\"ok\":false,\"error\":\"duplicate_canvas\",\"canvas\":" + quote_json(spec.name) + "}"};
+            if (source && (source->document->width() != spec.width || source->document->height() != spec.height))
+                return {false, "{\"ok\":false,\"error\":\"size_mismatch\"}"};
+            PackCanvas canvas;
+            canvas.name = spec.name; canvas.group = spec.group; canvas.frame = spec.frame;
+            canvas.owned = std::make_unique<PixelDocument>(bindings_.document->limits());
+            const bool ready = source ? canvas.owned->replace_pixels(spec.width, spec.height, source->document->pixels(), &error)
+                                      : canvas.owned->resize(spec.width, spec.height, &error);
+            if (!ready) return {false, "{\"ok\":false,\"error\":\"allocation_failed\",\"message\":" + quote_json(error) + "}"};
+            canvas.document = canvas.owned.get(); added.push_back(std::move(canvas));
+        }
+        // Allocate everything before publishing any new frame. Existing pixels,
+        // primary canvas and their undo history are untouched.
+        workspace.canvases.reserve(workspace.canvases.size() + added.size());
+        for (auto& canvas : added) workspace.canvases.push_back(std::move(canvas));
+        workspace.name_index.clear(); ++workspace.revision;
+        return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
+            ",\"added_canvases\":" + std::to_string(specs.size()) + ",\"canvas_count\":" + std::to_string(workspace.canvases.size()) +
+            ",\"seeded\":" + std::string(source ? "true" : "false") + "}"};
+    }
+
     if (action == "LIST" || action == "ANALYZE") {
         std::lock_guard state_lock(*bindings_.state_mutex);
         auto selected = select_canvases(workspace, args.get("canvases"), args.get("group"), args.get("canvas"));

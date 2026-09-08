@@ -339,6 +339,9 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                     return 0;
                 }
                 sync_loaded_project_back();
+                // Accepted artwork is now a durable project. The next Generate
+                // resumes its pixels/task ID in a fresh ephemeral Codex thread.
+                g_loaded_project = true;
 
                 // Keep recording for a short tail after the click so the demo
                 // captures the review popup disappearing and the accepted final state.

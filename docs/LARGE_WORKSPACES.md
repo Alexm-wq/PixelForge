@@ -1,5 +1,28 @@
 # Large workspace audit
 
+## Adding animations after acceptance
+
+Acceptance saves a bounded `project_brief.md` from the reviewed finish summary.
+Every Generate already creates a fresh ephemeral agent thread; the next task gets
+the accepted brief through `pixelforge_task get` instead of replayed conversation
+history. The brief survives project closing/reopening. Existing session logs are
+not deleted or sent as context. Pixel/autosave caches survive a conversation reset.
+
+The agent should read the brief and group catalog, inspect a few relevant existing
+animations (usually one or two), then append and build the requested animations.
+It should review unrelated groups only when a concrete uncertainty requires it.
+Final QA compares new frames against those selected references and their loop seam.
+
+```json
+{"action":"add","task_id":123,"canvases":"jump0,jump,64,64,0|jump1,jump,64,64,1","source":"idle0"}
+```
+
+`add` publishes all new frames together, rejects duplicate names, and leaves
+existing artwork and primary dimensions intact. Optional `source` must name an
+existing same-size frame and copies its exact pixels into each new frame. Omit it
+for blank frames. Pixel history does not remove structural additions. Use a normal
+multi-canvas drawing pass after adding the frames; `create` remains replacement.
+
 ## Agent navigation
 
 Use `pixelforge_task get` to identify the task, then:
