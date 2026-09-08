@@ -47,6 +47,8 @@ public:
 
     [[nodiscard]] bool can_resize(int width, int height, std::string* reason = nullptr) const;
     bool resize(int width, int height, std::string* reason = nullptr);
+    // Cold project restore: exact pixels, no per-pixel undo expansion.
+    bool replace_pixels(int width, int height, std::vector<std::uint32_t> pixels, std::string* reason = nullptr);
 
     [[nodiscard]] std::uint32_t pixel(int x, int y) const;
 

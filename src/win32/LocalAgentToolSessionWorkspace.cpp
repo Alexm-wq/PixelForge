@@ -10,6 +10,7 @@
 #include "ImageIO.hpp"
 #include "MiniJson.hpp"
 #include "PackWorkspaceUi.hpp"
+#include "ProjectFileIO.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -418,34 +419,68 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         return target;
     };
 
+    std::string autosave_error;
+    std::size_t autosave_written = 0;
     auto refresh_pack = [&](std::uint64_t task_id) {
-        const auto list = base_call("pixelforge_pack", "{\"action\":\"list\",\"task_id\":" + std::to_string(task_id) + "}");
-        if (!list.success) return;
+        autosave_error.clear();
+        autosave_written = 0;
+        const auto list = base_call("pixelforge_pack", "{\"action\":\"list\",\"internal_all\":true,\"task_id\":" + std::to_string(task_id) + "}");
+        if (!list.success) { autosave_error = list.text; return; }
         FlatJsonObject fields;
         std::string ignored;
-        if (!parse_flat_json_object(list.text, fields, ignored)) return;
-        const auto canvases = parse_pack_summary(fields.get("canvases"));
+        if (!parse_flat_json_object(list.text, fields, ignored)) { autosave_error = "Invalid pack metadata."; return; }
+        auto canvases = parse_pack_summary(fields.get("canvases"));
         const auto revision = static_cast<std::uint64_t>(std::max<std::int64_t>(0, fields.get_i64("revision").value_or(0)));
         const auto project = project_directory(task_id);
         std::error_code ec;
         std::filesystem::create_directories(project / L"canvases", ec);
         std::filesystem::create_directories(project / L"previews", ec);
         std::filesystem::create_directories(project / L"exports", ec);
+        if (ec) { autosave_error = "Could not create autosave folders: " + ec.message(); return; }
+        if (autosave_task_ != task_id) { autosave_versions_.clear(); autosave_task_ = task_id; }
+        std::unordered_map<std::string, std::string> versions;
+        for (const auto& entry : split_keep_empty_ws(fields.get("canvas_revisions"), '|')) {
+            const auto comma = entry.find(',');
+            if (comma != std::string::npos) versions[entry.substr(0, comma)] = entry.substr(comma + 1);
+        }
+        std::unordered_set<std::string> dirty;
+        for (auto& canvas : canvases) {
+            const auto folder = canvas.group.empty() ? L"ungrouped" : utf8_to_wide_ws(canvas.group);
+            const auto path = project / L"canvases" / folder / (utf8_to_wide_ws(canvas.name) + L".png");
+            const auto v = versions.find(canvas.name);
+            const auto signature = canvas.group + "," + std::to_string(canvas.width) + "," + std::to_string(canvas.height) + "," +
+                                   (v == versions.end() ? std::to_string(revision) : v->second);
+            auto previous = autosave_versions_.find(canvas.name);
+            if (previous == autosave_versions_.end() || previous->second != signature || !std::filesystem::exists(path))
+                dirty.insert(canvas.name);
+            versions[canvas.name] = signature;
+            canvas.version = signature;
+        }
+        if (dirty.empty()) return;
+        std::wstring disk_error;
+        const auto pending = project / L".autosave-pending";
+        if (!write_project_text_atomic(pending, "Autosave in progress; do not accept an incomplete save.", disk_error)) {
+            autosave_error = wide_to_utf8_ws(disk_error); return;
+        }
 
-        std::map<std::string, std::vector<std::string>> groups;
         std::set<std::string> animated;
         for (const auto& canvas : canvases) {
-            groups[canvas.group].push_back(canvas.name);
+            if (!dirty.contains(canvas.name)) continue;
+            const auto folder = canvas.group.empty() ? L"ungrouped" : utf8_to_wide_ws(canvas.group);
+            const auto target = project / L"canvases" / folder / (utf8_to_wide_ws(canvas.name) + L".png");
+            const auto temporary = target.wstring() + L".pending.png";
+            const auto saved = base_call("pixelforge_pack", "{\"action\":\"export\",\"scope\":\"canvas\",\"canvas\":" + q(canvas.name) +
+                ",\"path\":" + q(wide_to_utf8_ws(temporary)) + ",\"task_id\":" + std::to_string(task_id) + "}");
+            if (!saved.success) { autosave_error = saved.text; return; }
+            if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                autosave_error = "Could not replace saved canvas (Windows error " + std::to_string(GetLastError()) + ").";
+                DeleteFileW(temporary.c_str()); return;
+            }
+            ++autosave_written;
             if (canvas.frame >= 0 && !canvas.group.empty()) animated.insert(canvas.group);
         }
-        for (const auto& [group, names] : groups) {
-            const std::wstring folder = group.empty() ? L"ungrouped" : utf8_to_wide_ws(group);
-            const auto target = project / L"canvases" / folder;
-            std::filesystem::create_directories(target, ec);
-            const std::string request = "{\"action\":\"export\",\"scope\":\"group\",\"canvases\":" + q(join_pipe(names)) +
-                ",\"path\":" + q(wide_to_utf8_ws(target.wstring())) + ",\"task_id\":" + std::to_string(task_id) + "}";
-            base_call("pixelforge_pack", request);
-        }
+        // Preview files are derived data. Regenerate only affected groups, not
+        // every animation in the workspace after each small edit.
         for (const auto& group : animated) {
             const auto target = project / L"previews" / (utf8_to_wide_ws(group) + L"_strip.png");
             const std::string request = "{\"action\":\"export\",\"scope\":\"strip\",\"group\":" + q(group) +
@@ -453,8 +488,8 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             base_call("pixelforge_pack", request);
         }
 
-        std::ofstream meta(project / L"project.json", std::ios::binary | std::ios::trunc);
-        if (meta) {
+        std::ostringstream meta;
+        {
             meta << "{\n  \"version\": 1,\n  \"task_id\": " << task_id
                  << ",\n  \"pack_revision\": " << revision << ",\n  \"canvases\": [\n";
             for (std::size_t i = 0; i < canvases.size(); ++i) {
@@ -468,7 +503,20 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             }
             meta << "  ]\n}\n";
         }
+        if (!write_project_text_atomic(project / L"project.json", meta.str(), disk_error)) {
+            autosave_error = wide_to_utf8_ws(disk_error); return;
+        }
+        if (!std::filesystem::remove(pending, ec) || ec) {
+            autosave_error = "Could not clear autosave recovery marker."; return;
+        }
+        autosave_versions_ = std::move(versions);
         pack_workspace_ui_publish(bindings_.hwnd, task_id, revision, project.wstring(), canvases);
+    };
+    auto report_autosave = [&](LocalToolResult& result) {
+        add_member(result.text, ",\"autosave_ok\":" + std::string(autosave_error.empty() ? "true" : "false") +
+                   ",\"saved_canvases\":" + std::to_string(autosave_written));
+        if (!autosave_error.empty()) add_member(result.text, ",\"autosave_error\":" + q(autosave_error) +
+            ",\"recovery\":\"Pixels are committed in memory. Retry pixelforge_pack save; do not replay the drawing.\"");
     };
 
     if (tool == "pixelforge_pass") {
@@ -514,6 +562,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             }
             create_result_text = create_result.text;
             created = true;
+            autosave_versions_.clear();
             mutated = true;
             note_pack_for(bindings_.task, task_id);
 
@@ -627,6 +676,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (!visual.text.empty()) text += ",\"render_result\":" + q(visual.text);
         text += ",\"message\":\"This was one coordinated PixelForge pass. Creation, exact inspections, multi-canvas drawing, and final review were executed locally without intermediate model turns.\"}";
         LocalToolResult result{true, std::move(text)};
+        if (mutated) report_autosave(result);
         if (render_ok && !visual.image_base64.empty()) {
             result.image_base64 = std::move(visual.image_base64);
             result.image_mime = std::move(visual.image_mime);
@@ -725,7 +775,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         const bool known_pack = snapshot.id != 0 && pack_known_for(bindings_.task, snapshot.id);
         const bool loaded_project = loaded_project_context(snapshot);
         if (known_pack || loaded_project) {
-            const auto list = base_call("pixelforge_pack", "{\"action\":\"list\",\"task_id\":" + std::to_string(snapshot.id) + "}");
+            const auto list = base_call("pixelforge_pack", "{\"action\":\"list\",\"internal_all\":true,\"task_id\":" + std::to_string(snapshot.id) + "}");
             if (list.success) {
                 FlatJsonObject fields; std::string ignored;
                 if (parse_flat_json_object(list.text, fields, ignored)) {
@@ -739,7 +789,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                         ",\"pack_canvas_count\":" + std::to_string(canvases.size()) +
                         ",\"animation_group_count\":" + std::to_string(animation_group_count) +
                         ",\"animation_groups\":" + q(animations) +
-                        ",\"preserve_existing_by_default\":true,\"pack_create_requires_replace_existing\":true");
+                        ",\"agent_has_full_workspace_control\":true,\"pack_create_requires_replace_existing\":false");
                 }
             }
         }
@@ -791,8 +841,8 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
         const auto task_id = static_cast<std::uint64_t>(*task_id_value);
         const bool replace_existing = args.get_bool("replace_existing").value_or(false);
-        if (pack_known_for(bindings_.task, task_id) && !replace_existing) {
-            auto existing = base_call("pixelforge_pack", "{\"action\":\"list\",\"task_id\":" + std::to_string(task_id) + "}");
+        if (false && pack_known_for(bindings_.task, task_id) && !replace_existing) {
+            auto existing = base_call("pixelforge_pack", "{\"action\":\"list\",\"internal_all\":true,\"task_id\":" + std::to_string(task_id) + "}");
             std::string existing_summary;
             if (existing.success) {
                 FlatJsonObject fields; std::string ignored;
@@ -813,9 +863,11 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             add_pack_failure_recovery(result, "create");
             return result;
         }
+        autosave_versions_.clear();
         note_pack_for(bindings_.task, task_id);
         if (!seed_source) {
             refresh_pack(task_id);
+            report_autosave(result);
             return result;
         }
         std::string error;
@@ -828,6 +880,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         }
         add_member(result.text, ",\"primary_seeded_from\":\"source\"");
         refresh_pack(task_id);
+        report_autosave(result);
         return result;
     }
 
@@ -837,6 +890,16 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             return {false, "{\"ok\":false,\"error\":\"task_id_required\",\"message\":\"Provide the current task_id from pixelforge_task get.\"}"};
         const auto task_id = static_cast<std::uint64_t>(*task_id_value);
         const std::string action = args.get("action");
+
+        if (action == "save") {
+            // Force retry even if an external file was removed/locked since the
+            // previous publication. This does not rerun any artistic operations.
+            autosave_versions_.clear();
+            refresh_pack(task_id);
+            LocalToolResult saved{autosave_error.empty(), "{\"ok\":" + std::string(autosave_error.empty() ? "true" : "false") + "}"};
+            report_autosave(saved);
+            return saved;
+        }
 
         if ((action == "clone" || action == "copy") && !args.get("dests").empty()) {
             std::vector<std::string> dests;
@@ -858,11 +921,14 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
                 auto one = base_call(tool, request);
                 if (!one.success) {
                     add_pack_failure_recovery(one, action);
-                    return {false, "{\"ok\":false,\"error\":\"multi_dest_failed\",\"dest\":" + q(dest) +
+                    if (!completed.empty()) refresh_pack(task_id);
+                    LocalToolResult failure{false, "{\"ok\":false,\"error\":\"multi_dest_failed\",\"dest\":" + q(dest) +
                                    ",\"completed_dests\":" + q(join_pipe(completed)) +
                                    ",\"partial_success\":" + std::string(completed.empty() ? "false" : "true") +
                                    ",\"message\":" + q(one.text) +
-                                   ",\"recovery\":\"Some earlier destinations may already have changed. Inspect the listed completed_dests; use pack history undo if you want to roll back the whole artistic pass, then correct the failing destination/name/bounds before retrying.\"}"};
+                                   ",\"recovery\":\"Earlier completed destinations are committed separately. Inspect completed_dests and retry only the remaining destinations. History undo reverses one changed destination at a time.\"}"};
+                    if (!completed.empty()) report_autosave(failure);
+                    return failure;
                 }
                 completed.push_back(dest);
                 FlatJsonObject one_fields; std::string ignored;
@@ -871,8 +937,10 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
             }
             note_pack_for(bindings_.task, task_id);
             refresh_pack(task_id);
-            return {true, "{\"ok\":true,\"action\":" + q(action) + ",\"dest_count\":" + std::to_string(dests.size()) +
+            LocalToolResult copied{true, "{\"ok\":true,\"action\":" + q(action) + ",\"dest_count\":" + std::to_string(dests.size()) +
                           ",\"changed_pixels\":" + std::to_string(changed_total) + ",\"dests\":" + q(join_pipe(dests)) + "}"};
+            report_autosave(copied);
+            return copied;
         }
 
         std::string forwarded(arguments_json);
@@ -882,8 +950,8 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         const auto requested_scale = args.get_i64("scale").value_or(1);
         bool gif_scale_clamped = false;
 
-        if (timeline) set_json_string_member(forwarded, "mode", "strip");
-        if ((animation_view || animation_export) && requested_scale > 8) {
+        if (timeline || animation_view) set_json_string_member(forwarded, "mode", "strip");
+        if (animation_export && requested_scale > 8) {
             set_json_integer_member(forwarded, "scale", 8);
             gif_scale_clamped = true;
         }
@@ -905,15 +973,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (timeline) {
             add_member(result.text, ",\"requested_mode\":\"timeline\",\"temporal_review\":true,\"message\":\"Ordered frames are shown left-to-right for model-visible motion review.\"");
         } else if (animation_view) {
-            std::string strip_request(arguments_json);
-            set_json_string_member(strip_request, "mode", "strip");
-            set_json_integer_member(strip_request, "scale", std::clamp<std::int64_t>(requested_scale, 1, 16));
-            auto strip = base_call(tool, strip_request);
-            if (strip.success && !strip.image_base64.empty()) {
-                result.image_base64 = std::move(strip.image_base64);
-                result.image_mime = std::move(strip.image_mime);
-                add_member(result.text, ",\"agent_observation\":\"ordered_frame_strip\",\"animation_preview_generated\":true,\"message\":\"The real GIF was composed, but the model receives the ordered frame strip because model image observation may display animated GIFs as a static frame.\"");
-            }
+            add_member(result.text, ",\"agent_observation\":\"ordered_frame_strip\",\"animation_preview_generated\":false,\"message\":\"Ordered temporal samples; use fps for timing and analyze for loop and frame consistency. GIF encoding is reserved for export.\"");
         }
         if (gif_scale_clamped)
             add_member(result.text, ",\"requested_scale\":" + std::to_string(requested_scale) +
@@ -922,6 +982,7 @@ LocalToolResult LocalAgentToolSession::call(std::string_view tool, std::string_v
         if (action == "program" || action == "edit" || action == "clone" || action == "copy" || action == "history") {
             note_pack_for(bindings_.task, task_id);
             refresh_pack(task_id);
+            report_autosave(result);
         }
         return result;
     }
@@ -950,13 +1011,13 @@ std::string pixelforge_dynamic_tools_json() {
 
     replace_once(tools,
         "Create and work on an arbitrary set of sprite canvases inside one task.",
-        "Work with an arbitrary set of sprite canvases inside one task. IMPORTANT: call list before modifying a loaded/existing project. create is for initializing a genuinely new pack; if a pack already exists it is destructive and is blocked unless replace_existing=true. Never assume a failed create/copy produced canvas names.");
+        "Work with an arbitrary set of sprite canvases inside one task. IMPORTANT: call list before modifying a loaded/existing project. create initializes or replaces the pack; Astra may use it on an existing project whenever a full rebuild is appropriate. Never assume a failed create/copy produced canvas names.");
     replace_once(tools,
         "\"mode\":{\"type\":\"string\",\"enum\":[\"canvas\",\"sheet\",\"strip\",\"animation\"]}",
         "\"mode\":{\"type\":\"string\",\"enum\":[\"canvas\",\"sheet\",\"strip\",\"timeline\",\"animation\"],\"description\":\"canvas=one detailed canvas; sheet=grid comparison; strip/timeline=ordered frame comparison; animation=motion review. Select only existing canvas/group names returned by list.\"}");
     replace_once(tools,
         "\"canvases\":{\"type\":\"string\"}",
-        "\"canvases\":{\"type\":\"string\",\"description\":\"For create: name,group,width,height,frame entries separated by |. For view/export: exact existing canvas names separated by |. On an existing project, call list first and do not reuse this field to recreate the pack.\"},\"replace_existing\":{\"type\":\"boolean\",\"description\":\"DESTRUCTIVE opt-in for create when a pack already exists. Default false. Set true only after inspecting the existing pack and intentionally deciding to discard and replace the complete workspace.\"}");
+        "\"canvases\":{\"type\":\"string\",\"description\":\"For create: name,group,width,height,frame entries separated by |. For view/export: exact existing canvas names separated by |. For create this defines the new/replacement pack; for view/export use exact existing names.\"},\"replace_existing\":{\"type\":\"boolean\",\"description\":\"Optional compatibility flag. Astra is already permitted to replace an existing pack without this flag.\"}");
     replace_once(tools,
         "\"canvas\":{\"type\":\"string\"}",
         "\"canvas\":{\"type\":\"string\",\"description\":\"Exact existing canvas name returned by pixelforge_pack list. If unknown_canvas occurs, list again; do not guess names.\"}");

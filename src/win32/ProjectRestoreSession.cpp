@@ -71,6 +71,8 @@ LocalToolResult LocalAgentToolSession::restore_project_pack(
     // canvases. Project restore builds the complete in-memory pack first.
     auto created = base_call("pixelforge_pack", create_arguments_json);
     if (!created.success) return created;
+    auto pixels_restored = restore_pack_pixels(task_id, canvases);
+    if (!pixels_restored.success) return pixels_restored;
 
     for (const auto& canvas : canvases) {
         for (const auto& patch : canvas.patches) {
@@ -88,14 +90,26 @@ LocalToolResult LocalAgentToolSession::restore_project_pack(
     }
 
     auto listed = base_call("pixelforge_pack",
-        "{\"action\":\"list\",\"task_id\":" + std::to_string(task_id) + "}");
+        "{\"action\":\"list\",\"internal_all\":true,\"task_id\":" + std::to_string(task_id) + "}");
     if (!listed.success) return listed;
 
     FlatJsonObject fields;
     if (!parse_flat_json_object(listed.text, fields, parse_error))
         return {false, "{\"ok\":false,\"error\":\"restore_list_parse_failed\"}"};
 
-    const auto metadata = parse_restore_summary(fields.get("canvases"));
+    auto metadata = parse_restore_summary(fields.get("canvases"));
+    std::unordered_map<std::string, std::string> restored_versions;
+    for (const auto& entry : split_restore(fields.get("canvas_revisions"), '|')) {
+        const auto comma = entry.find(',');
+        if (comma != std::string::npos) restored_versions[entry.substr(0, comma)] = entry.substr(comma + 1);
+    }
+    autosave_versions_.clear(); autosave_task_ = task_id;
+    for (auto& canvas : metadata) {
+        const auto version = restored_versions.find(canvas.name);
+        if (version == restored_versions.end()) continue;
+        canvas.version = canvas.group + "," + std::to_string(canvas.width) + "," + std::to_string(canvas.height) + "," + version->second;
+        autosave_versions_[canvas.name] = canvas.version;
+    }
     const auto revision = static_cast<std::uint64_t>(
         std::max<std::int64_t>(0, fields.get_i64("revision").value_or(0)));
 

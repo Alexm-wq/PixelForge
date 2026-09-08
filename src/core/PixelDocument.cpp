@@ -56,6 +56,17 @@ bool PixelDocument::in_bounds(int x, int y) const noexcept {
     return x >= 0 && y >= 0 && x < width_ && y < height_;
 }
 
+bool PixelDocument::replace_pixels(int width, int height, std::vector<std::uint32_t> pixels, std::string* reason) {
+    if (!can_resize(width, height, reason)) return false;
+    if (pixels.size() != static_cast<std::size_t>(width) * height) {
+        if (reason) *reason = "Restored pixel count does not match canvas dimensions.";
+        return false;
+    }
+    width_ = width; height_ = height; pixels_ = std::move(pixels);
+    ++revision_; clear_history();
+    return true;
+}
+
 std::size_t PixelDocument::index_of(int x, int y) const noexcept {
     return static_cast<std::size_t>(y) * static_cast<std::size_t>(width_) + static_cast<std::size_t>(x);
 }

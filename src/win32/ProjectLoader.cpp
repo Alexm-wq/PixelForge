@@ -2,6 +2,7 @@
 
 #include "ImageIO.hpp"
 #include "MiniJson.hpp"
+#include "ProjectFileIO.hpp"
 
 #include <commdlg.h>
 
@@ -12,6 +13,8 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <limits>
+#include <unordered_set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -54,7 +57,7 @@ std::string q(std::string_view text) {
 }
 
 bool safe_component(std::string_view value) {
-    if (value.empty() || value.size() > 96) return false;
+    if (value.empty() || value == "." || value == ".." || value.back() == '.') return false;
     for (const unsigned char c : value)
         if (!std::isalnum(c) && c != '_' && c != '-' && c != '.') return false;
     return true;
@@ -187,11 +190,15 @@ bool copy_project_tree(const std::filesystem::path& source,
         ec.clear();
         if (std::filesystem::equivalent(source, destination, ec) && !ec) return true;
         ec.clear();
-        std::filesystem::remove_all(destination, ec);
-        if (ec) {
-            error = L"Could not clear the PixelForge working project directory.";
-            return false;
-        }
+        error = L"The destination project already exists; refusing to overwrite it.";
+        return false;
+    }
+    const auto absolute_source = std::filesystem::weakly_canonical(source, ec);
+    const auto absolute_destination = std::filesystem::weakly_canonical(destination, ec);
+    if (ec) { error = L"Could not resolve project directories."; return false; }
+    const auto relative_destination = absolute_destination.lexically_relative(absolute_source);
+    if (!relative_destination.empty() && *relative_destination.begin() != L"..") {
+        error = L"Cannot copy a project into one of its own subdirectories."; return false;
     }
     std::filesystem::create_directories(destination, ec);
     if (ec) {
@@ -248,6 +255,7 @@ bool parse_manifest(const std::filesystem::path& manifest,
     const auto root = manifest.parent_path();
     canvases.clear();
     canvases.reserve(objects.size());
+    std::unordered_set<std::string> names;
     for (const auto& object : objects) {
         FlatJsonObject fields;
         if (!parse_flat_json_object(object, fields, parse_error)) {
@@ -257,10 +265,16 @@ bool parse_manifest(const std::filesystem::path& manifest,
         SavedCanvas canvas;
         canvas.name = fields.get("name");
         canvas.group = fields.get("group");
-        canvas.frame = static_cast<int>(fields.get_i64("frame").value_or(-1));
-        canvas.width = static_cast<int>(fields.get_i64("width").value_or(0));
-        canvas.height = static_cast<int>(fields.get_i64("height").value_or(0));
+        const auto frame = fields.get_i64("frame").value_or(-1);
+        const auto width = fields.get_i64("width").value_or(0), height = fields.get_i64("height").value_or(0);
+        if (frame < -1 || frame > INT_MAX || width <= 0 || width > INT_MAX || height <= 0 || height > INT_MAX) {
+            error = L"Invalid project dimensions or frame index."; return false;
+        }
+        canvas.frame = static_cast<int>(frame); canvas.width = static_cast<int>(width); canvas.height = static_cast<int>(height);
         canvas.file = fields.get("file");
+        auto key = canvas.name;
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (!names.insert(key).second) { error = L"Duplicate canvas name in project."; return false; }
         if (!safe_component(canvas.name) || (!canvas.group.empty() && !safe_component(canvas.group)) ||
             canvas.width <= 0 || canvas.height <= 0) {
             error = L"The project contains an invalid canvas name, group, or dimension.";
@@ -356,9 +370,31 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
     std::vector<SavedCanvas> canvases;
     if (!parse_manifest(manifest, restored_task_id, canvases, error)) return false;
 
-    const auto active_directory = std::filesystem::path(repo_root) / L"projects" /
+    auto active_directory = std::filesystem::path(repo_root) / L"projects" /
                                   (L"task_" + std::to_wstring(restored_task_id));
+    std::error_code ec;
+    while (std::filesystem::exists(active_directory, ec) &&
+           !std::filesystem::equivalent(manifest.parent_path(), active_directory, ec)) {
+        restored_task_id = std::max(restored_task_id + 1, static_cast<std::uint64_t>(GetTickCount64()));
+        active_directory = std::filesystem::path(repo_root) / L"projects" / (L"task_" + std::to_wstring(restored_task_id));
+        ec.clear();
+    }
     if (!copy_project_tree(manifest.parent_path(), active_directory, error)) return false;
+    // An imported copy may have received a new working ID. Keep its manifest
+    // consistent without touching the source or the project that occupied it.
+    if (active_directory != manifest.parent_path()) {
+        std::string copied;
+        const auto copied_manifest = active_directory / manifest.filename();
+        if (!read_text(copied_manifest, copied)) { error = L"Could not read imported project manifest."; return false; }
+        auto p = copied.find("\"task_id\"");
+        p = copied.find(':', p);
+        if (p == std::string::npos) { error = L"Imported project is missing its task id."; return false; }
+        p = copied.find_first_not_of(" \t\r\n", p + 1);
+        auto end = p;
+        while (end < copied.size() && std::isdigit(static_cast<unsigned char>(copied[end]))) ++end;
+        copied.replace(p, end - p, std::to_string(restored_task_id));
+        if (!write_project_text_atomic(copied_manifest, copied, error)) return false;
+    }
 
     {
         std::lock_guard lock(state_mutex);
@@ -383,8 +419,16 @@ bool load_project_into_workspace(const std::wstring& manifest_path,
 
     std::vector<LocalPackRestoreCanvas> restore_canvases;
     restore_canvases.reserve(canvases.size());
-    for (const auto& canvas : canvases)
-        restore_canvases.push_back({canvas.name, encode_patch_chunks(canvas.image)});
+    for (auto& canvas : canvases) {
+        LocalPackRestoreCanvas saved;
+        saved.name = canvas.name; saved.width = canvas.width; saved.height = canvas.height;
+        saved.pixels.resize(static_cast<std::size_t>(canvas.width) * canvas.height);
+        for (int y = 0; y < canvas.height; ++y)
+            for (int x = 0; x < canvas.width; ++x)
+                saved.pixels[static_cast<std::size_t>(y) * canvas.width + x] = argb_at(canvas.image, x, y);
+        canvas.image = {}; // Release decoded bytes as each compact payload is built.
+        restore_canvases.push_back(std::move(saved));
+    }
 
     const std::string create_args = "{\"action\":\"create\",\"task_id\":" + std::to_string(restored_task_id) +
         ",\"canvases\":" + q(canvas_specs(canvases)) + ",\"seed_from_source\":false}";

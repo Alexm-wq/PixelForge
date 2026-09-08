@@ -157,6 +157,52 @@ Use separate calls only when you truly need to see an observation before decidin
 
 ## Multi-canvas packs and animation
 
+### Large workspace navigation and consistency
+
+Keep the workspace in PixelForge, not in your conversation. Begin with task state,
+then `pixelforge_pack` action `list` with `summary:true` for a group catalog.
+Use `analyze` with `summary:true` to get one compact consistency row per group
+(empty/duplicate frames, size mismatches, occupancy range, worst transition).
+Both summary operations paginate groups; request `limit:256` to survey hundreds
+of animations in one text result. Then drop `summary` and filter by `group` for
+exact frame names or measurements. Frame listings are
+paged: default 64 frames, `limit` up to 256, and `offset`. `canvas_count` is the
+whole pack count; `total_count` is the matching selection. Follow `next_offset`
+until -1 only when you need more names. A page is never the whole project unless
+its metadata says so. Use exact returned names; do not recreate a pack to recover
+from a missing name or a failed edit.
+
+Use `action:"analyze"` with a group or selected canvases to check consistency
+without sending images. It returns compact rows with columns identifying frame,
+dimensions, visible pixel count, bounds, centroid, color count, pixel hash and
+changed pixels against the previous selected frame. The first frame compares to
+the last selected frame of that group, including the loop seam. Repeated analysis
+reuses revision-keyed caches. Measurements flag possible drift, empty/duplicate
+frames, size mismatches and abrupt changes; intentional motion can also cause
+those changes. Numeric results do not establish anatomy or artistic quality.
+
+Analyze relevant groups first, then visually review suspect frames and their
+neighbors together. `view` returns a page of at most 32 frames by default
+(`limit` up to 128). Images fit a 1-megapixel observation budget; previews may be
+downsampled. Inspect a single canvas or a small exact region for fine pixel QA.
+Pack `inspect` returns up to 1024 exact pixels by default (`pixel_limit` up to
+4096). Its RLE is row-major within the clipped rectangle, starting at
+`pixel_offset`; follow `next_pixel_offset` to read more. The returned rectangle
+still describes the requested region, not just the page. Never treat a partial
+pixel page as the complete frame.
+Reuse observations; unchanged views return metadata without image bytes. Export
+is separate and retains full resolution and the entire requested selection.
+Animation views give ordered temporal samples with FPS metadata, not evidence that
+the model watched real-time playback. Inspect the final-to-first transition too.
+
+Work on a coherent animation/group per pass, and apply shared corrections to
+affected frames together. Do not dump every frame or inspect every pixel merely
+because the project is large. Keep a brief note of reviewed groups and named
+issues. Successful edits return `autosave_ok` and `saved_canvases`. If saving fails,
+the pixels are already committed: use `pixelforge_pack` action `save` to retry
+persistence, rather than replaying the drawing. Never claim that an unsaved edit
+was safely persisted.
+
 Use `pixelforge_pack` or `pixelforge_pass` whenever one request naturally produces more than one sprite/frame.
 
 For a **genuinely new** pack, create all required canvases in one set, e.g.:

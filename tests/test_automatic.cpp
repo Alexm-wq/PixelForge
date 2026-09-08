@@ -19,6 +19,11 @@ std::string invoke(int id, const std::string& tool, const std::string& args, boo
     const auto marker = line.find("\"text\":"); CHECK(marker != std::string::npos);
     std::size_t p = marker + 7; std::string text; CHECK(parse_string(line, p, text));
     if (tool == "view") CHECK(line.find("data:image/png;base64,") != std::string::npos);
+    if (tool == "pack" && args.find("\"mode\":\"animation\"") != std::string::npos) {
+        const auto first_image = line.find("\"type\":\"inputImage\"");
+        CHECK(first_image != std::string::npos);
+        CHECK(line.find("\"type\":\"inputImage\"", first_image + 1) == std::string::npos);
+    }
     return text;
 }
 int mock_server() {
@@ -65,6 +70,10 @@ int mock_server() {
                 CHECK(line.find("inputImage") == std::string::npos && line.find("unchanged") != std::string::npos);
                 auto resend_args = view_args; resend_args.pop_back(); resend_args += ",\"resend_image\":true}";
                 invoke(31, "view", resend_args);
+                invoke(32, "pass", "{\"task_id\":" + task_id +
+                    ",\"create_canvases\":\"a,walk,8,8,0|b,walk,8,8,1\",\"seed_from_source\":false,"
+                    "\"program\":\"CANVAS a;P 1 1 #FF123456;CANVAS b;P 2 1 #FF123456\"}");
+                invoke(33, "pack", "{\"action\":\"view\",\"mode\":\"animation\",\"group\":\"walk\",\"task_id\":" + task_id + "}");
                 invoke(4, "task", "{\"action\":\"finish\",\"task_id\":" + task_id + ",\"expected_revision\":" + rev + "}");
             }
             emit("{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}");
@@ -113,7 +122,8 @@ int main(int argc, char**) {
         CHECK(first.success && !first.image_base64.empty());
         FlatJsonObject metadata; std::string parse_error;
         CHECK(parse_flat_json_object(first.text, metadata, parse_error));
-        CHECK(*metadata.get_i64("width") * *metadata.get_i64("height") <= 65536);
+        // The current reference contract preserves native source resolution.
+        CHECK(metadata.get_i64("width") == 512 && metadata.get_i64("height") == 512);
         CHECK(content.width == 512 && content.height == 512);
         reference_args.pop_back(); reference_args += ",\"resend_image\":true}";
         const auto repeat = tools.call("pixelforge_view", reference_args);

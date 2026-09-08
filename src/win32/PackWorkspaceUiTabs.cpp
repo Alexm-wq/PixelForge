@@ -52,6 +52,7 @@ struct PixelSnapshot {
 struct CanvasPresentation {
     PixelSnapshot authoritative;
     CanvasPlayback playback;
+    std::string animation_version;
 };
 
 struct GroupPlayback {
@@ -312,14 +313,20 @@ void normalize_animation_selection_locked() {
 
 void commit_animation_snapshot_locked() {
     g_ui.animation_canvases.clear();
-    g_ui.animation_snapshots.clear();
+    std::unordered_set<std::string> live;
     for (const auto& canvas : g_ui.canvases) {
         if (canvas.frame < 0 || canvas.group.empty()) continue;
         const auto it = g_ui.presentations.find(canvas.name);
         if (it == g_ui.presentations.end() || !it->second.authoritative.valid()) continue;
         g_ui.animation_canvases.push_back(canvas);
-        g_ui.animation_snapshots.emplace(canvas.name, it->second.authoritative);
+        live.insert(canvas.name);
+        if (canvas.version.empty() || it->second.animation_version != canvas.version || !g_ui.animation_snapshots.contains(canvas.name)) {
+            g_ui.animation_snapshots[canvas.name] = it->second.authoritative;
+            it->second.animation_version = canvas.version;
+        }
     }
+    for (auto it = g_ui.animation_snapshots.begin(); it != g_ui.animation_snapshots.end();)
+        if (!live.contains(it->first)) it = g_ui.animation_snapshots.erase(it); else ++it;
     g_ui.animation_revision = g_ui.revision;
     g_ui.animation_refresh_pending = false;
     normalize_animation_selection_locked();
@@ -1160,8 +1167,17 @@ void pack_workspace_ui_publish(HWND owner,
     // frame snapshots on the worker thread once; paint/timer paths never touch
     // disk, which removes repeated WIC decode work from every workspace view.
     std::unordered_map<std::string, PixelSnapshot> loaded;
+    std::unordered_map<std::string, std::string> previous_versions;
+    {
+        std::lock_guard lock(g_ui_mutex);
+        if (g_ui.project_directory == project_directory && g_ui.task_id == task_id)
+            for (const auto& canvas : g_ui.canvases)
+                if (g_ui.presentations.contains(canvas.name)) previous_versions[canvas.name] = canvas.version;
+    }
     loaded.reserve(canvases.size());
     for (const auto& canvas : canvases) {
+        const auto previous = previous_versions.find(canvas.name);
+        if (!canvas.version.empty() && previous != previous_versions.end() && previous->second == canvas.version) continue;
         PixelSnapshot snapshot;
         if (load_canvas_snapshot(project_directory, canvas, snapshot))
             loaded.emplace(canvas.name, std::move(snapshot));

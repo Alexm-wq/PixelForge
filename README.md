@@ -156,7 +156,18 @@ Content and style references are observation-addressed and sent at their origina
 
 The system contract is `config/agent_system_prompt.md`. Automatic Generate injects it into the Codex thread as developer instructions, so the agent does not need an extra filesystem read to learn PixelForge's scope, recording rules and workflow. The build also copies the file beside `PixelForge.exe`.
 
-PixelForge currently edits one in-memory canvas. Export before closing: there is no project save/reopen, canvas import, layer or animation support. Reference slots load images for observation; they do not import pixels into the canvas.
+PixelForge supports saved multi-canvas projects and animation groups, with Source
+image seeding and bulk project reopening. Canvases and undo history remain resident
+in memory; large project capacity depends on total pixels and available RAM.
+Accept finalizes the project manifest after review. Export creates requested PNG
+or GIF deliverables; it is separate from project autosave.
+
+For large workspaces, use `pixelforge_pack list` / `analyze` with `summary:true`
+to survey groups, then filter a group for frame details. Results are paginated.
+Analysis caches frame measurements and adjacent-frame comparisons. Views return
+bounded preview pages and suppress unchanged images; exports preserve full
+resolution. Edits save only changed canvases and refresh affected UI snapshots.
+See `docs/LARGE_WORKSPACES.md` for the current behavior and measured checks.
 
 See:
 

@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <limits>
 #include <atomic>
 #include <cstddef>
 #include <charconv>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -41,6 +44,11 @@ struct PackCanvas {
     int frame = -1;
     PixelDocument* document = nullptr;
     std::unique_ptr<PixelDocument> owned;
+    std::uint64_t analysis_revision = UINT64_MAX;
+    std::string analysis_row;
+    std::string previous_name;
+    std::uint64_t delta_revision = UINT64_MAX, previous_revision = UINT64_MAX;
+    std::size_t delta_pixels = 0;
 };
 
 struct PackHistoryGroup {
@@ -51,7 +59,9 @@ struct PackWorkspace {
     std::uint64_t task_id = 0;
     PixelDocument* primary = nullptr;
     std::vector<PackCanvas> canvases;
+    mutable std::unordered_map<std::string, std::size_t> name_index;
     std::uint64_t revision = 0;
+    std::uint64_t generation = 0;
     std::vector<PackHistoryGroup> undo_groups;
     std::vector<PackHistoryGroup> redo_groups;
 };
@@ -82,6 +92,7 @@ struct RenderedMedia {
 std::mutex g_pack_mutex;
 std::unordered_map<AgentTaskController*, PackWorkspace> g_pack_workspaces;
 std::atomic_uint64_t g_preview_counter{0};
+std::atomic_uint64_t g_pack_generation{0};
 
 std::string quote_json(std::string_view text) {
     std::string out;
@@ -147,7 +158,7 @@ bool parse_int_value(std::string_view text, int& value) {
 }
 
 bool safe_name(std::string_view name) {
-    if (name.empty() || name.size() > 96) return false;
+    if (name.empty() || name == "." || name == ".." || name.back() == '.') return false;
     for (const unsigned char c : name) {
         if (!std::isalnum(c) && c != '_' && c != '-' && c != '.') return false;
     }
@@ -172,15 +183,47 @@ std::string join_names(const std::vector<std::string>& names, char separator = '
     return out;
 }
 
-std::string workspace_summary(const PackWorkspace& workspace) {
+std::string workspace_summary(const PackWorkspace& workspace, std::size_t begin = 0, std::size_t count = SIZE_MAX) {
     std::string out;
-    for (std::size_t i = 0; i < workspace.canvases.size(); ++i) {
+    const auto end = begin + std::min(count, workspace.canvases.size() - std::min(begin, workspace.canvases.size()));
+    for (std::size_t i = begin; i < end; ++i) {
         const auto& canvas = workspace.canvases[i];
-        if (i) out.push_back('|');
+        if (i != begin) out.push_back('|');
         out += canvas.name + "," + canvas.group + "," + std::to_string(canvas.document->width()) + "," +
                std::to_string(canvas.document->height()) + "," + std::to_string(canvas.frame);
     }
     return out;
+}
+
+// Cached numeric observations let the model triage whole animation libraries
+// without receiving thousands of images or serialized pixel arrays.
+const std::string& analyze_canvas(PackCanvas& canvas, bool& scanned) {
+    auto& doc = *canvas.document;
+    scanned = canvas.analysis_revision != doc.revision();
+    if (!scanned) return canvas.analysis_row;
+    std::unordered_set<std::uint32_t> colors;
+    std::size_t visible = 0;
+    int left = doc.width(), top = doc.height(), right = -1, bottom = -1;
+    std::uint64_t sum_x = 0, sum_y = 0, hash = 14695981039346656037ull;
+    const auto& pixels = doc.pixels();
+    for (std::size_t i = 0; i < pixels.size(); ++i) {
+        const auto p = pixels[i];
+        hash ^= p; hash *= 1099511628211ull;
+        if (!(p >> 24)) continue;
+        colors.insert(p);
+        const int x = static_cast<int>(i % doc.width()), y = static_cast<int>(i / doc.width());
+        ++visible; sum_x += x; sum_y += y;
+        left = std::min(left, x); right = std::max(right, x); top = std::min(top, y); bottom = std::max(bottom, y);
+    }
+    std::ostringstream out;
+    out.precision(5);
+    out << canvas.name << ',' << canvas.group << ',' << canvas.frame << ',' << doc.width() << ',' << doc.height()
+        << ',' << visible << ',' << (visible ? left : -1) << ',' << (visible ? top : -1) << ',' << right << ',' << bottom
+        << ',' << (visible ? double(sum_x) / visible : -1) << ',' << (visible ? double(sum_y) / visible : -1)
+        << ',' << colors.size() << ',' << std::hex << hash;
+    canvas.analysis_row = out.str();
+    canvas.analysis_revision = doc.revision();
+    return canvas.analysis_row;
 }
 
 bool parse_specs(std::string_view text, std::vector<CanvasSpec>& specs, std::string& error) {
@@ -225,15 +268,7 @@ bool parse_specs(std::string_view text, std::vector<CanvasSpec>& specs, std::str
             return false;
         }
         total_pixels += static_cast<std::uint64_t>(spec.width) * static_cast<std::uint64_t>(spec.height);
-        if (total_pixels > kMaxPackPixels) {
-            error = "Canvas pack exceeds the 64-megapixel safety limit.";
-            return false;
-        }
         specs.push_back(std::move(spec));
-        if (specs.size() > kMaxPackCanvases) {
-            error = "Canvas pack exceeds the 1024-canvas safety limit.";
-            return false;
-        }
     }
     if (specs.empty()) {
         error = "At least one canvas is required.";
@@ -245,10 +280,12 @@ bool parse_specs(std::string_view text, std::vector<CanvasSpec>& specs, std::str
 PackCanvas* find_canvas(PackWorkspace& workspace, std::string_view name) {
     if (name.empty()) return workspace.canvases.empty() ? nullptr : &workspace.canvases.front();
     const auto wanted = upper_copy(std::string(name));
-    for (auto& canvas : workspace.canvases) {
-        if (upper_copy(canvas.name) == wanted) return &canvas;
+    if (workspace.name_index.size() != workspace.canvases.size()) {
+        workspace.name_index.clear();
+        for (std::size_t i = 0; i < workspace.canvases.size(); ++i) workspace.name_index[upper_copy(workspace.canvases[i].name)] = i;
     }
-    return nullptr;
+    const auto it = workspace.name_index.find(wanted);
+    return it == workspace.name_index.end() ? nullptr : &workspace.canvases[it->second];
 }
 
 const PackCanvas* find_canvas(const PackWorkspace& workspace, std::string_view name) {
@@ -271,7 +308,9 @@ std::vector<PackCanvas*> select_canvases(PackWorkspace& workspace,
     }
     if (!explicit_names.empty()) {
         for (const auto& name : split_keep_empty(explicit_names, '|')) {
-            if (auto* canvas = find_canvas(workspace, trim_copy(name))) selected.push_back(canvas);
+            if (auto* canvas = find_canvas(workspace, trim_copy(name))) {
+                if (std::find(selected.begin(), selected.end(), canvas) == selected.end()) selected.push_back(canvas);
+            } else return {}; // Do not quietly observe/export only part of a requested selection.
         }
     } else if (!group.empty()) {
         const auto wanted = upper_copy(std::string(group));
@@ -281,6 +320,7 @@ std::vector<PackCanvas*> select_canvases(PackWorkspace& workspace,
         for (auto& canvas : workspace.canvases) selected.push_back(&canvas);
     }
     std::stable_sort(selected.begin(), selected.end(), [](const PackCanvas* a, const PackCanvas* b) {
+        if (a->group != b->group) return a->group < b->group;
         if (a->frame >= 0 && b->frame >= 0 && a->frame != b->frame) return a->frame < b->frame;
         if ((a->frame >= 0) != (b->frame >= 0)) return a->frame >= 0;
         return a->name < b->name;
@@ -469,7 +509,7 @@ bool parse_program_sections(std::string_view program,
 }
 
 std::vector<std::uint32_t> scale_nearest(const PixelDocument& document, int scale, int& out_w, int& out_h) {
-    scale = std::clamp(scale, 1, kMaxPreviewScale);
+    scale = std::max(1, scale);
     out_w = document.width() * scale;
     out_h = document.height() * scale;
     std::vector<std::uint32_t> out(static_cast<std::size_t>(out_w) * out_h, 0);
@@ -487,7 +527,7 @@ std::vector<std::uint32_t> compose_sheet(const std::vector<PackCanvas*>& selecte
                                          bool strip,
                                          int& width,
                                          int& height) {
-    scale = std::clamp(scale, 1, kMaxPreviewScale);
+    scale = std::max(1, scale);
     if (selected.empty()) { width = height = 0; return {}; }
     int max_w = 0, max_h = 0;
     for (const auto* canvas : selected) {
@@ -630,8 +670,8 @@ std::vector<std::uint8_t> gif_lzw_literal_stream(const std::vector<std::uint8_t>
 RenderedMedia encode_gif(const std::vector<PackCanvas*>& selected, int scale, int fps) {
     RenderedMedia out;
     if (selected.empty()) { out.error = "Animation selection is empty."; return out; }
-    scale = std::clamp(scale, 1, 8);
-    fps = std::clamp(fps, 1, 60);
+    scale = std::max(1, scale);
+    fps = std::max(1, fps);
     int max_w = 0, max_h = 0;
     for (const auto* canvas : selected) {
         max_w = std::max(max_w, canvas->document->width() * scale);
@@ -713,7 +753,7 @@ RenderedMedia encode_gif(const std::vector<PackCanvas*>& selected, int scale, in
 
     for (const auto* canvas : selected) {
         bytes.push_back(0x21); bytes.push_back(0xF9); bytes.push_back(0x04);
-        bytes.push_back(0x05);
+        bytes.push_back(0x09); // GIF disposal=2 (restore background) + transparency
         push_u16(bytes, delay);
         bytes.push_back(0);
         bytes.push_back(0);
@@ -792,7 +832,8 @@ RenderedMedia render_selection(std::vector<PackCanvas*> selected,
     return out;
 }
 
-std::string rle_region(const PixelDocument& document, int x, int y, int width, int height) {
+std::string rle_region(const PixelDocument& document, int x, int y, int width, int height,
+                       std::size_t offset = 0, std::size_t length = SIZE_MAX) {
     std::ostringstream out;
     bool first = true;
     std::uint32_t current = 0;
@@ -804,13 +845,14 @@ std::string rle_region(const PixelDocument& document, int x, int y, int width, i
         out << std::hex << std::uppercase << current << std::dec << 'x' << count;
         count = 0;
     };
-    for (int py = y; py < y + height; ++py) {
-        for (int px = x; px < x + width; ++px) {
+    const auto total = static_cast<std::size_t>(width) * height;
+    const auto end = offset + std::min(length, total - std::min(total, offset));
+    for (auto i = offset; i < end; ++i) {
+        const int py = y + static_cast<int>(i / width), px = x + static_cast<int>(i % width);
             const auto value = document.pixel(px, py);
             if (count && value != current) flush();
             if (!count) current = value;
             ++count;
-        }
     }
     flush();
     return out.str();
@@ -844,7 +886,66 @@ LocalToolResult media_result(const RenderedMedia& media, std::uint64_t revision,
     return {true, text, base64_pack(media.bytes), media.mime};
 }
 
+RenderedMedia render_observation(const std::vector<PackCanvas*>& selected, std::string mode, int scale, int columns) {
+    if (selected.empty()) { RenderedMedia out; out.error = "No canvases matched the selection."; return out; }
+    const bool strip = upper_copy(mode) == "STRIP";
+    const int padding = selected.size() == 1 ? 0 : 1;
+    int max_w = 1, max_h = 1;
+    for (auto* c : selected) { max_w = std::max(max_w, c->document->width()); max_h = std::max(max_h, c->document->height()); }
+    if (strip) columns = static_cast<int>(selected.size());
+    else if (columns <= 0) columns = static_cast<int>(std::ceil(std::sqrt(double(selected.size()))));
+    columns = std::clamp(columns, 1, static_cast<int>(selected.size()));
+    const int rows = static_cast<int>((selected.size() + columns - 1) / columns);
+    double factor = std::clamp(scale, 1, 32);
+    // Allocate the observation at its delivered size, never a huge intermediate
+    // strip. Exports continue to use the exact native-resolution renderer.
+    const double native_w = double(columns) * (double(max_w) + padding), native_h = double(rows) * (double(max_h) + padding);
+    factor = std::min({factor, 2048.0 / native_w, 2048.0 / native_h, std::sqrt(1048576.0 / (native_w * native_h))});
+    const int width = std::max(1, static_cast<int>(native_w * factor));
+    const int height = std::max(1, static_cast<int>(native_h * factor));
+    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(width) * height, 0);
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+        const auto& doc = *selected[i]->document;
+        const double ox = ((i % columns) * (double(max_w) + padding) + (max_w - doc.width()) / 2.0) * factor;
+        const double oy = ((i / columns) * (double(max_h) + padding) + (max_h - doc.height()) / 2.0) * factor;
+        const int left = static_cast<int>(ox), top = static_cast<int>(oy);
+        const int right = std::min(width, static_cast<int>(ox + doc.width() * factor));
+        const int bottom = std::min(height, static_cast<int>(oy + doc.height() * factor));
+        for (int y = top; y < bottom; ++y)
+            for (int x = left; x < right; ++x)
+                pixels[static_cast<std::size_t>(y) * width + x] = doc.pixel(
+                    std::clamp(static_cast<int>((x - left) / factor), 0, doc.width() - 1),
+                    std::clamp(static_cast<int>((y - top) / factor), 0, doc.height() - 1));
+    }
+    auto result = encode_png(pixels, width, height);
+    for (auto* c : selected) result.names.push_back(c->name);
+    return result;
+}
+
 } // namespace
+
+LocalToolResult LocalAgentToolSession::restore_pack_pixels(std::uint64_t task_id, const std::vector<LocalPackRestoreCanvas>& canvases) {
+    std::lock_guard pack_lock(g_pack_mutex);
+    std::lock_guard state_lock(*bindings_.state_mutex);
+    auto it = g_pack_workspaces.find(bindings_.task);
+    if (it == g_pack_workspaces.end() || it->second.task_id != task_id)
+        return {false, "{\"ok\":false,\"error\":\"restore_pack_missing\"}"};
+    for (const auto& saved : canvases) {
+        if (saved.pixels.empty()) continue;
+        const auto* target = find_canvas(it->second, saved.name);
+        if (!target || target->document->width() != saved.width || target->document->height() != saved.height ||
+            saved.pixels.size() != static_cast<std::size_t>(saved.width) * saved.height)
+            return {false, "{\"ok\":false,\"error\":\"invalid_restored_pixels\"}"};
+    }
+    for (const auto& saved : canvases) {
+        if (saved.pixels.empty()) continue;
+        auto* target = find_canvas(it->second, saved.name);
+        if (!target->document->replace_pixels(saved.width, saved.height, saved.pixels))
+            return {false, "{\"ok\":false,\"error\":\"restore_failed\"}"};
+    }
+    it->second.undo_groups.clear(); it->second.redo_groups.clear();
+    return {true, "{\"ok\":true}"};
+}
 
 LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments_json) {
     FlatJsonObject args;
@@ -857,6 +958,12 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
         return {false, "{\"ok\":false,\"error\":\"task_id_required\"}"};
     const auto task_id = static_cast<std::uint64_t>(*task_id_value);
     const auto action = upper_copy(args.get("action"));
+    for (const auto key : {"x", "y", "sx", "sy", "dx", "dy", "width", "height", "scale", "columns", "fps", "render_scale"}) {
+        if (!args.contains(key)) continue;
+        const auto value = args.get_i64(key);
+        if (!value || *value < INT_MIN || *value > INT_MAX)
+            return {false, "{\"ok\":false,\"error\":\"invalid_integer\",\"field\":" + quote_json(key) + "}"};
+    }
 
     AgentTaskSnapshot snapshot;
     {
@@ -872,32 +979,12 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
         if (!parse_specs(args.get("canvases"), specs, error))
             return {false, "{\"ok\":false,\"error\":\"invalid_canvases\",\"message\":" + quote_json(error) + "}"};
 
-        if (snapshot.state == TaskState::AwaitingAgentDecision) {
-            const auto accept = call_art_tool("pixelforge_task",
-                "{\"action\":\"accept\",\"task_id\":" + std::to_string(task_id) +
-                ",\"width\":" + std::to_string(specs.front().width) +
-                ",\"height\":" + std::to_string(specs.front().height) + "}");
-            if (!accept.success) return accept;
-        } else if (snapshot.state != TaskState::Accepted) {
-            return {false, "{\"ok\":false,\"error\":\"invalid_state\",\"message\":\"Create a pack while the task is awaiting acceptance or active.\"}"};
-        } else {
-            std::lock_guard state_lock(*bindings_.state_mutex);
-            if (bindings_.document->width() != specs.front().width || bindings_.document->height() != specs.front().height) {
-                bool blank = true;
-                for (const auto pixel : bindings_.document->pixels()) if (pixel != 0) { blank = false; break; }
-                if (!blank)
-                    return {false, "{\"ok\":false,\"error\":\"primary_canvas_size_mismatch\",\"message\":\"Primary canvas already contains artwork at a different size.\"}"};
-                std::string resize_error;
-                if (!bindings_.document->resize(specs.front().width, specs.front().height, &resize_error))
-                    return {false, "{\"ok\":false,\"error\":\"resize_failed\",\"message\":" + quote_json(resize_error) + "}"};
-            }
-        }
-
         std::lock_guard pack_lock(g_pack_mutex);
         PackWorkspace workspace;
         workspace.task_id = task_id;
         workspace.primary = bindings_.document;
         workspace.revision = 1;
+        workspace.generation = ++g_pack_generation;
         for (std::size_t i = 0; i < specs.size(); ++i) {
             PackCanvas canvas;
             canvas.name = specs[i].name;
@@ -914,16 +1001,35 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
             }
             workspace.canvases.push_back(std::move(canvas));
         }
-        const auto summary = workspace_summary(workspace);
+        if (snapshot.state == TaskState::AwaitingAgentDecision) {
+            const auto accept = call_art_tool("pixelforge_task",
+                "{\"action\":\"accept\",\"task_id\":" + std::to_string(task_id) +
+                ",\"width\":" + std::to_string(specs.front().width) +
+                ",\"height\":" + std::to_string(specs.front().height) + "}");
+            if (!accept.success) return accept;
+        } else if (snapshot.state != TaskState::Accepted) {
+            return {false, "{\"ok\":false,\"error\":\"invalid_state\",\"message\":\"Create a pack while the task is awaiting acceptance or active.\"}"};
+        } else {
+            std::lock_guard state_lock(*bindings_.state_mutex);
+            std::string resize_error;
+            if (!bindings_.document->resize(specs.front().width, specs.front().height, &resize_error))
+                return {false, "{\"ok\":false,\"error\":\"resize_failed\",\"message\":" + quote_json(resize_error) + "}"};
+        }
+
+        const auto summary = workspace_summary(workspace, 0, 64);
         const auto count = workspace.canvases.size();
         g_pack_workspaces[bindings_.task] = std::move(workspace);
         PostMessageW(bindings_.hwnd, WM_APP + 1, 0, 0);
         return {true, "{\"ok\":true,\"revision\":1,\"canvas_count\":" + std::to_string(count) +
-                      ",\"canvases\":" + quote_json(summary) + "}"};
+                      ",\"returned_count\":" + std::to_string(std::min<std::size_t>(64, count)) +
+                      ",\"next_offset\":" + std::string(count > 64 ? "64" : "-1") + ",\"canvases\":" + quote_json(summary) + "}"};
     }
 
     std::lock_guard pack_lock(g_pack_mutex);
     auto workspace_it = g_pack_workspaces.find(bindings_.task);
+    if (workspace_it == g_pack_workspaces.end() && action == "LIST") {
+        return {false, "{\"ok\":false,\"error\":\"pack_not_created\",\"message\":\"No multi-canvas pack exists yet. LIST is read-only and does not create one. For a genuinely new multi-canvas task, call CREATE once; for a loaded project, refresh task state because its restored pack should already exist.\"}"};
+    }
     if (workspace_it == g_pack_workspaces.end()) {
         if (snapshot.state != TaskState::Accepted && snapshot.state != TaskState::Finished)
             return {false, "{\"ok\":false,\"error\":\"pack_not_created\"}"};
@@ -931,16 +1037,102 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
         workspace.task_id = task_id;
         workspace.primary = bindings_.document;
         workspace.revision = 1;
+        workspace.generation = ++g_pack_generation;
         workspace.canvases.push_back({"canvas", "", -1, bindings_.document, nullptr});
         workspace_it = g_pack_workspaces.emplace(bindings_.task, std::move(workspace)).first;
     }
     auto& workspace = workspace_it->second;
     workspace.task_id = task_id;
 
-    if (action == "LIST") {
+    if (action == "LIST" || action == "ANALYZE") {
+        std::lock_guard state_lock(*bindings_.state_mutex);
+        auto selected = select_canvases(workspace, args.get("canvases"), args.get("group"), args.get("canvas"));
+        if (action == "LIST" && args.get_bool("internal_all").value_or(false)) {
+            selected.clear(); for (auto& c : workspace.canvases) selected.push_back(&c);
+        }
+        if (args.get_bool("summary").value_or(false)) {
+            std::map<std::string, std::vector<PackCanvas*>> groups;
+            for (auto* c : selected) groups[c->group].push_back(c);
+            const auto offset = std::min(groups.size(), static_cast<std::size_t>(std::max<std::int64_t>(0, args.get_i64("offset").value_or(0))));
+            const auto count = std::min(groups.size() - offset, static_cast<std::size_t>(std::clamp<std::int64_t>(args.get_i64("limit").value_or(64), 1, 256)));
+            std::string rows; std::size_t index = 0, scanned = 0;
+            for (auto& [name, frames] : groups) {
+                if (index++ < offset) continue;
+                if (index > offset + count) break;
+                if (!rows.empty()) rows += '|';
+                rows += name + "," + std::to_string(frames.size());
+                if (action == "LIST") continue;
+                std::size_t empty = 0, duplicate = 0, mismatched = 0, low = SIZE_MAX, high = 0, worst = 0;
+                std::string worst_frame;
+                std::unordered_set<std::string> hashes;
+                for (std::size_t i = 0; i < frames.size(); ++i) {
+                    auto& c = *frames[i]; bool fresh = false;
+                    const auto metrics = split_keep_empty(analyze_canvas(c, fresh), ','); scanned += fresh;
+                    const auto visible = std::stoull(metrics[5]);
+                    empty += visible == 0; low = std::min<std::size_t>(low, visible); high = std::max<std::size_t>(high, visible);
+                    duplicate += !hashes.insert(std::to_string(c.document->width()) + "x" + std::to_string(c.document->height()) + ":" + metrics[13]).second;
+                    const auto& previous = *frames[(i + frames.size() - 1) % frames.size()];
+                    if (previous.document->width() != c.document->width() || previous.document->height() != c.document->height()) { ++mismatched; continue; }
+                    if (c.delta_revision != c.document->revision() || c.previous_revision != previous.document->revision() || c.previous_name != previous.name) {
+                        c.delta_pixels = 0;
+                        const auto& a = c.document->pixels(); const auto& b = previous.document->pixels();
+                        for (std::size_t p = 0; p < a.size(); ++p) c.delta_pixels += a[p] != b[p];
+                        c.delta_revision = c.document->revision(); c.previous_revision = previous.document->revision(); c.previous_name = previous.name;
+                    }
+                    if (c.delta_pixels > worst) { worst = c.delta_pixels; worst_frame = c.name; }
+                }
+                rows += "," + std::to_string(empty) + "," + std::to_string(duplicate) + "," + std::to_string(mismatched) + "," +
+                    std::to_string(low) + "," + std::to_string(high) + "," + std::to_string(worst) + "," + worst_frame;
+            }
+            return {true, "{\"ok\":true,\"summary\":true,\"revision\":" + std::to_string(workspace.revision) +
+                ",\"group_count\":" + std::to_string(groups.size()) + ",\"canvas_count\":" + std::to_string(selected.size()) +
+                ",\"returned_count\":" + std::to_string(count) + ",\"next_offset\":" + (offset + count < groups.size() ? std::to_string(offset + count) : "-1") +
+                ",\"scanned_frames\":" + std::to_string(scanned) + ",\"columns\":" + quote_json(action == "LIST" ? "group,frames" :
+                "group,frames,empty,duplicates,dimension_mismatches,min_visible,max_visible,max_changed,transition_to") + ",\"rows\":" + quote_json(rows) + "}"};
+        }
+        const auto total = selected.size();
+        const auto offset = std::min(total, static_cast<std::size_t>(std::max<std::int64_t>(0, args.get_i64("offset").value_or(0))));
+        const auto limit = args.get_bool("internal_all").value_or(false) ? total :
+            static_cast<std::size_t>(std::clamp<std::int64_t>(args.get_i64("limit").value_or(64), 1, 256));
+        const auto end = offset + std::min(limit, total - offset);
+        std::string rows, versions;
+        std::size_t scanned = 0, comparisons = 0;
+        for (std::size_t i = offset; i < end; ++i) {
+            auto& c = *selected[i];
+            if (i != offset) { rows += '|'; versions += '|'; }
+            versions += c.name + "," + std::to_string(workspace.generation) + ":" + std::to_string(c.document->revision());
+            if (action == "LIST") {
+                rows += c.name + "," + c.group + "," + std::to_string(c.document->width()) + "," +
+                        std::to_string(c.document->height()) + "," + std::to_string(c.frame);
+            } else {
+                bool fresh = false;
+                rows += analyze_canvas(c, fresh); scanned += fresh;
+                // First frame compares to the last selected frame of its group
+                // to include the loop seam. Interior page boundaries are retained.
+                PackCanvas* previous = i && selected[i - 1]->group == c.group ? selected[i - 1] : nullptr;
+                if (!previous && c.frame >= 0 && !c.group.empty())
+                    for (auto it = selected.rbegin(); it != selected.rend(); ++it)
+                        if ((*it)->group == c.group) { previous = *it; break; }
+                const bool comparable = previous && c.frame >= 0 && !c.group.empty() &&
+                    previous->document->width() == c.document->width() && previous->document->height() == c.document->height();
+                if (comparable) {
+                    if (c.delta_revision != c.document->revision() || c.previous_revision != previous->document->revision() || c.previous_name != previous->name) {
+                        c.delta_pixels = 0; ++comparisons;
+                        const auto& a = c.document->pixels(); const auto& b = previous->document->pixels();
+                        for (std::size_t p = 0; p < a.size(); ++p) c.delta_pixels += a[p] != b[p];
+                        c.delta_revision = c.document->revision(); c.previous_revision = previous->document->revision(); c.previous_name = previous->name;
+                    }
+                    rows += "," + previous->name + "," + std::to_string(c.delta_pixels);
+                } else rows += ",,-1";
+            }
+        }
         return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
-                      ",\"canvas_count\":" + std::to_string(workspace.canvases.size()) +
-                      ",\"canvases\":" + quote_json(workspace_summary(workspace)) + "}"};
+            ",\"canvas_count\":" + std::to_string(workspace.canvases.size()) + ",\"total_count\":" + std::to_string(total) +
+            ",\"offset\":" + std::to_string(offset) + ",\"returned_count\":" + std::to_string(end - offset) +
+            ",\"next_offset\":" + (end < total ? std::to_string(end) : "-1") +
+            (action == "LIST" ? ",\"canvases\":" + quote_json(rows) + ",\"canvas_revisions\":" + quote_json(versions) :
+             ",\"columns\":\"name,group,frame,width,height,visible,left,top,right,bottom,centroid_x,centroid_y,colors,hash,previous,changed_from_previous\",\"rows\":" + quote_json(rows) +
+             ",\"scanned_frames\":" + std::to_string(scanned) + ",\"compared_pairs\":" + std::to_string(comparisons)) + "}"};
     }
 
     if (snapshot.state != TaskState::Accepted && action != "VIEW" && action != "INSPECT" && action != "EXPORT")
@@ -996,7 +1188,8 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
             }
 
             std::vector<PackCanvas*> touched;
-            for (auto& item : compiled) touched.push_back(item.canvas);
+            for (auto& item : compiled)
+                if (std::find(applied.begin(), applied.end(), item.canvas->document) != applied.end()) touched.push_back(item.canvas);
             const auto names = unique_names(touched);
             if (changed_total) push_history(workspace, names);
             if (std::find_if(touched.begin(), touched.end(), [&](const PackCanvas* c) { return c->document == bindings_.document; }) != touched.end())
@@ -1014,11 +1207,13 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
             const auto render_scale = static_cast<int>(args.get_i64("render_scale").value_or(0));
             if (render_scale > 0) {
                 auto selected = select_canvases(workspace, join_names(names), "", "");
-                auto media = render_selection(std::move(selected), names.size() == 1 ? "canvas" : "sheet", render_scale,
-                                              static_cast<int>(args.get_i64("columns").value_or(0)),
-                                              static_cast<int>(args.get_i64("fps").value_or(8)));
+                if (selected.size() > 32) selected.resize(32);
+                auto media = render_observation(selected, names.size() == 1 ? "canvas" : "sheet", render_scale,
+                                              static_cast<int>(args.get_i64("columns").value_or(0)));
                 if (media.ok) {
                     auto visual = media_result(media, workspace.revision, names.size() == 1 ? "canvas" : "sheet");
+                    response.text.pop_back();
+                    response.text += ",\"render_result\":" + quote_json(visual.text) + ",\"render_returned_count\":" + std::to_string(selected.size()) + "}";
                     response.image_base64 = std::move(visual.image_base64);
                     response.image_mime = std::move(visual.image_mime);
                 }
@@ -1082,27 +1277,43 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
         const int height = static_cast<int>(args.get_i64("height").value_or(source->document->height()));
         const int dx = static_cast<int>(args.get_i64("dx").value_or(0));
         const int dy = static_cast<int>(args.get_i64("dy").value_or(0));
-        if (!rect_fits(*source->document, sx, sy, width, height) || !rect_fits(*dest->document, dx, dy, width, height))
-            return {false, "{\"ok\":false,\"error\":\"copy_out_of_bounds\"}"};
-        std::vector<std::uint32_t> source_pixels(static_cast<std::size_t>(width) * height);
-        for (int y = 0; y < height; ++y)
-            for (int x = 0; x < width; ++x)
-                source_pixels[static_cast<std::size_t>(y) * width + x] = source->document->pixel(sx + x, sy + y);
+        const std::int64_t start_x = std::max({0ll, -static_cast<long long>(sx), -static_cast<long long>(dx)});
+        const std::int64_t start_y = std::max({0ll, -static_cast<long long>(sy), -static_cast<long long>(dy)});
+        const std::int64_t end_x = std::min({static_cast<long long>(std::max(0, width)), static_cast<long long>(source->document->width()) - sx, static_cast<long long>(dest->document->width()) - dx});
+        const std::int64_t end_y = std::min({static_cast<long long>(std::max(0, height)), static_cast<long long>(source->document->height()) - sy, static_cast<long long>(dest->document->height()) - dy});
+        const int actual_width = static_cast<int>(std::max<std::int64_t>(0, end_x - start_x));
+        const int actual_height = static_cast<int>(std::max<std::int64_t>(0, end_y - start_y));
+        const int actual_sx = actual_width ? static_cast<int>(sx + start_x) : 0;
+        const int actual_sy = actual_height ? static_cast<int>(sy + start_y) : 0;
+        const int actual_dx = actual_width ? static_cast<int>(dx + start_x) : 0;
+        const int actual_dy = actual_height ? static_cast<int>(dy + start_y) : 0;
+        const bool clipped = actual_width != width || actual_height != height || start_x != 0 || start_y != 0;
         std::size_t changed = 0;
-        {
-            std::lock_guard state_lock(*bindings_.state_mutex);
-            auto tx = dest->document->begin_transaction();
-            for (int y = 0; y < height; ++y)
-                for (int x = 0; x < width; ++x)
-                    tx.set_pixel(dx + x, dy + y, source_pixels[static_cast<std::size_t>(y) * width + x]);
-            changed = tx.pending_changes();
-            if (changed && !tx.commit()) return {false, "{\"ok\":false,\"error\":\"copy_failed\"}"};
-            if (!changed) tx.cancel();
+        if (actual_width > 0 && actual_height > 0) {
+            std::vector<std::uint32_t> source_pixels(static_cast<std::size_t>(actual_width) * actual_height);
+            for (int y = 0; y < actual_height; ++y)
+                for (int x = 0; x < actual_width; ++x)
+                    source_pixels[static_cast<std::size_t>(y) * actual_width + x] = source->document->pixel(actual_sx + x, actual_sy + y);
+            {
+                std::lock_guard state_lock(*bindings_.state_mutex);
+                auto tx = dest->document->begin_transaction();
+                for (int y = 0; y < actual_height; ++y)
+                    for (int x = 0; x < actual_width; ++x)
+                        tx.set_pixel(actual_dx + x, actual_dy + y, source_pixels[static_cast<std::size_t>(y) * actual_width + x]);
+                changed = tx.pending_changes();
+                if (changed && !tx.commit()) return {false, "{\"ok\":false,\"error\":\"copy_failed\"}"};
+                if (!changed) tx.cancel();
+            }
         }
         if (changed) push_history(workspace, {dest->name});
-        if (dest->document == bindings_.document) PostMessageW(bindings_.hwnd, WM_APP + 1, 0, 0);
+        if (dest->document == bindings_.document && changed) PostMessageW(bindings_.hwnd, WM_APP + 1, 0, 0);
         return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
-                      ",\"changed_pixels\":" + std::to_string(changed) + "}"};
+                      ",\"changed_pixels\":" + std::to_string(changed) +
+                      ",\"clipped\":" + std::string(clipped ? "true" : "false") +
+                      ",\"empty\":" + std::string(actual_width == 0 || actual_height == 0 ? "true" : "false") +
+                      ",\"sx\":" + std::to_string(actual_sx) + ",\"sy\":" + std::to_string(actual_sy) +
+                      ",\"dx\":" + std::to_string(actual_dx) + ",\"dy\":" + std::to_string(actual_dy) +
+                      ",\"width\":" + std::to_string(actual_width) + ",\"height\":" + std::to_string(actual_height) + "}"};
     }
 
     if (action == "HISTORY") {
@@ -1149,12 +1360,36 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
     if (action == "VIEW") {
         const auto mode = args.get("mode", "sheet");
         auto selected = select_canvases(workspace, args.get("canvases"), args.get("group"),
-                                        upper_copy(mode) == "CANVAS" || upper_copy(mode) == "SINGLE" ? args.get("canvas") : "");
-        const int scale = static_cast<int>(args.get_i64("scale").value_or(4));
+                                        upper_copy(mode) == "CANVAS" || upper_copy(mode) == "SINGLE" ? args.get("canvas", workspace.canvases.front().name) : "");
+        const int scale = static_cast<int>(std::clamp<std::int64_t>(args.get_i64("scale").value_or(4), 1, 32));
         const int columns = static_cast<int>(args.get_i64("columns").value_or(0));
         const int fps = static_cast<int>(args.get_i64("fps").value_or(8));
         std::lock_guard state_lock(*bindings_.state_mutex);
-        return media_result(render_selection(std::move(selected), mode, scale, columns, fps), workspace.revision, mode);
+        const auto total = selected.size();
+        const auto offset = std::min(total, static_cast<std::size_t>(std::max<std::int64_t>(0, args.get_i64("offset").value_or(0))));
+        const auto count = std::min(total - offset, static_cast<std::size_t>(std::clamp<std::int64_t>(args.get_i64("limit").value_or(32), 1, 128)));
+        selected = std::vector<PackCanvas*>(selected.begin() + offset, selected.begin() + offset + count);
+        std::string key = std::to_string(task_id) + ":" + std::to_string(workspace.generation) + ":" + mode + ":" + std::to_string(scale) + ":" + std::to_string(columns);
+        for (auto* c : selected) key += ":" + c->name + ":" + std::to_string(c->document->revision());
+        std::uint64_t hash = 14695981039346656037ull;
+        for (unsigned char c : key) { hash ^= c; hash *= 1099511628211ull; }
+        const auto observation = "pack-state:" + std::to_string(hash);
+        const auto page = ",\"total_count\":" + std::to_string(total) + ",\"offset\":" + std::to_string(offset) +
+            ",\"returned_count\":" + std::to_string(count) + ",\"next_offset\":" + (offset + count < total ? std::to_string(offset + count) : "-1");
+        if (args.get("known_observation") == observation ||
+            (!args.get_bool("resend_image").value_or(false) && delivered_observations_.contains(observation)))
+            return {true, "{\"ok\":true,\"unchanged\":true,\"observation\":" + quote_json(observation) + page + "}"};
+        auto result = media_result(render_observation(selected, mode, scale, columns), workspace.revision, mode);
+        if (result.success) {
+            FlatJsonObject metadata; std::string ignored;
+            parse_flat_json_object(result.text, metadata, ignored);
+            const auto old = quote_json(metadata.get("observation"));
+            const auto at = result.text.find(old);
+            if (at != std::string::npos) result.text.replace(at, old.size(), quote_json(observation));
+            result.text.pop_back(); result.text += page + ",\"preview_only\":true,\"fps\":" + std::to_string(fps) + "}";
+            delivered_observations_.insert(observation);
+        }
+        return result;
     }
 
     if (action == "INSPECT") {
@@ -1164,15 +1399,35 @@ LocalToolResult LocalAgentToolSession::call_pack_tool(std::string_view arguments
         const int y = static_cast<int>(args.get_i64("y").value_or(0));
         const int width = static_cast<int>(args.get_i64("width").value_or(canvas->document->width()));
         const int height = static_cast<int>(args.get_i64("height").value_or(canvas->document->height()));
-        if (!rect_fits(*canvas->document, x, y, width, height) ||
-            static_cast<std::uint64_t>(width) * height > 4096)
-            return {false, "{\"ok\":false,\"error\":\"inspect_region_invalid\"}"};
+        const int canvas_width = canvas->document->width();
+        const int canvas_height = canvas->document->height();
+        const std::int64_t requested_right = static_cast<std::int64_t>(x) + std::max(0, width);
+        const std::int64_t requested_bottom = static_cast<std::int64_t>(y) + std::max(0, height);
+        const int actual_x = std::clamp(x, 0, canvas_width);
+        const int actual_y = std::clamp(y, 0, canvas_height);
+        const int actual_right = static_cast<int>(std::clamp<std::int64_t>(requested_right, actual_x, canvas_width));
+        const int actual_bottom = static_cast<int>(std::clamp<std::int64_t>(requested_bottom, actual_y, canvas_height));
+        const int actual_width = std::max(0, actual_right - actual_x);
+        const int actual_height = std::max(0, actual_bottom - actual_y);
+        const bool clipped = actual_x != x || actual_y != y || actual_width != width || actual_height != height;
         std::lock_guard state_lock(*bindings_.state_mutex);
+        const auto total = static_cast<std::size_t>(actual_width) * actual_height;
+        const auto pixel_offset = std::min(total, static_cast<std::size_t>(std::max<std::int64_t>(0, args.get_i64("pixel_offset").value_or(0))));
+        const auto count = std::min(total - pixel_offset, static_cast<std::size_t>(std::clamp<std::int64_t>(args.get_i64("pixel_limit").value_or(1024), 1, 4096)));
+        const std::string rle = actual_width > 0 && actual_height > 0
+            ? rle_region(*canvas->document, actual_x, actual_y, actual_width, actual_height, pixel_offset, count)
+            : std::string{};
         return {true, "{\"ok\":true,\"revision\":" + std::to_string(workspace.revision) +
                       ",\"canvas\":" + quote_json(canvas->name) +
-                      ",\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) +
-                      ",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) +
-                      ",\"rle\":" + quote_json(rle_region(*canvas->document, x, y, width, height)) + "}"};
+                      ",\"requested_x\":" + std::to_string(x) + ",\"requested_y\":" + std::to_string(y) +
+                      ",\"requested_width\":" + std::to_string(width) + ",\"requested_height\":" + std::to_string(height) +
+                      ",\"x\":" + std::to_string(actual_x) + ",\"y\":" + std::to_string(actual_y) +
+                      ",\"width\":" + std::to_string(actual_width) + ",\"height\":" + std::to_string(actual_height) +
+                      ",\"clipped\":" + std::string(clipped ? "true" : "false") +
+                      ",\"empty\":" + std::string(actual_width == 0 || actual_height == 0 ? "true" : "false") +
+                      ",\"pixel_offset\":" + std::to_string(pixel_offset) + ",\"returned_pixels\":" + std::to_string(count) +
+                      ",\"total_pixels\":" + std::to_string(total) + ",\"next_pixel_offset\":" + (pixel_offset + count < total ? std::to_string(pixel_offset + count) : "-1") +
+                      ",\"rle\":" + quote_json(rle) + "}"};
     }
 
     if (action == "EXPORT") {

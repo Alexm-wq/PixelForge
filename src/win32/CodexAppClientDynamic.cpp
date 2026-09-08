@@ -752,79 +752,20 @@ void CodexAppClient::handle_server_request(std::string_view line) {
         consecutive_tool_errors_ = output.success ? 0 : consecutive_tool_errors_ + 1;
         if (consecutive_tool_errors_ >= 3) failure_reason_ = L"Stopped after three consecutive tool failures. See the session log for exact errors.";
         FlatJsonObject result_fields; std::string parse_error;
-        const bool drawing_tool = tool == "pixelforge_edit" || tool == "pixelforge_program";
+        const bool drawing_tool = tool == "pixelforge_edit" || tool == "pixelforge_program" || tool == "pixelforge_pass" || (tool == "pixelforge_pack" && (action == "program" || action == "edit" || action == "clone" || action == "copy"));
         if (output.success && drawing_tool && parse_flat_json_object(output.text, result_fields, parse_error) &&
             result_fields.get_i64("changed_pixels").value_or(0) > 0) {
             received_edit_ = true;
             progress_deadline_ = GetTickCount64() + progress_timeout_ms_;
         }
 
-        struct FrameObservation {
-            PackFrameInfo info;
-            LocalToolResult image;
-            int time_ms = 0;
-        };
-        std::vector<FrameObservation> animation_observations;
-        FlatJsonObject call_args;
-        std::string call_parse_error;
-        if (output.success && tool == "pixelforge_pack" && action == "view" &&
-            parse_flat_json_object(arguments, call_args, call_parse_error) &&
-            upper_ascii(call_args.get("mode")) == "ANIMATION") {
-            const auto task_id = call_args.get_i64("task_id");
-            if (task_id && *task_id >= 0) {
-                const auto list = active_tool_session_->call("pixelforge_pack",
-                    "{\"action\":\"list\",\"task_id\":" + std::to_string(*task_id) + "}");
-                FlatJsonObject list_fields;
-                std::string ignored;
-                if (list.success && parse_flat_json_object(list.text, list_fields, ignored)) {
-                    const auto available = parse_pack_summary_for_animation(list_fields.get("canvases"));
-                    const auto selected = select_animation_frames(call_args, available);
-                    const int fps = static_cast<int>(std::clamp<std::int64_t>(call_args.get_i64("fps").value_or(8), 1, 60));
-                    const bool explicit_scale = call_args.contains("scale");
-                    const int requested_scale = static_cast<int>(std::clamp<std::int64_t>(call_args.get_i64("scale").value_or(1), 1, 16));
-                    for (std::size_t i = 0; i < selected.size(); ++i) {
-                        const auto& frame = selected[i];
-                        int frame_scale = requested_scale;
-                        if (!explicit_scale) {
-                            const int extent = std::max(frame.width, frame.height);
-                            frame_scale = extent > 0 ? std::clamp(384 / extent, 1, 16) : 1;
-                        }
-                        const std::string request = "{\"action\":\"view\",\"mode\":\"canvas\",\"task_id\":" +
-                            std::to_string(*task_id) + ",\"canvas\":" + json_quote(frame.name) +
-                            ",\"scale\":" + std::to_string(frame_scale) + "}";
-                        auto frame_image = active_tool_session_->call("pixelforge_pack", request);
-                        if (!frame_image.success || frame_image.image_base64.empty()) continue;
-                        const int temporal_index = frame.frame >= 0 ? frame.frame : static_cast<int>(i);
-                        animation_observations.push_back({frame, std::move(frame_image),
-                            static_cast<int>((static_cast<std::int64_t>(temporal_index) * 1000) / fps)});
-                    }
-                    codex_trace_detail("ANIMATION observation_frames=" + std::to_string(animation_observations.size()) +
-                        " requested=" + std::to_string(selected.size()) + " fps=" + std::to_string(fps));
-                }
-            }
-        }
-
+        // Forward only the requested observation. Hidden per-frame expansion
+        // multiplies image context and bypasses the caller's page/selection budget.
         std::string content = "[{\"type\":\"inputText\",\"text\":" + json_quote(output.text) + "}";
         if (!output.image_base64.empty()) {
             const std::string mime = output.image_mime.empty() ? "image/png" : output.image_mime;
             content += ",{\"type\":\"inputImage\",\"imageUrl\":" +
                        json_quote("data:" + mime + ";base64," + output.image_base64) + "}";
-        }
-        for (std::size_t i = 0; i < animation_observations.size(); ++i) {
-            const auto& observation = animation_observations[i];
-            std::string label = "Animation frame " + std::to_string(i + 1) + "/" +
-                std::to_string(animation_observations.size()) + ": canvas=" + observation.info.name +
-                " frame=" + std::to_string(observation.info.frame) +
-                " time_ms=" + std::to_string(observation.time_ms) +
-                ". Judge this as one ordered moment in the motion sequence.";
-            content += ",{\"type\":\"inputText\",\"text\":" + json_quote(label) + "}";
-            const std::string mime = observation.image.image_mime.empty() ? "image/png" : observation.image.image_mime;
-            content += ",{\"type\":\"inputImage\",\"imageUrl\":" +
-                       json_quote("data:" + mime + ";base64," + observation.image.image_base64) + "}";
-        }
-        if (animation_observations.size() > 1) {
-            content += ",{\"type\":\"inputText\",\"text\":" +
-                json_quote("Loop transition: after the final supplied frame, motion returns directly to the first supplied frame. Evaluate that last-to-first transition as part of animation naturalness.") + "}";
         }
         content += "]";
         write_line("{\"id\":" + id_raw + ",\"result\":{\"contentItems\":" + content +

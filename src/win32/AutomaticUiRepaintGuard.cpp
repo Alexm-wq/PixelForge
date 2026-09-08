@@ -1,5 +1,6 @@
 #include "AgentTask.hpp"
 #include "ImageIO.hpp"
+#include "ProjectFileIO.hpp"
 
 #include <windows.h>
 
@@ -175,29 +176,7 @@ bool replace_or_insert_project_name(std::string& manifest, std::string_view proj
 }
 
 bool write_text_atomic(const std::filesystem::path& path, const std::string& text, std::wstring& error) {
-    auto temporary = path;
-    temporary += L".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            error = L"Could not create temporary project manifest: " + temporary.wstring();
-            return false;
-        }
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-        if (!out) {
-            error = L"Could not write project manifest: " + temporary.wstring();
-            return false;
-        }
-    }
-    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const DWORD code = GetLastError();
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        error = L"Could not finalize project.json (Windows error " + std::to_wstring(code) + L").";
-        return false;
-    }
-    return true;
+    return pixelforge::win32::write_project_text_atomic(path, text, error);
 }
 
 std::size_t manifest_canvas_count(std::string_view manifest) {
@@ -248,6 +227,10 @@ bool persist_reviewed_project(std::wstring& saved_directory, std::wstring& error
     }
     const auto project = repo_root / L"projects" / (L"task_" + std::to_wstring(snapshot.id));
     const auto manifest_path = project / L"project.json";
+    if (std::filesystem::exists(project / L".autosave-pending")) {
+        error = L"The latest autosave did not complete. Retry saving before accepting; artwork remains in memory.";
+        return false;
+    }
     const auto canvases = project / L"canvases";
     const std::string project_name = project_name_from(snapshot);
 
@@ -263,6 +246,8 @@ bool persist_reviewed_project(std::wstring& saved_directory, std::wstring& error
             error = L"Could not read the existing project manifest.";
             return false;
         }
+        // Windows must release this read handle before replacing project.json.
+        in.close();
         const std::size_t expected = manifest_canvas_count(manifest);
         const std::size_t present = persisted_canvas_file_count(canvases);
         if (expected == 0 || present < expected) {

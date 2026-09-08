@@ -15,6 +15,7 @@ struct PackUiCanvasInfo {
     int width = 0;
     int height = 0;
     int frame = -1;
+    std::string version; // Host-only saved frame version; empty forces refresh.
 };
 
 // Publishes the canonical pack snapshot consumed by the permanent main-window

@@ -38,6 +38,8 @@ struct LocalToolResult {
 struct LocalPackRestoreCanvas {
     std::string name;
     std::vector<std::string> patches;
+    int width = 0, height = 0;
+    std::vector<std::uint32_t> pixels;
 };
 
 class LocalAgentToolSession {
@@ -63,6 +65,7 @@ private:
     LocalToolResult call_art_tool(std::string_view tool, std::string_view arguments_json);
     LocalToolResult call_record_tool(std::string_view arguments_json);
     LocalToolResult call_pack_tool(std::string_view arguments_json);
+    LocalToolResult restore_pack_pixels(std::uint64_t task_id, const std::vector<LocalPackRestoreCanvas>& canvases);
     bool write_line(std::string_view line);
     bool read_line(std::string& line);
 
@@ -83,6 +86,9 @@ private:
     std::uint64_t observed_task_ = 0;
     std::uint64_t observed_revision_ = 0;
     bool has_observed_revision_ = false;
+    // Last successfully persisted frame versions; session-local, never model context.
+    std::uint64_t autosave_task_ = 0;
+    std::unordered_map<std::string, std::string> autosave_versions_;
 };
 
 std::string pixelforge_dynamic_tools_json();
