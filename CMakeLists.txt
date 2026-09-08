@@ -14,6 +14,24 @@ add_library(pixelforge_core
 target_include_directories(pixelforge_core PUBLIC src/core)
 
 if(WIN32)
+    # MultiCanvasTool's GIF frames are full logical-screen frames with transparent
+    # pixels. GIF disposal method 1 (keep previous frame) therefore ghosts old
+    # poses into later frames. Build a generated copy using disposal method 2
+    # (restore background) while keeping transparent index 0.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/MultiCanvasTool.cpp" PIXELFORGE_MULTI_CANVAS_TEXT)
+    string(FIND "${PIXELFORGE_MULTI_CANVAS_TEXT}" "bytes.push_back(0x05);" PIXELFORGE_GIF_DISPOSAL_OFFSET)
+    if(PIXELFORGE_GIF_DISPOSAL_OFFSET EQUAL -1)
+        message(FATAL_ERROR "PixelForge GIF disposal marker was not found in MultiCanvasTool.cpp")
+    endif()
+    string(REPLACE
+        "bytes.push_back(0x05);"
+        "bytes.push_back(0x09); // GIF disposal=2 (restore background) + transparency"
+        PIXELFORGE_MULTI_CANVAS_TEXT
+        "${PIXELFORGE_MULTI_CANVAS_TEXT}")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    set(PIXELFORGE_MULTI_CANVAS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/MultiCanvasTool.cpp")
+    file(WRITE "${PIXELFORGE_MULTI_CANVAS_SOURCE}" "${PIXELFORGE_MULTI_CANVAS_TEXT}")
+
     add_executable(PixelForge WIN32
         src/win32/main_auto.cpp
         src/win32/ImageIO.cpp
@@ -25,7 +43,7 @@ if(WIN32)
         src/win32/AgentInteractionUi.cpp
         src/win32/AutomaticUiRepaintGuard.cpp
         src/win32/LocalAgentToolSessionWorkspace.cpp
-        src/win32/MultiCanvasTool.cpp
+        ${PIXELFORGE_MULTI_CANVAS_SOURCE}
         src/win32/PackWorkspaceUiTabs.cpp
         src/win32/ProjectLoader.cpp
         src/win32/PixelProgram.cpp
@@ -68,7 +86,7 @@ if(BUILD_TESTING)
         set(PIXELFORGE_AUTOMATIC_TOOL_SOURCES
             src/win32/AgentInteractionUi.cpp
             src/win32/LocalAgentToolSessionWorkspace.cpp
-            src/win32/MultiCanvasTool.cpp
+            ${PIXELFORGE_MULTI_CANVAS_SOURCE}
             src/win32/PackWorkspaceUiTabs.cpp
             src/win32/PixelProgram.cpp
             src/win32/AgentMcpServerFramed.cpp
