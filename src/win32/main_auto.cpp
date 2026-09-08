@@ -1,6 +1,7 @@
 #include "CodexAppClient.hpp"
 #include "LocalAgentToolSession.hpp"
 #include "PipeBridge.hpp"
+#include "ProjectLoader.hpp"
 #include "RecordMcpServer.hpp"
 #include "SessionRecorder.hpp"
 
@@ -28,6 +29,7 @@ constexpr UINT_PTR RECORDING_FINALIZE_TIMER = 79;
 constexpr int ID_STOP_CODEX = 1020;
 constexpr int ID_INTELLIGENCE = 1021;
 constexpr int ID_MODEL = 1022;
+constexpr int ID_OPEN_PROJECT = 1023;
 constexpr int ID_REVIEW_FEEDBACK = 1030;
 constexpr int ID_REVIEW_ACCEPT = 1031;
 constexpr int ID_REVIEW_CHANGES = 1032;
@@ -51,6 +53,8 @@ HWND g_review_window = nullptr;
 HWND g_review_feedback = nullptr;
 bool g_review_popup_pending = false;
 std::wstring g_review_summary_text;
+bool g_loaded_project = false;
+pixelforge::win32::ProjectLoadSummary g_loaded_project_summary;
 
 void start_automatic_generation(HWND hwnd, std::string review_feedback = {});
 void show_user_review_window(HWND owner);
@@ -192,6 +196,90 @@ bool start_local_tools(HWND hwnd, std::wstring& error) {
     return g_local_tool_session.start(bindings, std::move(record), error);
 }
 
+void sync_loaded_project_back() {
+    if (!g_loaded_project || g_loaded_project_summary.source_directory.empty() ||
+        g_loaded_project_summary.active_directory.empty()) return;
+    const std::filesystem::path source(g_loaded_project_summary.source_directory);
+    const std::filesystem::path active(g_loaded_project_summary.active_directory);
+    std::error_code ec;
+    if (!std::filesystem::exists(active, ec)) return;
+    ec.clear();
+    if (std::filesystem::equivalent(source, active, ec) && !ec) return;
+    ec.clear();
+    std::filesystem::create_directories(source, ec);
+    if (ec) return;
+    for (std::filesystem::recursive_directory_iterator it(active, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto relative = std::filesystem::relative(it->path(), active, ec);
+        if (ec) break;
+        const auto target = source / relative;
+        if (it->is_directory(ec)) {
+            ec.clear();
+            std::filesystem::create_directories(target, ec);
+        } else if (it->is_regular_file(ec)) {
+            ec.clear();
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (ec) break;
+            std::filesystem::copy_file(it->path(), target, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+        if (ec) break;
+    }
+}
+
+void open_saved_project(HWND hwnd) {
+    if (g_codex_client.busy()) {
+        show_error(hwnd, L"Stop the current Codex turn before opening another project.");
+        return;
+    }
+    if (g_repo_root.empty()) {
+        show_error(hwnd, L"PixelForge could not resolve its repository root.");
+        return;
+    }
+
+    std::wstring manifest;
+    std::wstring error;
+    if (!pixelforge::win32::choose_project_manifest(hwnd, manifest, error)) {
+        if (!error.empty()) show_error(hwnd, error);
+        return;
+    }
+
+    g_local_tool_session.stop();
+    if (!start_local_tools(hwnd, error)) {
+        show_error(hwnd, error);
+        return;
+    }
+
+    pixelforge::win32::ProjectLoadSummary loaded;
+    if (!pixelforge::win32::load_project_into_workspace(
+            manifest, g_repo_root, g_local_tool_session, g_app.task, g_app.document,
+            g_state_mutex, loaded, error)) {
+        g_local_tool_session.stop();
+        show_error(hwnd, error.empty() ? L"Could not open the PixelForge project." : error);
+        return;
+    }
+    g_local_tool_session.stop();
+
+    g_loaded_project = true;
+    g_loaded_project_summary = std::move(loaded);
+    sync_loaded_project_back();
+    {
+        std::lock_guard lock(g_state_mutex);
+        reset_playback_to_document_locked();
+        if (g_width) SetWindowTextW(g_width, std::to_wstring(g_app.document.width()).c_str());
+        if (g_height) SetWindowTextW(g_height, std::to_wstring(g_app.document.height()).c_str());
+    }
+    PostMessageW(hwnd, WM_AGENT_UPDATED, 0, 0);
+    InvalidateRect(hwnd, nullptr, FALSE);
+
+    std::wstring status = L"Project loaded: " + std::to_wstring(g_loaded_project_summary.canvas_count) +
+                          L" canvases. Astra can inspect and edit the restored pack directly.";
+    std::error_code ec;
+    if (!std::filesystem::equivalent(g_loaded_project_summary.source_directory,
+                                     g_loaded_project_summary.active_directory, ec) || ec) {
+        status += L" Working copy: " + g_loaded_project_summary.active_directory;
+    }
+    post_codex_status(hwnd, std::move(status));
+}
+
 void center_owned_window(HWND window, HWND owner) {
     RECT wr{}, orc{};
     if (!GetWindowRect(window, &wr) || !owner || !GetWindowRect(owner, &orc)) return;
@@ -250,6 +338,7 @@ LRESULT CALLBACK review_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                     show_error(hwnd, utf8_to_wide(error));
                     return 0;
                 }
+                sync_loaded_project_back();
 
                 // Keep recording for a short tail after the click so the demo
                 // captures the review popup disappearing and the accepted final state.
@@ -423,9 +512,22 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
     const std::string model = selected_model();
     const std::wstring model_label = selected_model_label();
     const std::string reasoning_effort = selected_reasoning_effort();
+    std::string task_error;
     {
         std::lock_guard lock(g_state_mutex);
-        g_app.task.begin(prompt);
+        if (g_loaded_project) {
+            if (!g_app.task.resume_existing_project(prompt, &task_error)) {
+                // A pending review is handled above. Any other failure is safer
+                // to surface than to silently fork the loaded project into task_N+1.
+            }
+        } else {
+            g_app.task.begin(prompt);
+        }
+    }
+    if (!task_error.empty()) {
+        g_local_tool_session.stop();
+        show_error(hwnd, utf8_to_wide(task_error));
+        return;
     }
     InvalidateRect(hwnd, nullptr, FALSE);
     post_codex_status(hwnd, review_feedback.empty()
@@ -451,6 +553,7 @@ void start_automatic_generation(HWND hwnd, std::string review_feedback) {
         },
         [hwnd](bool ok, std::wstring message) {
             g_local_tool_session.stop();
+            sync_loaded_project_back();
 
             AgentTaskSnapshot snapshot;
             {
@@ -523,6 +626,11 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             SendMessageW(g_intelligence, CB_SETCURSEL, 1, 0);
         }
 
+        HWND open_project = CreateWindowW(L"BUTTON", L"Open Project...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          12, 480, 144, 28, hwnd,
+                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN_PROJECT)), nullptr, nullptr);
+        if (open_project) SendMessageW(open_project, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
         g_codex_status = CreateWindowW(L"STATIC", L"Codex: idle.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       12, 600, 312, 120, hwnd, nullptr, nullptr, nullptr);
         if (g_codex_status) SendMessageW(g_codex_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -538,6 +646,10 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         post_codex_status(hwnd, g_session_recorder.active()
             ? L"Codex: stopping; demo recording will finalize when the stopped turn reports failure."
             : L"Codex: stopping; existing canvas will be kept.");
+        return 0;
+    }
+    if (msg == WM_COMMAND && LOWORD(wparam) == ID_OPEN_PROJECT) {
+        open_saved_project(hwnd);
         return 0;
     }
     if (msg == WM_CODEX_STATUS) {
@@ -571,6 +683,7 @@ LRESULT CALLBACK automatic_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         if (g_review_window) DestroyWindow(g_review_window);
         g_codex_client.shutdown();
         g_local_tool_session.stop();
+        sync_loaded_project_back();
         g_session_recorder.permit_finalization();
         finalize_recording_if_needed(hwnd);
         return pixelforge_legacy_wndproc(hwnd, msg, wparam, lparam);
@@ -644,6 +757,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
 
     g_codex_client.shutdown();
     g_local_tool_session.stop();
+    sync_loaded_project_back();
     g_session_recorder.permit_finalization();
     finalize_recording_if_needed(hwnd);
     if (SUCCEEDED(com)) CoUninitialize();
