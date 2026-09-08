@@ -23,6 +23,7 @@ if(WIN32)
         src/win32/CodexAppClientDynamic.cpp
         src/win32/CodexSessionTrace.cpp
         src/win32/AgentInteractionUi.cpp
+        src/win32/AutomaticUiRepaintGuard.cpp
         src/win32/LocalAgentToolSessionWorkspace.cpp
         src/win32/MultiCanvasTool.cpp
         src/win32/PackWorkspaceUiTabs.cpp
