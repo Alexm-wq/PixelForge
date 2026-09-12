@@ -13,72 +13,29 @@ add_library(pixelforge_core
 )
 target_include_directories(pixelforge_core PUBLIC src/core)
 
+# Optional portable editor. The original Windows application stays unchanged.
+option(PIXELFORGE_BUILD_QT "Build the portable Qt PNG editor" OFF)
+option(PIXELFORGE_QT_TESTS "Build focused Qt editor interaction tests" OFF)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PixelProgramSource.cmake")
+if(PIXELFORGE_BUILD_QT)
+    pixelforge_generate_pixel_program(PIXELFORGE_QT_PIXEL_PROGRAM_SOURCE QT_HOST
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/PixelProgram.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/qt-host/PixelProgram.cpp")
+    if(PIXELFORGE_QT_TESTS)
+        enable_testing()
+    endif()
+    add_subdirectory(src/qt)
+endif()
+
 if(WIN32)
     set(PIXELFORGE_MULTI_CANVAS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/MultiCanvasTool.cpp")
 
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
-    # PixelProgram is the agent's expansion engine. Do not impose arbitrary limits
-    # on the number of masks, masks' aggregate bytes, emitted patch operations,
-    # palette indices, mask-name length, or cluster size. The process/allocator is
-    # the resource boundary; large valid artistic passes should compile as one pass.
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/PixelProgram.cpp" PIXELFORGE_PIXEL_PROGRAM_TEXT)
-    string(REPLACE
-        "constexpr std::size_t kMaxPatchOperations = 20000;\nconstexpr std::size_t kMaxNamedMasks = 64;\nconstexpr std::size_t kMaxMaskBytes = 64u * 1024u * 1024u;\n"
-        ""
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE "return parse_int(token, index) && index >= 0 && index <= 255;"
-                   "return parse_int(token, index) && index >= 0;"
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE "if (name.empty() || name.size() > 64) return false;" "if (name.empty()) return false;"
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE
-[=[                ++operations;
-                if (operations > kMaxPatchOperations) return {};]=]
-[=[                ++operations;]=]
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE
-[=[    bool store_mask(std::string_view name, Mask mask, std::string& error) {
-        const auto key = mask_key(name);
-        const auto found = masks_.find(key);
-        if (found == masks_.end()) {
-            if (masks_.size() >= kMaxNamedMasks) {
-                error = "Program exceeds the 64 named-mask limit.";
-                return false;
-            }
-            if ((masks_.size() + 1) * mask.size() > kMaxMaskBytes) {
-                error = "Named masks would exceed the 64 MiB mask-memory limit; clear/reuse masks or split the pass.";
-                return false;
-            }
-        }
-        masks_[key] = std::move(mask);
-        return true;
-    }]=]
-[=[    bool store_mask(std::string_view name, Mask mask, std::string& error) {
-        (void)error;
-        masks_[mask_key(name)] = std::move(mask);
-        return true;
-    }]=]
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE "color must be palette index 0..255 or #AARRGGBB."
-                   "color must be a non-negative palette index or #AARRGGBB."
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE "mask name must be 1..64 letters, digits, '_' or '-'."
-                   "mask name must contain letters, digits, '_' or '-'."
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE
-        "if(size_min <= 0 || size_max < size_min || size_max > 256) { result.error = \"Line \" + std::to_string(line_no) + \": cluster sizes must satisfy 1 <= size_min <= size_max <= 256.\"; return result; }"
-        "if(size_min <= 0 || size_max < size_min) { result.error = \"Line \" + std::to_string(line_no) + \": cluster sizes must satisfy 1 <= size_min <= size_max.\"; return result; }"
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    string(REPLACE
-[=[    if (result.patch.empty()) {
-        result.error = "Program expands beyond the 20,000-operation atomic patch limit; split it into two artistic passes.";
-        return result;
-    }]=]
-[=[]=]
-        PIXELFORGE_PIXEL_PROGRAM_TEXT "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
-    set(PIXELFORGE_PIXEL_PROGRAM_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/PixelProgram.cpp")
-    file(WRITE "${PIXELFORGE_PIXEL_PROGRAM_SOURCE}" "${PIXELFORGE_PIXEL_PROGRAM_TEXT}")
+    # Preserve the original Windows generated compiler policy via shared helper.
+    pixelforge_generate_pixel_program(PIXELFORGE_PIXEL_PROGRAM_SOURCE WINDOWS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/PixelProgram.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/PixelProgram.cpp")
 
     # Remove equivalent arbitrary ceilings from the single-canvas MCP path too.
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/AgentMcpServer.cpp" PIXELFORGE_AGENT_MCP_TEXT)
